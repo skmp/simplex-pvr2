@@ -24,7 +24,7 @@ module isp_setup_min (
     input             start,
     output reg        done,
 
-    input      [31:0] isp_word,   // refsw params->isp; [4:3] = CullMode
+    input      [31:0] isp_word,   // refsw params->isp; [26:25]=CullMode [29:27]=DepthMode [24]=ZWriteDis
 
     input      [31:0] x1, input [31:0] y1, input [31:0] z1,
     input      [31:0] x2, input [31:0] y2, input [31:0] z2,
@@ -214,7 +214,7 @@ module isp_setup_min (
                     c_invw<=la_q;
                     begin : cb
                       reg [1:0] cm; reg tapos,taneg,wrong;
-                      cm=isp_word[4:3]; tapos=fpos(tri_area); taneg=fneg(tri_area);
+                      cm=isp_word[26:25]; tapos=fpos(tri_area); taneg=fneg(tri_area); // CullMode
                       wrong=(cm[0]==0&&taneg)||(cm[0]==1&&tapos);
                       cull<=(cm>=2)&&wrong;
                     end

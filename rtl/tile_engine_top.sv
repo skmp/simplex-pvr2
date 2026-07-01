@@ -26,8 +26,8 @@
 //     0..63   : write `data` into register file entry cmd[5:0].
 //     64..127 : engine command (data ignored for now):
 //       64 TILE_CLEAR           : depth/tag tile <= {REG_BG_DEPTH, REG_BG_TAG}
-//       65 TRIANGLE_ISP_SETUP   : nop
-//       66 TRIANGLE_ISP_RASTERIZE: nop
+//       65 TRIANGLE_ISP_SETUP   : compute edge/invW-plane coeffs (isp_setup_min)
+//       66 TRIANGLE_ISP_RASTERIZE: opaque; one line/clock, depth test + tag write
 //       67 TRIANGLE_TSP_SETUP    : nop
 //       68 TRIANGLE_TSP_SHADE    : nop
 //       69 TILE_DRAW_TAGS        : color[y][x] <= {8'hFF, tag[y][x]}
@@ -73,7 +73,8 @@ module tile_engine_top #(
     localparam REG_X2 = 6'd11, REG_Y2 = 6'd12, REG_Z2 = 6'd13;
     localparam REG_X3 = 6'd14, REG_Y3 = 6'd15, REG_Z3 = 6'd16;
     localparam REG_X_BASE = 6'd17, REG_Y_BASE = 6'd18;   // tile origin (screen)
-    localparam REG_ISP_WORD = 6'd19;                     // params->isp (CullMode)
+    localparam REG_ISP_WORD = 6'd19;                     // params->isp (Cull/Depth/ZWrite)
+    localparam REG_ISP_TAG  = 6'd20;                     // parameter_tag_t written on pass
 
     // Convenient reads of the input registers (assign-from-regs style).
     wire [31:0] isp_x1 = regs[REG_X1], isp_y1 = regs[REG_Y1], isp_z1 = regs[REG_Z1];
@@ -92,10 +93,18 @@ module tile_engine_top #(
     localparam CMD_TILE_FLUSH            = 7'd70;
 
     // ---- tile buffers ----
-    // depth/tag: {32-bit depth, TAG_BITS tag}
-    (* ramstyle = "M10K" *) reg [32+TAG_BITS-1:0] dt_buf  [0:N_PIX-1];
+    // Organized as TILE_W banks (one per x column), each TILE_H deep (indexed by
+    // y). This lets the rasterizer write/read a whole scanline (all x, fixed y)
+    // in a single clock. Linear index idx = y*TILE_W + x maps to
+    //   bank x = idx[XW-1:0], row y = idx[IDX_W-1:XW].
+    // depth/tag entry: {32-bit invW depth, TAG_BITS tag}
+    (* ramstyle = "M10K" *) reg [32+TAG_BITS-1:0] dt_buf  [0:TILE_W-1][0:TILE_H-1];
     // color: 32-bit
-    (* ramstyle = "M10K" *) reg [31:0]            col_buf [0:N_PIX-1];
+    (* ramstyle = "M10K" *) reg [31:0]            col_buf [0:TILE_W-1][0:TILE_H-1];
+
+    // linear-index split helpers (for the CLEAR/DRAWTAGS/FLUSH iterators)
+    wire [XW-1:0] idx_x;
+    wire [YW-1:0] idx_y;
 
     // ------------------------------------------------------------------
     // HPS DDR3 bridge + ddram controller
@@ -209,10 +218,14 @@ module tile_engine_top #(
         S_FLUSH_RD  = 4'd3,  // present pixel, issue write
         S_FLUSH_WAIT= 4'd4,  // wait for ddram to accept (not busy)
         S_ISP_SETUP = 4'd6,  // wait for isp_setup_min to finish
+        S_ISP_RASTER= 4'd7,  // rasterize one line per clock (opaque)
         S_DONE      = 4'd5;
 
     reg [3:0]       state;
     reg [IDX_W-1:0] idx;         // pixel iterator (0..N_PIX-1)
+    integer         bi;          // rasterizer per-bank loop var
+    assign idx_x = idx[XW-1:0];
+    assign idx_y = idx[IDX_W-1:XW];
 
     // pixel color read for flush (registered one cycle for block-ram read)
     reg [31:0]      flush_col;
@@ -256,6 +269,71 @@ module tile_engine_top #(
     reg [31:0] isp_c1,isp_c2,isp_c3,isp_c4;
     reg [31:0] isp_ddx_invw, isp_ddy_invw, isp_c_invw;
 
+    // ------------------------------------------------------------------
+    // ISP rasterize (CMD_TRIANGLE_ISP_RASTERIZE) - opaque only.
+    // ------------------------------------------------------------------
+    // Processes one 32-pixel scanline per clock. isp_raster_line evaluates all
+    // 32 Xhs/invW combinationally for the current line; per inside-pixel we run
+    // the opaque DepthMode test and, on pass, write invW depth + tag into the
+    // 32 depth/tag banks (all in the same clock).
+    reg  [4:0]  ras_y;                 // current line
+    wire [31:0] ras_inside;
+    wire [31:0] ras_invw [0:TILE_W-1];
+
+    isp_raster_line u_line (
+        .y(ras_y),
+        .c1(isp_c1), .c2(isp_c2), .c3(isp_c3), .c4(isp_c4),
+        .dx12(isp_dx12),.dx23(isp_dx23),.dx31(isp_dx31),.dx41(isp_dx41),
+        .dy12(isp_dy12),.dy23(isp_dy23),.dy31(isp_dy31),.dy41(isp_dy41),
+        .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
+        .inside_mask(ras_inside),
+        .invw_0(ras_invw[0]),  .invw_1(ras_invw[1]),  .invw_2(ras_invw[2]),  .invw_3(ras_invw[3]),
+        .invw_4(ras_invw[4]),  .invw_5(ras_invw[5]),  .invw_6(ras_invw[6]),  .invw_7(ras_invw[7]),
+        .invw_8(ras_invw[8]),  .invw_9(ras_invw[9]),  .invw_10(ras_invw[10]),.invw_11(ras_invw[11]),
+        .invw_12(ras_invw[12]),.invw_13(ras_invw[13]),.invw_14(ras_invw[14]),.invw_15(ras_invw[15]),
+        .invw_16(ras_invw[16]),.invw_17(ras_invw[17]),.invw_18(ras_invw[18]),.invw_19(ras_invw[19]),
+        .invw_20(ras_invw[20]),.invw_21(ras_invw[21]),.invw_22(ras_invw[22]),.invw_23(ras_invw[23]),
+        .invw_24(ras_invw[24]),.invw_25(ras_invw[25]),.invw_26(ras_invw[26]),.invw_27(ras_invw[27]),
+        .invw_28(ras_invw[28]),.invw_29(ras_invw[29]),.invw_30(ras_invw[30]),.invw_31(ras_invw[31])
+    );
+
+    // opaque DepthMode compare: does new invW pass against stored depth?
+    //  refsw: 0 never,1 less(reject if new>=old),2 equal,3 <=,4 greater,
+    //         5 !=,6 >=,7 always.  ("reject" cases inverted to a pass flag)
+    function fcmp_pass(input [2:0] mode, input [31:0] nw, input [31:0] ob);
+        reg lt,eq,gt;
+        begin
+            eq = (nw[30:0]==31'd0 && ob[30:0]==31'd0) ? 1'b1 : (nw==ob);
+            gt = fgt(nw,ob);
+            lt = ~eq & ~gt;
+            case (mode)
+                3'd0: fcmp_pass = 1'b0;      // never
+                3'd1: fcmp_pass = lt;        // less  (new < old)
+                3'd2: fcmp_pass = eq;        // equal
+                3'd3: fcmp_pass = lt|eq;     // less-or-equal
+                3'd4: fcmp_pass = gt;        // greater
+                3'd5: fcmp_pass = ~eq;       // not-equal
+                3'd6: fcmp_pass = gt|eq;     // greater-or-equal
+                3'd7: fcmp_pass = 1'b1;      // always
+            endcase
+        end
+    endfunction
+    // signed-float greater-than a > b (no NaN/inf; DaZ handled by ==0 test)
+    function fgt(input [31:0] a, input [31:0] b);
+        reg az,bz; reg [30:0] am,bm;
+        begin
+            az=(a[30:0]==0); bz=(b[30:0]==0);
+            am=a[30:0]; bm=b[30:0];
+            if (az&&bz)          fgt=1'b0;
+            else if (a[31]^b[31]) fgt = b[31];         // a>b if b negative
+            else if (~a[31])      fgt = (am>bm);        // both >=0
+            else                  fgt = (am<bm);        // both <0
+        end
+    endfunction
+
+    wire [2:0] depth_mode = isp_word[29:27];
+    wire       zwrite_dis = isp_word[24];
+
     always @(posedge clk_100m) begin
         if (reset_100m) begin
             state    <= S_IDLE;
@@ -290,6 +368,10 @@ module tile_engine_top #(
                                 isp_start <= 1'b1;      // kick the setup pipeline
                                 state     <= S_ISP_SETUP;
                             end
+                            CMD_TRIANGLE_ISP_RASTERIZE: begin
+                                ras_y <= 5'd0;          // start at line 0
+                                state <= S_ISP_RASTER;
+                            end
                             // nop commands: acknowledge, one cycle before ready
                             default: begin
                                 cmd_done <= 1'b1;
@@ -303,7 +385,7 @@ module tile_engine_top #(
             // --------------------------------------------------------
             // TILE_CLEAR: every entry <= {REG_BG_DEPTH, REG_BG_TAG}
             S_CLEAR: begin
-                dt_buf[idx] <= {regs[REG_BG_DEPTH], regs[REG_BG_TAG][TAG_BITS-1:0]};
+                dt_buf[idx_x][idx_y] <= {regs[REG_BG_DEPTH], regs[REG_BG_TAG][TAG_BITS-1:0]};
                 if (idx == LAST_IDX) state <= S_DONE;
                 else                idx   <= idx + 1'b1;
             end
@@ -311,7 +393,7 @@ module tile_engine_top #(
             // --------------------------------------------------------
             // TILE_DRAW_TAGS: color <= {8'hFF, tag}
             S_DRAWTAGS: begin
-                col_buf[idx] <= {8'hFF, dt_buf[idx][TAG_BITS-1:0]};
+                col_buf[idx_x][idx_y] <= {8'hFF, dt_buf[idx_x][idx_y][TAG_BITS-1:0]};
                 if (idx == LAST_IDX) state <= S_DONE;
                 else                idx   <= idx + 1'b1;
             end
@@ -320,7 +402,7 @@ module tile_engine_top #(
             // TILE_FLUSH: color[y][x] -> DDR3[REG_TILE_BASE + y*32 + x]
             //  idx already encodes y*TILE_W + x (row-major).
             S_FLUSH_RD: begin
-                flush_col <= col_buf[idx];
+                flush_col <= col_buf[idx_x][idx_y];
                 state     <= S_FLUSH_WAIT;
             end
 
@@ -350,6 +432,30 @@ module tile_engine_top #(
                     isp_c1<=w_c1; isp_c2<=w_c2; isp_c3<=w_c3; isp_c4<=w_c4;
                     isp_ddx_invw<=w_ddx; isp_ddy_invw<=w_ddy; isp_c_invw<=w_cinvw;
                     state <= S_DONE;
+                end
+            end
+
+            // --------------------------------------------------------
+            // TRIANGLE_ISP_RASTERIZE (opaque): one scanline per clock.
+            // Cull skips the whole triangle. For each inside pixel that passes
+            // the DepthMode test: write invW depth (unless ZWriteDis) and tag.
+            S_ISP_RASTER: begin
+                if (isp_r_cull) begin
+                    state <= S_DONE;
+                end else begin
+                    for (bi = 0; bi < TILE_W; bi = bi + 1) begin
+                        if (ras_inside[bi] &&
+                            fcmp_pass(depth_mode, ras_invw[bi],
+                                      dt_buf[bi][ras_y][32+TAG_BITS-1:TAG_BITS])) begin
+                            // depth (top 32b) written unless ZWriteDis; tag always
+                            dt_buf[bi][ras_y] <= {
+                                zwrite_dis ? dt_buf[bi][ras_y][32+TAG_BITS-1:TAG_BITS]
+                                           : ras_invw[bi],
+                                regs[REG_ISP_TAG][TAG_BITS-1:0] };
+                        end
+                    end
+                    if (ras_y == YW'(TILE_H-1)) state <= S_DONE;
+                    else                        ras_y <= ras_y + 1'b1;
                 end
             end
 
