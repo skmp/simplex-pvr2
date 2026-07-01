@@ -114,7 +114,9 @@ module tile_engine_top #(
     localparam integer NBANKS = 8;
     localparam integer DTW    = 32 + TAG_BITS;   // depth+tag width (56)
 
-    // depth/tag RAM
+    // depth/tag RAM. Addresses are driven COMBINATIONALLY from the FSM's state
+    // registers so a registered-read RAM returns the addressed entry on the next
+    // clock (addr valid in cycle N -> rdata valid N+1). we/wdata are registered.
     reg  [NBANKS-1:0]      dt_we;
     reg  [7*NBANKS-1:0]    dt_addr;
     reg  [DTW*NBANKS-1:0]  dt_wdata;
@@ -250,8 +252,10 @@ module tile_engine_top #(
         S_FLUSH_RD  = 4'd3,  // present pixel, issue write
         S_FLUSH_WAIT= 4'd4,  // wait for ddram to accept (not busy)
         S_ISP_SETUP = 4'd6,  // wait for isp_setup_min to finish
-        S_ISP_RASTER= 4'd7,  // rasterize one line per clock (opaque)
+        S_ISP_RASTER= 4'd7,  // rasterize a chunk (read phase)
         S_TSP_SETUP = 4'd8,  // wait for tsp_setup_min to finish
+        S_DRAW_RD   = 4'd9,  // draw-tags: present dt read addr
+        S_RAS_WR    = 4'd10, // rasterize: depth-compare + write-back phase
         S_DONE      = 4'd5;
 
     reg [3:0]       state;
@@ -260,13 +264,61 @@ module tile_engine_top #(
     assign idx_x = idx[XW-1:0];
     assign idx_y = idx[IDX_W-1:XW];
 
-    // pixel color read for flush (registered one cycle for block-ram read)
-    reg [31:0]      flush_col;
+    // pipelined-RMW helpers (block-RAM read latency)
+    reg [2:0]  dr_bank; reg [6:0] dr_addr; reg dr_last;   // draw-tags read->write
+    reg [2:0]  fl_bank;                                    // flush read bank
 
     // 32-bit word address for the current flush pixel: REG_TILE_BASE + idx.
     wire [31:0] word32_addr = regs[REG_TILE_BASE] + {{(32-IDX_W){1'b0}}, idx};
 
     assign ready = (state == S_IDLE);
+
+    // ------------------------------------------------------------------
+    // Combinational RAM control drive (we / addr / wdata all together, so a
+    // registered-read/write RAM samples a consistent set at the clock edge).
+    // Read addr valid in cycle N -> rdata valid N+1, consumed in the adjacent
+    // state. Writes take effect at the edge leaving the state that asserts we.
+    //  CLEAR      : dt  write @ idx           (bank idx[2:0])
+    //  DRAW_RD    : dt  read  @ idx           -> S_DRAWTAGS consumes rdata
+    //  DRAWTAGS   : col write @ dr (from rdata) + dt read @ idx (pipeline next)
+    //  FLUSH_RD   : col read  @ idx           -> S_FLUSH_WAIT consumes
+    //  ISP_RASTER : dt  read  @ chunk         -> S_RAS_WR consumes rdata
+    //  RAS_WR     : dt  write @ chunk (pass lanes), same addr as the read
+    integer ai;
+    always @(*) begin
+        dt_we = '0; dt_addr = '0; dt_wdata = '0;
+        col_we = '0; col_addr = '0; col_wdata = '0;
+        case (state)
+        S_CLEAR: begin
+            dt_we[idx[2:0]]               = 1'b1;
+            dt_addr [7*idx[2:0] +: 7]     = idx[9:3];
+            dt_wdata[DTW*idx[2:0] +: DTW] = {regs[REG_BG_DEPTH], regs[REG_BG_TAG][TAG_BITS-1:0]};
+        end
+        S_DRAW_RD:  dt_addr[7*idx[2:0] +: 7] = idx[9:3];
+        S_DRAWTAGS: begin
+            dt_addr[7*idx[2:0] +: 7] = idx[9:3];              // pipeline next read
+            col_we[dr_bank]              = 1'b1;
+            col_addr [7*dr_bank +: 7]    = dr_addr;
+            col_wdata[32*dr_bank +: 32]  = {8'hFF, dt_rdata[DTW*dr_bank + TAG_BITS-1 -: TAG_BITS]};
+        end
+        S_FLUSH_RD: col_addr[7*idx[2:0] +: 7] = idx[9:3];
+        S_ISP_RASTER:
+            for (ai = 0; ai < NBANKS; ai = ai + 1)
+                dt_addr[7*ai +: 7] = pix_addr(ras_x + ai[4:0], ras_y);
+        S_RAS_WR:
+            for (ai = 0; ai < NBANKS; ai = ai + 1) begin
+                dt_addr[7*ai +: 7] = pix_addr(ras_x + ai[4:0], ras_y);
+                if (ras_inside[ai] &&
+                    fcmp_pass(depth_mode, ras_invw(ai), dt_rdata[DTW*ai + DTW-1 -: 32])) begin
+                    dt_we[ai]              = 1'b1;
+                    dt_wdata[DTW*ai +: DTW] = {
+                        zwrite_dis ? dt_rdata[DTW*ai + DTW-1 -: 32] : ras_invw(ai),
+                        regs[REG_ISP_TAG][TAG_BITS-1:0] };
+                end
+            end
+        default: ;
+        endcase
+    end
 
     // ------------------------------------------------------------------
     // ISP triangle setup (CMD_TRIANGLE_ISP_SETUP)
@@ -439,7 +491,7 @@ module tile_engine_top #(
                         idx <= 0;
                         case (cmd)
                             CMD_TILE_CLEAR:     state <= S_CLEAR;
-                            CMD_TILE_DRAW_TAGS: state <= S_DRAWTAGS;
+                            CMD_TILE_DRAW_TAGS: state <= S_DRAW_RD;
                             CMD_TILE_FLUSH:     state <= S_FLUSH_RD;
                             CMD_TRIANGLE_ISP_SETUP: begin
                                 isp_start <= 1'b1;      // kick the setup pipeline
@@ -464,36 +516,44 @@ module tile_engine_top #(
             end
 
             // --------------------------------------------------------
-            // TILE_CLEAR: every entry <= {REG_BG_DEPTH, REG_BG_TAG}
+            // TILE_CLEAR: every entry <= {REG_BG_DEPTH, REG_BG_TAG}.
+            // One entry/cycle: bank=idx[2:0], addr=idx[9:3] (write-only).
+            // RAM control (we/addr/wdata) for all of these states is driven by
+            // the combinational block above; the FSM only advances iterators.
             S_CLEAR: begin
-                dt_buf[idx_x][idx_y] <= {regs[REG_BG_DEPTH], regs[REG_BG_TAG][TAG_BITS-1:0]};
                 if (idx == LAST_IDX) state <= S_DONE;
-                else                idx   <= idx + 1'b1;
+                else                 idx   <= idx + 1'b1;
             end
 
             // --------------------------------------------------------
-            // TILE_DRAW_TAGS: color <= {8'hFF, tag}
+            // TILE_DRAW_TAGS: color[p] <= {8'hFF, dt_tag[p]}. Read-modify:
+            //  S_DRAW_RD presents dt read addr for idx; next cycle S_DRAWTAGS
+            //  has dt_rdata valid and writes col. idx advances in RD.
+            S_DRAW_RD: begin
+                dr_bank <= idx[2:0];                     // bank/addr to write in WR
+                dr_addr <= idx[9:3];
+                dr_last <= (idx == LAST_IDX);
+                idx     <= idx + 1'b1;
+                state   <= S_DRAWTAGS;
+            end
             S_DRAWTAGS: begin
-                col_buf[idx_x][idx_y] <= {8'hFF, dt_buf[idx_x][idx_y][TAG_BITS-1:0]};
-                if (idx == LAST_IDX) state <= S_DONE;
-                else                idx   <= idx + 1'b1;
+                if (dr_last) state <= S_DONE;
+                else         state <= S_DRAW_RD;
             end
 
             // --------------------------------------------------------
-            // TILE_FLUSH: color[y][x] -> DDR3[REG_TILE_BASE + y*32 + x]
-            //  idx already encodes y*TILE_W + x (row-major).
+            // TILE_FLUSH: colour[y][x] -> DDR3[REG_TILE_BASE + y*32 + x].
+            //  S_FLUSH_RD presents col read addr (comb); data valid S_FLUSH_WAIT.
             S_FLUSH_RD: begin
-                flush_col <= col_buf[idx_x][idx_y];
-                state     <= S_FLUSH_WAIT;
+                fl_bank <= idx[2:0];
+                state   <= S_FLUSH_WAIT;
             end
 
             S_FLUSH_WAIT: begin
+                // col_rdata[fl_bank] valid now.
                 if (!mem_busy) begin
-                    // REG_TILE_BASE and idx are 32-bit *word* indices; the
-                    // ddram bus mem_addr[27:1] indexes 16-bit words, so a
-                    // 32-bit word maps to (word_index << 1) with bit 0 = 0.
                     mem_addr <= word32_addr[26:0] << 1;
-                    mem_din  <= flush_col;
+                    mem_din  <= col_rdata[32*fl_bank +: 32];
                     mem_wr   <= 4'b1111;      // full 32-bit write
                     if (idx == LAST_IDX) state <= S_DONE;
                     else begin
@@ -517,33 +577,26 @@ module tile_engine_top #(
             end
 
             // --------------------------------------------------------
-            // TRIANGLE_ISP_RASTERIZE (opaque): one scanline per clock.
-            // Cull skips the whole triangle. For each inside pixel that passes
-            // the DepthMode test: write invW depth (unless ZWriteDis) and tag.
+            // TRIANGLE_ISP_RASTERIZE (opaque), RAS_LANES pixels/chunk, banked RAM
+            // read-modify-write. S_ISP_RASTER = READ phase: present the chunk's
+            // depth read address to all lane-banks (all banks share the same addr
+            // in a chunk). isp_raster_line evaluates inside/invW combinationally.
             S_ISP_RASTER: begin
-                if (isp_r_cull) begin
-                    state <= S_DONE;
+                if (isp_r_cull) state <= S_DONE;   // dt read addr driven comb
+                else            state <= S_RAS_WR;
+            end
+
+            // WRITE phase: dt_rdata valid; the comb block does the per-lane
+            // DepthMode test + write-back. Here we just advance the chunk.
+            S_RAS_WR: begin
+                // advance x-chunk; at end of line advance y (or finish)
+                if (ras_x == XW'(TILE_W-RAS_LANES)) begin
+                    ras_x <= 5'd0;
+                    if (ras_y == YW'(TILE_H-1)) state <= S_DONE;
+                    else begin ras_y <= ras_y + 1'b1; state <= S_ISP_RASTER; end
                 end else begin
-                    // process RAS_LANES pixels of this chunk (bank = ras_x+bi)
-                    for (bi = 0; bi < RAS_LANES; bi = bi + 1) begin
-                        if (ras_inside[bi] &&
-                            fcmp_pass(depth_mode, ras_invw(bi),
-                                      dt_buf[ras_x + bi[4:0]][ras_y][32+TAG_BITS-1:TAG_BITS])) begin
-                            // depth (top 32b) written unless ZWriteDis; tag always
-                            dt_buf[ras_x + bi[4:0]][ras_y] <= {
-                                zwrite_dis ? dt_buf[ras_x + bi[4:0]][ras_y][32+TAG_BITS-1:TAG_BITS]
-                                           : ras_invw(bi),
-                                regs[REG_ISP_TAG][TAG_BITS-1:0] };
-                        end
-                    end
-                    // advance x-chunk; at end of line advance y (or finish)
-                    if (ras_x == XW'(TILE_W-RAS_LANES)) begin
-                        ras_x <= 5'd0;
-                        if (ras_y == YW'(TILE_H-1)) state <= S_DONE;
-                        else                        ras_y <= ras_y + 1'b1;
-                    end else begin
-                        ras_x <= ras_x + XW'(RAS_LANES);
-                    end
+                    ras_x <= ras_x + XW'(RAS_LANES);
+                    state <= S_ISP_RASTER;
                 end
             end
 
