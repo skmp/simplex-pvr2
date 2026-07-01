@@ -38,7 +38,7 @@ MODE ?= tri
 MODEARG = $(if $(filter quad,$(MODE)),quad,)
 
 .PHONY: all vectors fp sim sim-tri sim-quad seq seq-tri seq-quad ip ip-tri ip-quad quartus clean \
-        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe
+        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe dcache256 oparse ispstrip region planecache
 
 # TSP module files (package first). ISP shared FP units come from rtl/isp_min.
 TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
@@ -46,7 +46,7 @@ TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/
 all: fp sim-tri sim-quad seq-tri seq-quad ip-tri ip-quad
 
 # ---- run the fast unit tests (FP prims + TSP texture blocks + full pipeline) ----
-test: fp tex pipe
+test: fp tex dcache256 oparse ispstrip region pipe
 
 # ---- TSP texture-pipeline block tests (randomized vectors vs refsw) ----
 TSP = rtl/tsp
@@ -87,6 +87,34 @@ pipe: | $(BUILD)
 	  $(TSP_RTL) rtl/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) $(DDRSTUB) \
 	  $(CWD)/tb/tsp_pipe_tb.cpp --Mdir $(BUILD)/obj_pipe -o tb
 	./$(BUILD)/obj_pipe/tb
+
+# data_cache256 unit test: 256-bit line cache + behavioural 64-bit DDR.
+dcache256: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module data_cache256_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/data_cache256_tb_top.sv $(TSP)/data_cache256.sv $(CWD)/tb/data_cache256_tb.cpp \
+	  --Mdir $(BUILD)/obj_dcache256 -o tb
+	./$(BUILD)/obj_dcache256/tb
+
+# object_list_parser unit test: list walker + injected 256b data$ + behav DDR.
+oparse: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module object_list_parser_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/object_list_parser_tb_top.sv $(TSP)/object_list_parser.sv $(TSP)/data_cache256.sv \
+	  $(CWD)/tb/object_list_parser_tb.cpp --Mdir $(BUILD)/obj_oparse -o tb
+	./$(BUILD)/obj_oparse/tb
+
+# region_array_parser unit test: region walk -> per-tile ordered states.
+region: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module region_array_parser_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/region_array_parser_tb_top.sv $(TSP)/region_array_parser.sv $(TSP)/data_cache256.sv \
+	  $(CWD)/tb/region_array_parser_tb.cpp --Mdir $(BUILD)/obj_region -o tb
+	./$(BUILD)/obj_region/tb
+
+# isp_tristrip_iterator unit test: strip triangle/vertex iterator (XYZ only).
+ispstrip: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module isp_tristrip_iterator_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/isp_tristrip_iterator_tb_top.sv $(TSP)/isp_tristrip_iterator.sv $(TSP)/data_cache256.sv \
+	  $(CWD)/tb/isp_tristrip_iterator_tb.cpp --Mdir $(BUILD)/obj_ispstrip -o tb
+	./$(BUILD)/obj_ispstrip/tb
 
 # tex_fetch integrated test: tex_fetch + 2 injected caches + behavioural DDR.
 tex-fetch: | $(BUILD)

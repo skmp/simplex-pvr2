@@ -34,4 +34,170 @@ package tsp_pkg;
         logic [63:0] rdata;     // 64-bit line
     } cache_resp_t;
 
+    // ---- 32-byte (256-bit) line data-cache client port ----
+    // Used by the ISP/TSP param data caches (data_cache256). laddr is a
+    // 32-byte-line address (i.e. byte_addr >> 5). The 256-bit line holds 8
+    // 32-bit words; a client selects the word it wants from rdata.
+    typedef struct packed {
+        logic        req;        // 1-cycle request strobe
+        logic [26:0] laddr;      // 32-byte-line address (byte_addr[31:5])
+    } cache_req256_t;
+    typedef struct packed {
+        logic         ack;       // 1-cycle response strobe
+        logic [255:0] rdata;     // 256-bit line (8 x 32-bit words)
+    } cache_resp256_t;
+
+    // ---- PVR core tag (mirrors ISP_BACKGND_T_type, pvr_regs.h:318) ----
+    // Packed so that {msb..lsb} == the 32-bit tag word: bit31=invalid,
+    // [30:29]=pad, [28]=cache_bypass, [27]=shadow, [26:24]=skip,
+    // [23:3]=param_offs_in_words, [2:0]=tag_offset.
+    typedef struct packed {
+        logic        invalid;              // bit 31  (TAG_INVALID)
+        logic [1:0]  pad;                  // bits 30:29
+        logic        cache_bypass;         // bit 28
+        logic        shadow;               // bit 27
+        logic [2:0]  skip;                 // bits 26:24
+        logic [20:0] param_offs_in_words;  // bits 23:3
+        logic [2:0]  tag_offset;           // bits 2:0
+    } core_tag_t;                          // == 32 bits
+
+    // entry type emitted by the object-list parser
+    typedef enum logic [1:0] {
+        ENT_STRIP = 2'd0,   // triangle strip
+        ENT_TRI   = 2'd1,   // triangle array
+        ENT_QUAD  = 2'd2    // quad array
+    } entry_type_e;
+
+    // ---- decoded object-list entry fields (ObjectListTstrip/Tarray/Qarray
+    // layout, refsw_lists_regtypes.h) - NOT the core tag (ISP_BACKGND_T_type
+    // has a DIFFERENT bit layout and is built via CoreTagFromDesc by whoever
+    // needs it; the parser does not do that repacking). `mask` is meaningful
+    // for ENT_STRIP (bit i set => triangle i exists, i=0..5); `count` is
+    // meaningful for ENT_TRI/ENT_QUAD (count = number of array elements,
+    // i.e. refsw's `prims+1`). The consumer picks which sub-element(s) to
+    // process using these raw fields directly. ----
+    typedef struct packed {
+        logic [20:0] param_offs_in_words;  // as read from the entry (E[20:0])
+        logic [2:0]  skip;                 // E[23:21]
+        logic        shadow;               // E[24]
+        logic [5:0]  mask;                 // strip only: E[30:25]
+        logic [4:0]  count;                // array only: prims+1 (1..16)
+    } objlist_entry_t;
+
+    // ---- object-list parser output: one ENTRY at a time (not one primitive) ----
+    // The parser is a pure LIST WALKER: it reads one object-list entry,
+    // classifies it, and presents entry_ready (LEVEL) with entry_type + the
+    // decoded entry fields (mask/count/param_offs/skip/shadow) held stable. It
+    // does NOT iterate strip triangles or array elements itself, chase
+    // param_offs_in_words to the parameter buffer, decode vertices, or build
+    // the ISP_BACKGND_T_type core tag - all of that (including which
+    // sub-element to process next) is the consumer's job (param_fetch, shared
+    // with the TSP plane cache's miss path).
+    //
+    // Handshake: parser raises entry_ready with fields stable; the consumer
+    // processes the WHOLE entry (e.g. iterating every set mask bit / every
+    // array index itself) and pulses entry_done (1 cycle) when done with it;
+    // the parser then drops entry_ready and advances to the next list entry.
+    typedef struct packed {
+        logic           entry_ready;   // LEVEL: an entry is presented + stable
+        entry_type_e    entry_type;    // ENT_STRIP / ENT_TRI / ENT_QUAD
+        objlist_entry_t entry;         // decoded object-list entry fields
+    } prim_out_t;
+    typedef struct packed {
+        logic      entry_done;   // 1-cycle: consumer finished this entry
+    } prim_ack_t;
+
+    // one decoded vertex (raw 32-bit param words placed into named fields;
+    // float/format interpretation is left to the consumer). UV/ofs are only
+    // meaningful when the record's isp word enables Texture/Offset. Produced by
+    // param_fetch (tag -> header + vertices), NOT by object_list_parser.
+    typedef struct packed {
+        logic [31:0] x, y, z;      // position (raw float bits)
+        logic [31:0] u, v;         // texture coords (raw; f16 pair packed in u if UV_16b)
+        logic [31:0] col;          // base colour (packed ARGB word)
+        logic [31:0] ofs;          // offset colour (packed word)
+    } vtx_words_t;
+
+    // ---- region_array_parser output: one STATE at a time per tile ----
+    // For each region-array entry (tile), the parser strobes the tile's enabled
+    // states in order (clear -> op -> pt -> tr -> flush), one per handshake:
+    // it raises state_ready (LEVEL) with tile x/y, a one-hot `state`, and (for
+    // op/pt/tr) the list base pointer (byte addr = ListPointer.ptr_in_words*4);
+    // the consumer processes that state and pulses list_done (1-cycle); the
+    // parser then advances to the tile's next enabled state, or the next tile.
+    // A tile with NO enabled states is silently skipped. tiles_parsed pulses
+    // when the whole region array is consumed (control.last_region, or after
+    // 16384 tiles as a runaway guard). ptr is 0 for clear/flush (no list).
+    //
+    // State derivation from the region entry (refsw RenderCORE):
+    //   clear = !control.z_keep          (bit 30 inverted)
+    //   op    = !opaque.empty            (opaque   ListPointer)
+    //   pt    = !puncht.empty            (puncht   ListPointer)
+    //   tr    = !trans.empty             (trans    ListPointer)
+    //   flush = !control.no_writeout     (bit 28 inverted -> tile written out)
+    typedef enum logic [4:0] {
+        RSTATE_CLEAR = 5'b00001,
+        RSTATE_OP    = 5'b00010,
+        RSTATE_PT    = 5'b00100,
+        RSTATE_TR    = 5'b01000,
+        RSTATE_FLUSH = 5'b10000
+    } region_state_e;
+    typedef struct packed {
+        logic          list_ready;    // LEVEL: a (tile,state) is presented + stable
+        logic [5:0]    tile_x;        // control.tilex (tile column; *32 for pixels)
+        logic [5:0]    tile_y;        // control.tiley
+        logic [4:0]    state;         // one-hot region_state_e
+        logic [26:0]   list_ptr;      // byte addr of the list (op/pt/tr); 0 for clear/flush
+    } region_out_t;
+    typedef struct packed {
+        logic      list_done;   // 1-cycle: consumer finished this state
+    } region_ack_t;
+
+    // ---- isp_tristrip_iterator output: one triangle at a time ----
+    // Iterates a single ENT_STRIP entry's masked triangles (i=0..5 where
+    // mask[i] set), reading only XYZ per vertex (UV/color/offset ignored for
+    // now). Handshake mirrors object_list_parser: triangle_ready (LEVEL, XYZ
+    // x3 + isp word stable) <-> triangle_done (1-cycle pulse). When the strip
+    // is exhausted the iterator pulses prim_done (to ITS OWN caller, signalling
+    // it is finished with the whole entry - same shape as entry_done one level
+    // up the hierarchy).
+    typedef struct packed {
+        logic [31:0] x, y, z;
+    } xyz_t;
+    typedef struct packed {
+        logic          triangle_ready;   // LEVEL: a triangle's 3 vertices are stable
+        logic [31:0]   isp;              // record's ISP_TSP word (Cull/Depth/ZWrite etc)
+        xyz_t          v0, v1, v2;       // the triangle's 3 vertices (XYZ only)
+        logic          prim_done;        // 1-cycle: whole strip entry finished
+    } triangle_out_t;
+    typedef struct packed {
+        logic      triangle_done;   // 1-cycle: consumer finished this triangle
+    } triangle_ack_t;
+
+    // ISP word (ISP_TSP) bit positions (LSB-first, core_structs.h:59):
+    //   CacheBypass=21, UV_16b=22, Gouraud=23, Offset=24, Texture=25,
+    //   ZWriteDis=26, CullMode=[28:27], DepthMode=[31:29].
+    localparam int ISP_CACHEBYPASS_BIT = 21;
+    localparam int ISP_UV16_BIT        = 22;
+    localparam int ISP_GOURAUD_BIT     = 23;
+    localparam int ISP_OFFSET_BIT      = 24;
+    localparam int ISP_TEXTURE_BIT     = 25;
+
+    // ---- tsp_setup dependency injected into the plane cache ----
+    // request out (plane cache -> setup) : start + vertices/flags
+    typedef struct packed {
+        logic        start;
+        logic        gouraud, texture, offset;
+        logic [31:0] x1,y1,z1, x2,y2,z2, x3,y3,z3, xbase,ybase;
+        logic [31:0] u1,v1, u2,v2, u3,v3;
+        logic [31:0] col1,col2,col3, ofs1,ofs2,ofs3;
+    } setup_req_t;
+    // response in (setup -> plane cache) : streamed planes + done
+    typedef struct packed {
+        logic        plane_valid;
+        logic [3:0]  plane_idx;
+        logic [31:0] o_ddx, o_ddy, o_c;
+        logic        done;
+    } setup_resp_t;
+
 endpackage

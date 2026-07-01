@@ -65,6 +65,7 @@ int main(int argc,char**argv){
     Verilated::commandArgs(argc,argv);
     dut=new Vtile_engine_top;
     dut->reset_req=1; dut->cold_req=0; dut->cmd_valid=0;
+    dut->reg_we=0; dut->cmd_stb=0; dut->reg_addr=0;   // legacy submit() path
     for(int i=0;i<6;i++)tick(); dut->reset_req=0;
     int g=0; while(dut->core_reset){tick();if(++g>100)return 1;} tick();
 

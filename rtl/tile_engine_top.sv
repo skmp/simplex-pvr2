@@ -48,8 +48,18 @@ module tile_engine_top import tsp_pkg::*; #(
     output            core_reset,  // active-high synchronous core reset
 
     // ---- command / data interface ----
+    // Two access paths share the cmd_valid/cmd_done/ready handshake:
+    //   * register write : reg_we=1, reg_addr[9:0] selects one of 1024 PVR regs,
+    //                       data is the value. Completes in one cycle.
+    //   * command        : cmd_stb=1, cmd[6:0] is the opcode (see CMD_* below).
+    // For backward compatibility the LEGACY encoding is still accepted: when
+    // neither reg_we nor cmd_stb is driven, cmd[6]==0 => write reg cmd[5:0],
+    // cmd[6]==1 => run command cmd[6:0]. (co-sim submit() uses the legacy form.)
     input      [6:0]  cmd,
     input      [31:0] data,
+    input      [9:0]  reg_addr,    // full 1024-register index (when reg_we)
+    input             reg_we,      // 1: this cmd_valid is a wide register write
+    input             cmd_stb,     // 1: this cmd_valid is a command opcode
     input             cmd_valid,   // 1-cycle strobe: submit cmd+data
     output reg        cmd_done,    // 1-cycle pulse, one clock before ready
     output            ready        // level: idle and able to accept a command
@@ -60,13 +70,14 @@ module tile_engine_top import tsp_pkg::*; #(
     localparam integer YW      = $clog2(TILE_H);          // 5
     localparam [IDX_W-1:0] LAST_IDX = IDX_W'(N_PIX - 1);  // last pixel index
 
-    // ---- register file ----
-    reg [31:0] regs [0:63];
+    // ---- register file (full 1024 PVR registers) ----
+    reg [31:0] regs [0:1023];
 
-    // Named registers (indices are part of the host ABI).
-    localparam REG_BG_DEPTH = 6'd0;
-    localparam REG_BG_TAG   = 6'd1;
-    localparam REG_TILE_BASE= 6'd2;
+    // Named registers (indices are part of the host ABI). Low indices keep the
+    // original 6-bit values so the legacy cmd[5:0] write path still targets them.
+    localparam REG_BG_DEPTH = 10'd0;
+    localparam REG_BG_TAG   = 10'd1;
+    localparam REG_TILE_BASE= 10'd2;
 
     // ISP triangle setup inputs (host writes these before CMD_TRIANGLE_ISP_SETUP)
     localparam REG_X1 = 6'd8,  REG_Y1 = 6'd9,  REG_Z1 = 6'd10;
@@ -110,6 +121,12 @@ module tile_engine_top import tsp_pkg::*; #(
     localparam CMD_TRIANGLE_TSP_SHADE    = 7'd68;
     localparam CMD_TILE_DRAW_TAGS        = 7'd69;
     localparam CMD_TILE_FLUSH            = 7'd70;
+    localparam CMD_START_RENDER          = 7'd71;   // autonomous whole-tile render
+
+    // ---- upper-bank PVR registers (only reachable via the wide reg_addr path) ----
+    localparam REG_PARAM_BASE   = 10'd64;   // VRAM byte base of the param buffer
+    localparam REG_OBJLIST_PTR  = 10'd65;   // object-list pointer (byte addr) for START_RENDER
+    localparam REG_REGION_BASE  = 10'd66;   // (reserved) region-array base
 
     // ---- tile buffers (block RAM, banked) ----
     // Both buffers are NBANKS single-port M10K banks so a NBANKS-pixel span of a
@@ -511,8 +528,21 @@ module tile_engine_top import tsp_pkg::*; #(
     tex_cache u_qcache (.clk(clk_100m),.reset(reset_100m),
         .creq(qc_creq),.cresp(qc_cresp),.dreq(qc_dreq),.dresp(qc_dresp));
 
+    // ISP/TSP param data caches (32-byte line). Client ports are driven by the
+    // object-list parser (ISP$) and the plane cache (TSP$) in later stages; for
+    // now they sit idle. Both share the tex_mem 4-port arbiter.
+    ddr_rd_req_t  ispd_dreq, tspd_dreq;
+    ddr_rd_resp_t ispd_dresp, tspd_dresp;
+    cache_req256_t  ispd_creq, tspd_creq;
+    cache_resp256_t ispd_cresp, tspd_cresp;
+    data_cache256 u_isp_data (.clk(clk_100m),.reset(reset_100m),
+        .creq(ispd_creq),.cresp(ispd_cresp),.dreq(ispd_dreq),.dresp(ispd_dresp));
+    data_cache256 u_tsp_data (.clk(clk_100m),.reset(reset_100m),
+        .creq(tspd_creq),.cresp(tspd_cresp),.dreq(tspd_dreq),.dresp(tspd_dresp));
+
     tex_mem u_texmem (.clk(clk_100m),.reset(reset_100m),
-        .d_dreq(dc_dreq),.d_dresp(dc_dresp),.q_dreq(qc_dreq),.q_dresp(qc_dresp)
+        .d_dreq(dc_dreq),.d_dresp(dc_dresp),.q_dreq(qc_dreq),.q_dresp(qc_dresp),
+        .i_dreq(ispd_dreq),.i_dresp(ispd_dresp),.t_dreq(tspd_dreq),.t_dresp(tspd_dresp)
 `ifdef SYNTHESIS
         ,.ram2_address(tex_ram2_address),.ram2_burstcount(tex_ram2_burstcount),
         .ram2_waitrequest(tex_ram2_waitrequest),.ram2_readdata(tex_ram2_readdata),
@@ -522,6 +552,9 @@ module tile_engine_top import tsp_pkg::*; #(
 `ifndef SYNTHESIS
     assign tex_ram2_address=29'd0; assign tex_ram2_burstcount=8'd0; assign tex_ram2_read=1'b0;
 `endif
+    // idle the param data$ client ports until the parser/plane-cache drive them
+    assign ispd_creq = '0;
+    assign tspd_creq = '0;
 
     // flatten the plane arrays for the tsp_shade port (packed vectors)
     // tsp_shade takes p_ddx/p_ddy/p_c as [0:9] arrays directly.
@@ -564,10 +597,10 @@ module tile_engine_top import tsp_pkg::*; #(
             // --------------------------------------------------------
             S_IDLE: begin
                 if (cmd_valid) begin
-                    if (cmd[6] == 1'b0) begin
-                        // 0..63 : register write. Completes immediately;
-                        // stay ready and pulse done next cycle.
-                        regs[cmd[5:0]] <= data;
+                    // Register-write path: explicit wide write (reg_we), OR the
+                    // legacy encoding (no reg_we/cmd_stb and cmd[6]==0 -> reg cmd[5:0]).
+                    if (reg_we || (!cmd_stb && cmd[6] == 1'b0)) begin
+                        regs[reg_we ? reg_addr : {4'b0, cmd[5:0]}] <= data;
                         cmd_done <= 1'b1;   // ready again next cycle (still idle)
                     end else begin
                         idx <= 0;
