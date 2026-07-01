@@ -142,6 +142,15 @@ frontendtsp: | $(BUILD)
 	  $(CWD)/tb/frontend_tsp_tb.cpp --Mdir $(BUILD)/obj_frontendtsp -o tb
 	./$(BUILD)/obj_frontendtsp/tb $(DUMP)
 
+# tsp_shade_pp: fully-pipelined shader, verified bit-equal vs serial tsp_shade.
+tspshadepp: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
+	  --top-module tsp_shade_pp_tb_top \
+	  $(TSP_RTL) tb/tsp_shade_pp_tb_top.sv \
+	  $(wildcard rtl/isp_min/*.sv) \
+	  $(CWD)/tb/tsp_shade_pp_tb.cpp --Mdir $(BUILD)/obj_tspshadepp -o tb
+	./$(BUILD)/obj_tspshadepp/tb
+
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
 	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw -Irtl/tsp/gen \

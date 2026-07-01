@@ -65,7 +65,7 @@ module tsp_setup_min (
 
     // ---------------- reciprocal ----------------
     reg        rc_req; reg [31:0] rc_in; wire rc_ack; wire [31:0] rc_y;
-    fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.in_valid(rc_req),.x(rc_in),
+    fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(rc_req),.x(rc_in),
                        .out_valid(rc_ack),.y(rc_y));
 
     // ---------------- attribute multipliers: 3 per context ----------------

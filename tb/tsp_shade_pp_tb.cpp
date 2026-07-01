@@ -1,0 +1,157 @@
+// tsp_shade_pp_tb - verify the fully-pipelined tsp_shade_pp is bit-identical to
+// the serial tsp_shade over the same VRAM + per-pixel inputs.
+//
+// For a batch (fixed planes/tsp/tcw, varying px/py/invw): first run the serial
+// reference on each pixel and record ARGB; then stream the SAME pixels through
+// the pipelined DUT (respecting `stall`) and match by id.
+#include "Vtsp_shade_pp_tb_top.h"
+#include "Vtsp_shade_pp_tb_top___024root.h"
+#include "verilated.h"
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+
+static Vtsp_shade_pp_tb_top* dut;
+#define VRAM dut->rootp->tsp_shade_pp_tb_top__DOT__vram
+static void tick(){ dut->clk=0; dut->eval(); dut->clk=1; dut->eval(); }
+
+static uint32_t rng=0x1234abcd;
+static uint32_t rnd(){uint32_t x=rng;x^=x<<13;x^=x>>17;x^=x<<5;rng=x;return x;}
+
+// set all 10 planes (flat wires) + scalar config
+struct Cfg {
+    uint32_t ddx[10], ddy[10], c[10];
+    uint32_t tsp, tcw, text_ctrl, pp_texture, pp_offset;
+};
+static void apply_cfg(const Cfg&g){
+    dut->ddx0=g.ddx[0];dut->ddx1=g.ddx[1];dut->ddx2=g.ddx[2];dut->ddx3=g.ddx[3];dut->ddx4=g.ddx[4];
+    dut->ddx5=g.ddx[5];dut->ddx6=g.ddx[6];dut->ddx7=g.ddx[7];dut->ddx8=g.ddx[8];dut->ddx9=g.ddx[9];
+    dut->ddy0=g.ddy[0];dut->ddy1=g.ddy[1];dut->ddy2=g.ddy[2];dut->ddy3=g.ddy[3];dut->ddy4=g.ddy[4];
+    dut->ddy5=g.ddy[5];dut->ddy6=g.ddy[6];dut->ddy7=g.ddy[7];dut->ddy8=g.ddy[8];dut->ddy9=g.ddy[9];
+    dut->c0=g.c[0];dut->c1=g.c[1];dut->c2=g.c[2];dut->c3=g.c[3];dut->c4=g.c[4];
+    dut->c5=g.c[5];dut->c6=g.c[6];dut->c7=g.c[7];dut->c8=g.c[8];dut->c9=g.c[9];
+    dut->tsp=g.tsp; dut->tcw=g.tcw; dut->text_ctrl=g.text_ctrl;
+    dut->pp_texture=g.pp_texture; dut->pp_offset=g.pp_offset;
+}
+
+struct Pix { uint8_t px, py; uint32_t invw; };
+
+int total=0, fails=0;
+
+static void run_batch(const char* name, const Cfg&g, std::vector<Pix>&pix){
+    // --- serial reference: argb per pixel ---
+    std::vector<uint32_t> ref(pix.size());
+    apply_cfg(g);
+    for(size_t i=0;i<pix.size();i++){
+        dut->px=pix[i].px; dut->py=pix[i].py; dut->invw_in=pix[i].invw;
+        dut->ref_req=1; tick(); dut->ref_req=0;
+        int guard=0;
+        while(!dut->ref_done){ tick(); if(++guard>10000){printf("[%s] ref hang\n",name);return;} }
+        ref[i]=dut->ref_argb;
+        tick();
+    }
+
+    // --- pipelined dut: stream the same pixels; collect by id ---
+    std::vector<uint32_t> got(pix.size(), 0xDEADBEEF);
+    std::vector<uint8_t>  seen(pix.size(), 0);
+    apply_cfg(g);
+    size_t in_i=0, out_n=0;
+    int guard=0;
+    dut->pp_in_valid=0;
+    while(out_n < pix.size()){
+        // Evaluate combinational outputs (incl. pp_stall) for the CURRENT state
+        // before deciding what to drive, so the TB samples the same stall the DUT
+        // will sample at the coming edge.
+        dut->eval();
+        bool stalled = dut->pp_stall;
+        bool present = (in_i < pix.size()) && !stalled;
+        if(present){
+            dut->px=pix[in_i].px; dut->py=pix[in_i].py; dut->invw_in=pix[in_i].invw;
+            dut->pp_in_id=(uint16_t)in_i;
+            dut->pp_in_valid=1;
+        } else {
+            dut->pp_in_valid=0;
+        }
+        tick();
+        if(present) in_i++;   // the DUT consumed it this edge
+        // registered outputs reflect the edge just taken; dedup via seen[]
+        if(dut->pp_out_valid && !dut->pp_stall){
+            uint32_t id=dut->pp_out_id;
+            if(id<pix.size() && !seen[id]){ got[id]=dut->pp_out_argb; seen[id]=1; out_n++; }
+        }
+        if(++guard > 2000000){ printf("[%s] pp hang: in=%zu out=%zu\n",name,in_i,out_n); break; }
+    }
+    dut->pp_in_valid=0;
+
+    // --- compare ---
+    for(size_t i=0;i<pix.size();i++){
+        total++;
+        if(got[i]!=ref[i]){
+            fails++;
+            if(fails<20) printf("[%s] pix%zu (%d,%d) invw=%08x: pp=%08x ref=%08x\n",
+                name,i,pix[i].px,pix[i].py,pix[i].invw,got[i],ref[i]);
+        }
+    }
+}
+
+int main(int argc,char**argv){
+    Verilated::commandArgs(argc,argv);
+    dut=new Vtsp_shade_pp_tb_top;
+    dut->clk=0; dut->reset=1;
+    dut->ref_req=0; dut->pp_in_valid=0; dut->pp_in_id=0;
+    // fill VRAM with pseudo-random texel data
+    for(uint32_t i=0;i<1048576;i++) VRAM[i]=((uint64_t)rnd()<<32)|rnd();
+    for(int i=0;i<8;i++) tick();
+    dut->reset=0; tick();
+
+    // helper: a plausible plane set (small gradients around a base)
+    auto mkcfg=[&](uint32_t tcw, uint32_t tsp, uint32_t ptx, uint32_t pof)->Cfg{
+        Cfg g; memset(&g,0,sizeof(g));
+        for(int k=0;k<10;k++){
+            g.ddx[k]=0x3a000000 | (rnd()&0x000fffff);  // ~small
+            g.ddy[k]=0x3a000000 | (rnd()&0x000fffff);
+            g.c[k]  =0x3f000000 | (rnd()&0x001fffff);   // ~0.5..1
+        }
+        g.tcw=tcw; g.tsp=tsp; g.text_ctrl=0; g.pp_texture=ptx; g.pp_offset=pof;
+        return g;
+    };
+
+    // a batch of pixels (varied coords + invW)
+    auto mkpix=[&](int n)->std::vector<Pix>{
+        std::vector<Pix> v;
+        for(int i=0;i<n;i++){
+            Pix p; p.px=rnd()&31; p.py=rnd()&31;
+            p.invw=0x3f000000 | (rnd()&0x007fffff);   // ~0.5..1, positive
+            v.push_back(p);
+        }
+        return v;
+    };
+
+    // pixfmt in tcw[29:27]; keep it simple: 0 (ARGB1555), non-VQ, non-palette.
+    // tsp bits: filtmode tsp[14:13]. Test point (0) and bilinear (1).
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(/*tcw*/0x00000000,/*tsp*/0x00000000,/*ptx*/1,/*pof*/0);
+        run_batch("tex_point", g, p);
+    }
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x00000000, 0x00002000 /*filtmode=1 bilinear*/, 1, 0);
+        run_batch("tex_bilinear", g, p);
+    }
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x00000000, 0x00000000, 0 /*no texture*/, 0);
+        run_batch("no_texture", g, p);
+    }
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x00000000, 0x00002040 /*bilinear + shadinstr*/, 1, 1 /*offset*/);
+        run_batch("tex_bilin_offset", g, p);
+    }
+
+    printf("tsp_shade_pp: %d/%d passed\n", total-fails, total);
+    printf(fails?"TSPSHADEPP FAIL\n":"TSPSHADEPP OK\n");
+    return fails?1:0;
+}

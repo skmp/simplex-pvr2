@@ -75,7 +75,7 @@ module isp_setup_min (
     // rc_req is pulsed (avoids racing the tri_area store). 3-cycle latency;
     // the setup FSM waits on rc_ack rather than a fixed cycle.
     reg        rc_req; reg [31:0] rc_in; wire rc_ack; wire [31:0] rc_y;
-    fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.in_valid(rc_req),.x(rc_in),
+    fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(rc_req),.x(rc_in),
                        .out_valid(rc_ack),.y(rc_y));
     // Sticky latch: the recip out_valid is a 1-clock pulse and may not land on a
     // body (phase-0) clock, so capture it + the result for the FSM to consume.

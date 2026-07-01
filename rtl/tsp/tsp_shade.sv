@@ -56,7 +56,7 @@ module tsp_shade import tsp_pkg::*; (
     wire [31:0] ad_y;
     fp_add24_s2 u_ad2 (.sum(ad_sum), .e_big(ad_eb), .s_big(ad_sb), .y(ad_y));
     reg        rc_req; reg [31:0] rc_in; wire rc_ack; wire [31:0] rc_y;
-    fp_rcp_fast u_rc (.clk(clk),.reset(reset),.in_valid(rc_req),.x(rc_in),
+    fp_rcp_fast u_rc (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(rc_req),.x(rc_in),
                       .out_valid(rc_ack),.y(rc_y));
 
     function [7:0] f2u8(input [31:0] f);

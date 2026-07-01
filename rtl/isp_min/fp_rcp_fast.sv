@@ -16,6 +16,7 @@
 module fp_rcp_fast (
     input             clk,
     input             reset,
+    input             stall,     // 1 stalls (freezes) all pipeline stages
     input             in_valid,
     input      [31:0] x,
     output reg        out_valid,
@@ -43,7 +44,7 @@ module fp_rcp_fast (
     reg        s1_s, s1_xz, v1;
     always @(posedge clk) begin
         if (reset) v1 <= 0;
-        else begin
+        else if (!stall) begin
             s1_r0 <= seed_rom[idx];
             s1_m  <= m_q16;
             s1_ex <= ex;  s1_s <= sx;  s1_xz <= x_zero;
@@ -60,7 +61,7 @@ module fp_rcp_fast (
     always @(*) mr_c = s1_m * s1_r0;              // 17b * 17b = 34b, Q1.32
     always @(posedge clk) begin
         if (reset) v2 <= 0;
-        else begin
+        else if (!stall) begin
             s2_two_m <= 18'h20000 - mr_c[33:16];  // 2.0(Q1.16) - top(Q1.16)
             s2_r0    <= s1_r0;
             s2_ex    <= s1_ex; s2_s <= s1_s; s2_xz <= s1_xz;
@@ -71,7 +72,7 @@ module fp_rcp_fast (
     // ---- stage 3: r1 = r0*two_m ; normalize + pack ----
     always @(posedge clk) begin
         if (reset) out_valid <= 0;
-        else begin
+        else if (!stall) begin
             out_valid <= v2;
             y <= pack(s2_r0, s2_two_m, s2_ex, s2_s, s2_xz);
         end
