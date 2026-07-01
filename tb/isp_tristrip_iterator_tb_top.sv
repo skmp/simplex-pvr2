@@ -13,6 +13,7 @@ module isp_tristrip_iterator_tb_top import tsp_pkg::*; (
     output            triangle_ready,
     output            prim_done,
     output     [31:0] out_isp,
+    output     [31:0] out_tag,          // the triangle's CoreTag (ISP_BACKGND_T layout)
     output     [31:0] v0x,v0y,v0z, v1x,v1y,v1z, v2x,v2y,v2z
 );
     objlist_entry_t entry;
@@ -28,6 +29,7 @@ module isp_tristrip_iterator_tb_top import tsp_pkg::*; (
     assign triangle_ready = trio.triangle_ready;
     assign prim_done      = trio.prim_done;
     assign out_isp        = trio.isp;
+    assign out_tag        = trio.tag;
     assign v0x=trio.v0.x; assign v0y=trio.v0.y; assign v0z=trio.v0.z;
     assign v1x=trio.v1.x; assign v1y=trio.v1.y; assign v1z=trio.v1.z;
     assign v2x=trio.v2.x; assign v2y=trio.v2.y; assign v2z=trio.v2.z;

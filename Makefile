@@ -20,7 +20,8 @@
 # MODE selects the scene fed to gen_vectors (default: tri).
 
 VERILATOR ?= verilator
-VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/tsp/gen
+VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/tsp/gen \
+            -CFLAGS "-O3 -march=native"
 
 # combinational (bit-exact) design
 RTL_COMB  = rtl/fp_add.sv rtl/fp_mul.sv rtl/fp_div.sv \
@@ -118,6 +119,18 @@ frontend: | $(BUILD)
 	  $(TSP)/isp_tristrip_iterator.sv $(TSP)/data_cache256.sv \
 	  $(CWD)/tb/frontend_tb.cpp --Mdir $(BUILD)/obj_frontend -o tb
 	./$(BUILD)/obj_frontend/tb
+
+# front-end + real ISP integration: adds isp_setup_min + isp_raster_line +
+# depth-test + CoreTag tag writes; tile FLUSH -> 640x480 fb -> output.bmp.
+frontendisp: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
+	  --top-module frontend_isp_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/frontend_isp_tb_top.sv \
+	  $(TSP)/reg_file.sv $(TSP)/region_array_parser.sv $(TSP)/object_list_parser.sv \
+	  $(TSP)/isp_tristrip_iterator.sv $(TSP)/data_cache256.sv \
+	  $(wildcard rtl/isp_min/*.sv) \
+	  $(CWD)/tb/frontend_isp_tb.cpp --Mdir $(BUILD)/obj_frontendisp -o tb
+	./$(BUILD)/obj_frontendisp/tb $(DUMP)
 
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)

@@ -33,7 +33,15 @@ static uint32_t get_word(uint32_t byte_addr){
 }
 
 struct Vtx { uint32_t x,y,z; };
-struct GoldTri { uint32_t isp; Vtx v0,v1,v2; };
+struct GoldTri { uint32_t isp, tag; Vtx v0,v1,v2; };
+
+// refsw CoreTagFromDesc (ISP_BACKGND_T_type layout): tag_offset[2:0],
+// param_offs_in_words[23:3], skip[26:24], shadow[27], cache_bypass[28].
+static uint32_t core_tag(uint32_t cache_bypass, uint32_t shadow, uint32_t skip,
+                         uint32_t param_offs, uint32_t tag_offset){
+    return (tag_offset&7) | ((param_offs&0x1FFFFF)<<3) | ((skip&7)<<24)
+         | ((shadow&1)<<27) | ((cache_bypass&1)<<28);
+}
 
 // Build a param record at byte `base`: isp,tsp,tcw [,tsp1,tcw1 if two_vol],
 // then 8 vertices of (skip+3) words each (only first 3 = XYZ are meaningful;
@@ -58,12 +66,14 @@ static uint32_t build_record(uint32_t base, uint32_t isp, uint32_t skip, bool tw
 
 // Golden: RenderTriangleStrip's triangle/vertex selection. refsw gates triangle
 // i by mask & (1 << (5-i)) (refsw_lists.cpp:194).
-static std::vector<GoldTri> golden_strip(uint32_t isp, uint32_t mask, Vtx verts[8]){
+static std::vector<GoldTri> golden_strip(uint32_t isp, uint32_t mask, Vtx verts[8],
+                                          uint32_t param_offs, uint32_t skip, uint32_t shadow){
     std::vector<GoldTri> out;
     for(int i=0;i<6;i++){
         if (!((mask>>(5-i))&1)) continue;
         int not_even = i&1, even = not_even^1;
-        out.push_back({isp, verts[i+not_even], verts[i+even], verts[i+2]});
+        uint32_t tag = core_tag((isp>>21)&1, shadow, skip, param_offs, i);
+        out.push_back({isp, tag, verts[i+not_even], verts[i+even], verts[i+2]});
     }
     return out;
 }
@@ -80,7 +90,7 @@ static void run_case(const char* name, uint32_t base_words, uint32_t skip, bool 
     for(int i=0;i<300;i++) tick();   // data_cache256 reset sweep
 
     build_record(base_words*4, isp, skip, two_vol, verts);
-    auto gold = golden_strip(isp, mask, verts);
+    auto gold = golden_strip(isp, mask, verts, base_words, skip, two_vol?1:0);
 
     dut->param_base=0;
     dut->entry_param_offs = base_words;   // param_offs_in_words (base is word-addr)
@@ -100,15 +110,16 @@ static void run_case(const char* name, uint32_t base_words, uint32_t skip, bool 
             } else {
                 auto&g=gold[gi];
                 bool ok = (dut->out_isp==g.isp)
+                    && (dut->out_tag==g.tag)
                     && vtx_eq(dut->v0x,dut->v0y,dut->v0z,g.v0)
                     && vtx_eq(dut->v1x,dut->v1y,dut->v1z,g.v1)
                     && vtx_eq(dut->v2x,dut->v2y,dut->v2z,g.v2);
                 if(!ok){
                     fails++;
-                    if(fails<20) printf("[%s] tri #%zu mismatch: hw isp=%08x v0=(%x,%x,%x) v1=(%x,%x,%x) v2=(%x,%x,%x)\n"
-                        "        exp isp=%08x v0=(%x,%x,%x) v1=(%x,%x,%x) v2=(%x,%x,%x)\n",
-                        name,gi,dut->out_isp,dut->v0x,dut->v0y,dut->v0z,dut->v1x,dut->v1y,dut->v1z,dut->v2x,dut->v2y,dut->v2z,
-                        g.isp,g.v0.x,g.v0.y,g.v0.z,g.v1.x,g.v1.y,g.v1.z,g.v2.x,g.v2.y,g.v2.z);
+                    if(fails<20) printf("[%s] tri #%zu mismatch: hw isp=%08x tag=%08x v0=(%x,%x,%x) v1=(%x,%x,%x) v2=(%x,%x,%x)\n"
+                        "        exp isp=%08x tag=%08x v0=(%x,%x,%x) v1=(%x,%x,%x) v2=(%x,%x,%x)\n",
+                        name,gi,dut->out_isp,dut->out_tag,dut->v0x,dut->v0y,dut->v0z,dut->v1x,dut->v1y,dut->v1z,dut->v2x,dut->v2y,dut->v2z,
+                        g.isp,g.tag,g.v0.x,g.v0.y,g.v0.z,g.v1.x,g.v1.y,g.v1.z,g.v2.x,g.v2.y,g.v2.z);
                 }
             }
             dut->consume=1; tick(); dut->consume=0;

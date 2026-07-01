@@ -61,6 +61,7 @@ module isp_tristrip_iterator import tsp_pkg::*; (
     // ---- geometry (latched at start) ----
     reg [26:0] rec_base;      // byte addr of this entry's record (isp word)
     reg [2:0]  skip_r; reg shadow_r; reg [5:0] mask_r;
+    reg [20:0] po_r;          // param_offs_in_words (kept raw for the CoreTag)
     wire       two_vol   = shadow_r;
     wire [4:0] stride_w  = 5'd3 + skip_r * (two_vol ? 5'd2 : 5'd1);   // words/vertex
     wire [26:0] hdr_bytes = two_vol ? 27'd20 : 27'd12;
@@ -73,10 +74,12 @@ module isp_tristrip_iterator import tsp_pkg::*; (
     // ---- output regs ----
     reg            tri_ready_r;
     xyz_t          v0_r, v1_r, v2_r;
+    core_tag_t     tag_r;
     reg            pdone_r;
     assign trio.triangle_ready = tri_ready_r;
     assign trio.isp            = isp_r;
     assign trio.v0 = v0_r; assign trio.v1 = v1_r; assign trio.v2 = v2_r;
+    assign trio.tag            = tag_r;
     assign trio.prim_done      = pdone_r;
 
     // ---- walk state ----
@@ -118,6 +121,7 @@ module isp_tristrip_iterator import tsp_pkg::*; (
                 skip_r   <= entry.skip;
                 shadow_r <= entry.shadow;
                 mask_r   <= entry.mask;
+                po_r     <= entry.param_offs_in_words;
                 busy     <= 1'b1;
                 st       <= S_ISP;
             end
@@ -145,6 +149,11 @@ module isp_tristrip_iterator import tsp_pkg::*; (
             S_SEEK: begin
                 if (mask_r[3'd5 - s_i]) begin
                     v0_r <= vslot[va(s_i)]; v1_r <= vslot[vb(s_i)]; v2_r <= vslot[{1'b0,s_i}+4'd2];
+                    // CoreTagFromDesc(isp.CacheBypass, shadow, skip, param_offs, i)
+                    tag_r <= '{ invalid:1'b0, pad:2'b00,
+                                cache_bypass:isp_r[ISP_CACHEBYPASS_BIT],
+                                shadow:shadow_r, skip:skip_r,
+                                param_offs_in_words:po_r, tag_offset:s_i };
                     st <= S_PRESENT;
                 end else if (s_i == 3'd5) st <= S_PDONE;
                 else s_i <= s_i + 3'd1;

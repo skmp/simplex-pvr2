@@ -341,8 +341,7 @@ module tile_engine_top import tsp_pkg::*; #(
         S_RAS_WR:
             for (ai = 0; ai < NBANKS; ai = ai + 1) begin
                 dt_addr[7*ai +: 7] = pix_addr(ras_x + ai[4:0], ras_y);
-                if (ras_inside[ai] &&
-                    fcmp_pass(depth_mode, ras_invw(ai), dt_rdata[DTW*ai + DTW-1 -: 32])) begin
+                if (ras_inside[ai] && ras_pass[ai]) begin
                     dt_we[ai]              = 1'b1;
                     dt_wdata[DTW*ai +: DTW] = {
                         zwrite_dis ? dt_rdata[DTW*ai + DTW-1 -: 32] : ras_invw(ai),
@@ -420,39 +419,18 @@ module tile_engine_top import tsp_pkg::*; #(
         .invw_flat(ras_invw_flat)
     );
 
-    // opaque DepthMode compare: does new invW pass against stored depth?
-    //  refsw: 0 never,1 less(reject if new>=old),2 equal,3 <=,4 greater,
-    //         5 !=,6 >=,7 always.  ("reject" cases inverted to a pass flag)
-    function fcmp_pass(input [2:0] mode, input [31:0] nw, input [31:0] ob);
-        reg lt,eq,gt;
-        begin
-            eq = (nw[30:0]==31'd0 && ob[30:0]==31'd0) ? 1'b1 : (nw==ob);
-            gt = fgt(nw,ob);
-            lt = ~eq & ~gt;
-            case (mode)
-                3'd0: fcmp_pass = 1'b0;      // never
-                3'd1: fcmp_pass = lt;        // less  (new < old)
-                3'd2: fcmp_pass = eq;        // equal
-                3'd3: fcmp_pass = lt|eq;     // less-or-equal
-                3'd4: fcmp_pass = gt;        // greater
-                3'd5: fcmp_pass = ~eq;       // not-equal
-                3'd6: fcmp_pass = gt|eq;     // greater-or-equal
-                3'd7: fcmp_pass = 1'b1;      // always
-            endcase
+    // opaque DepthMode compare per rasterizer lane: does the lane's new invW
+    // pass against the stored depth in its bank? (isp_depth_cmp, refsw modes)
+    wire [RAS_LANES-1:0] ras_pass;
+    generate
+        for (genvar gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
+            isp_depth_cmp u_cmp (
+                .mode(depth_mode),
+                .nw  (ras_invw_flat[32*gd +: 32]),
+                .ob  (dt_rdata[DTW*gd + DTW-1 -: 32]),
+                .pass(ras_pass[gd]));
         end
-    endfunction
-    // signed-float greater-than a > b (no NaN/inf; DaZ handled by ==0 test)
-    function fgt(input [31:0] a, input [31:0] b);
-        reg az,bz; reg [30:0] am,bm;
-        begin
-            az=(a[30:0]==0); bz=(b[30:0]==0);
-            am=a[30:0]; bm=b[30:0];
-            if (az&&bz)          fgt=1'b0;
-            else if (a[31]^b[31]) fgt = b[31];         // a>b if b negative
-            else if (~a[31])      fgt = (am>bm);        // both >=0
-            else                  fgt = (am<bm);        // both <0
-        end
-    endfunction
+    endgenerate
 
     // ISP_TSP word bitfields (refsw core_structs ISP layout, LSB-first):
     //  [22]UV_16b [23]Gouraud [24]Offset [25]Texture [26]ZWriteDis
