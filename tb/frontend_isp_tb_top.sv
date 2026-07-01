@@ -186,7 +186,7 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                S_SETUP=11, S_RAS=12, S_RASW=13;
     reg [3:0] st;
 
-    integer tri_count, cull_count;
+    integer tri_count, cull_count, tri_seen;
     reg [5:0] cur_tx, cur_ty;      // latched tile coords (stable during lists)
     integer i, l;
     integer px, py;
@@ -196,7 +196,7 @@ module frontend_isp_tb_top import tsp_pkg::*; (
             st<=S_IDLE; done<=0; ra_start<=0; ol_start<=0; it_start<=0;
             isp_start<=0; ras_in_valid<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
-            tri_count<=0; cull_count<=0;
+            tri_count<=0; cull_count<=0; tri_seen<=0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
             isp_start<=0; ras_in_valid<=0;
@@ -273,9 +273,12 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                     tri_tag <= it_trio.tag;
                     isp_start <= 1'b1;
                     st <= S_SETUP;
-                    if (tri_count % 100 == 0)
+                    // count PRESENTED triangles (tri_count only counts the
+                    // non-culled ones, which would re-print through cull runs)
+                    tri_seen <= tri_seen + 1;
+                    if (tri_seen % 100 == 0)
                         $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h v0=(%h,%h,%h) v1=(%h,%h,%h) v2=(%h,%h,%h)",
-                            cur_tx, cur_ty, tri_count, it_trio.tag, it_trio.isp,
+                            cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp,
                             it_trio.v0.x, it_trio.v0.y, it_trio.v0.z,
                             it_trio.v1.x, it_trio.v1.y, it_trio.v1.z,
                             it_trio.v2.x, it_trio.v2.y, it_trio.v2.z);

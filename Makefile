@@ -132,6 +132,16 @@ frontendisp: | $(BUILD)
 	  $(CWD)/tb/frontend_isp_tb.cpp --Mdir $(BUILD)/obj_frontendisp -o tb
 	./$(BUILD)/obj_frontendisp/tb $(DUMP)
 
+# front-end + ISP + TSP: tile flush shades every pixel through a tag-keyed TSP
+# plane cache (param fetch + tsp_setup_min) and tsp_shade -> shaded_<name>.bmp.
+frontendtsp: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
+	  --top-module frontend_tsp_tb_top \
+	  $(TSP_RTL) tb/frontend_tsp_tb_top.sv \
+	  $(wildcard rtl/isp_min/*.sv) \
+	  $(CWD)/tb/frontend_tsp_tb.cpp --Mdir $(BUILD)/obj_frontendtsp -o tb
+	./$(BUILD)/obj_frontendtsp/tb $(DUMP)
+
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
 	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw -Irtl/tsp/gen \
