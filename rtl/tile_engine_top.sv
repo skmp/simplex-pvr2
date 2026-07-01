@@ -36,7 +36,7 @@
 // The depth/tag buffer holds {32-bit depth, 24-bit tag}; the color buffer holds
 // a 32-bit color per pixel. Both are 32x32 (1024 entries).
 //
-module tile_engine_top #(
+module tile_engine_top import tsp_pkg::*; #(
     parameter integer TILE_W   = 32,
     parameter integer TILE_H   = 32,
     parameter integer TAG_BITS = 24
@@ -85,6 +85,10 @@ module tile_engine_top #(
     localparam REG_T_COL1=6'd39, REG_T_COL2=6'd40, REG_T_COL3=6'd41;   // packed ARGB
     localparam REG_T_OFS1=6'd42, REG_T_OFS2=6'd43, REG_T_OFS3=6'd44;   // packed offset
     localparam REG_ISP_TSP=6'd45, REG_TSP=6'd46, REG_TCW=6'd47;        // TA words
+    // TSP shade (CMD_TRIANGLE_TSP_SHADE)
+    localparam REG_TSP_SHADE_TAG=6'd48;   // per-pixel tag to shade (compare)
+    localparam REG_TEXT_CTRL    =6'd49;   // TEXT_CONTROL (stride unit, low 5b)
+    localparam REG_TAG          =6'd50;   // TAG register (per spec)
 
     // Convenient reads of the input registers (assign-from-regs style).
     wire [31:0] isp_x1 = regs[REG_X1], isp_y1 = regs[REG_Y1], isp_z1 = regs[REG_Z1];
@@ -183,14 +187,14 @@ module tile_engine_top #(
         .ram1_byteenable   (ram_byteenable),
         .ram1_write        (ram_we),
 
-        // ram2 : unused
+        // ram2 : texture read channel (driven by tex_mem under SYNTHESIS)
         .ram2_clk          (clk_100m),
-        .ram2_address      (29'd0),
-        .ram2_burstcount   (8'd0),
-        .ram2_waitrequest  (),
-        .ram2_readdata     (),
-        .ram2_readdatavalid(),
-        .ram2_read         (1'b0),
+        .ram2_address      (tex_ram2_address),
+        .ram2_burstcount   (tex_ram2_burstcount),
+        .ram2_waitrequest  (tex_ram2_waitrequest),
+        .ram2_readdata     (tex_ram2_readdata),
+        .ram2_readdatavalid(tex_ram2_readdatavalid),
+        .ram2_read         (tex_ram2_read),
         .ram2_writedata    (64'd0),
         .ram2_byteenable   (8'd0),
         .ram2_write        (1'b0),
@@ -245,21 +249,25 @@ module tile_engine_top #(
     // ------------------------------------------------------------------
     // FSM
     // ------------------------------------------------------------------
-    localparam [3:0]
-        S_IDLE      = 4'd0,
-        S_CLEAR     = 4'd1,
-        S_DRAWTAGS  = 4'd2,
-        S_FLUSH_RD  = 4'd3,  // present pixel, issue write
-        S_FLUSH_WAIT= 4'd4,  // wait for ddram to accept (not busy)
-        S_ISP_SETUP = 4'd6,  // wait for isp_setup_min to finish
-        S_ISP_RASTER= 4'd7,  // rasterize a chunk (read phase)
-        S_TSP_SETUP = 4'd8,  // wait for tsp_setup_min to finish
-        S_DRAW_RD   = 4'd9,  // draw-tags: present dt read addr
-        S_RAS_WR    = 4'd10, // rasterize: depth-compare + write-back phase
-        S_RAS_WAIT  = 4'd11, // rasterize: wait for pipelined line eval
-        S_DONE      = 4'd5;
+    localparam [4:0]
+        S_IDLE      = 5'd0,
+        S_CLEAR     = 5'd1,
+        S_DRAWTAGS  = 5'd2,
+        S_FLUSH_RD  = 5'd3,  // present pixel, issue write
+        S_FLUSH_WAIT= 5'd4,  // wait for ddram to accept (not busy)
+        S_ISP_SETUP = 5'd6,  // wait for isp_setup_min to finish
+        S_ISP_RASTER= 5'd7,  // rasterize a chunk (read phase)
+        S_TSP_SETUP = 5'd8,  // wait for tsp_setup_min to finish
+        S_DRAW_RD   = 5'd9,  // draw-tags: present dt read addr
+        S_RAS_WR    = 5'd10, // rasterize: depth-compare + write-back phase
+        S_RAS_WAIT  = 5'd11, // rasterize: wait for pipelined line eval
+        S_SH_RD     = 5'd12, // shade: present dt read addr for pixel
+        S_SH_CMP    = 5'd13, // shade: dt_rdata valid -> tag compare, invW
+        S_SH_RUN    = 5'd14, // shade: wait tsp_shade done
+        S_SH_WR     = 5'd15, // shade: write colour, advance pixel
+        S_DONE      = 5'd5;
 
-    reg [3:0]       state;
+    reg [4:0]       state;
     reg [IDX_W-1:0] idx;         // pixel iterator (0..N_PIX-1)
     integer         bi;          // rasterizer per-bank loop var
     assign idx_x = idx[XW-1:0];
@@ -303,6 +311,13 @@ module tile_engine_top #(
             col_wdata[32*dr_bank +: 32]  = {8'hFF, dt_rdata[DTW*dr_bank + TAG_BITS-1 -: TAG_BITS]};
         end
         S_FLUSH_RD: col_addr[7*idx[2:0] +: 7] = idx[9:3];
+        // shade: present dt read (pixel = idx) so S_SH_CMP has tag+invW.
+        S_SH_RD, S_SH_CMP, S_SH_RUN: dt_addr[7*idx[2:0] +: 7] = idx[9:3];
+        S_SH_WR: begin
+            col_we[idx[2:0]]             = 1'b1;
+            col_addr[7*idx[2:0] +: 7]    = idx[9:3];
+            col_wdata[32*idx[2:0] +: 32] = sh_argb;
+        end
         S_ISP_RASTER, S_RAS_WAIT:
             for (ai = 0; ai < NBANKS; ai = ai + 1)
                 dt_addr[7*ai +: 7] = pix_addr(ras_x + ai[4:0], ras_y);
@@ -466,6 +481,64 @@ module tile_engine_top #(
         end
     end
 
+    // ------------------------------------------------------------------
+    // TSP shade datapath (CMD_TRIANGLE_TSP_SHADE): 2 texture caches fed by
+    // tex_mem, tsp_shade orchestrating the per-pixel pipeline.
+    // ------------------------------------------------------------------
+    // HPS ram2 texture read channel (driven by tex_mem under SYNTHESIS; tied off
+    // in sim where tex_mem serves a behavioural VRAM instead).
+    wire [28:0] tex_ram2_address;
+    wire [7:0]  tex_ram2_burstcount;
+    wire        tex_ram2_read;
+`ifdef SYNTHESIS
+    wire        tex_ram2_waitrequest, tex_ram2_readdatavalid;
+    wire [63:0] tex_ram2_readdata;
+`else
+    wire        tex_ram2_waitrequest   = 1'b0;
+    wire        tex_ram2_readdatavalid = 1'b0;
+    wire [63:0] tex_ram2_readdata      = 64'd0;
+`endif
+
+    // cache <-> tex_mem DDR bundles
+    ddr_rd_req_t  dc_dreq, qc_dreq;
+    ddr_rd_resp_t dc_dresp, qc_dresp;
+    // tex_fetch/shade <-> cache client bundles
+    cache_req_t   dc_creq, qc_creq;
+    cache_resp_t  dc_cresp, qc_cresp;
+
+    tex_cache u_dcache (.clk(clk_100m),.reset(reset_100m),
+        .creq(dc_creq),.cresp(dc_cresp),.dreq(dc_dreq),.dresp(dc_dresp));
+    tex_cache u_qcache (.clk(clk_100m),.reset(reset_100m),
+        .creq(qc_creq),.cresp(qc_cresp),.dreq(qc_dreq),.dresp(qc_dresp));
+
+    tex_mem u_texmem (.clk(clk_100m),.reset(reset_100m),
+        .d_dreq(dc_dreq),.d_dresp(dc_dresp),.q_dreq(qc_dreq),.q_dresp(qc_dresp)
+`ifdef SYNTHESIS
+        ,.ram2_address(tex_ram2_address),.ram2_burstcount(tex_ram2_burstcount),
+        .ram2_waitrequest(tex_ram2_waitrequest),.ram2_readdata(tex_ram2_readdata),
+        .ram2_readdatavalid(tex_ram2_readdatavalid),.ram2_read(tex_ram2_read)
+`endif
+    );
+`ifndef SYNTHESIS
+    assign tex_ram2_address=29'd0; assign tex_ram2_burstcount=8'd0; assign tex_ram2_read=1'b0;
+`endif
+
+    // flatten the plane arrays for the tsp_shade port (packed vectors)
+    // tsp_shade takes p_ddx/p_ddy/p_c as [0:9] arrays directly.
+    reg        sh_req;
+    reg  [4:0] sh_px, sh_py;
+    reg [31:0] sh_invw;
+    wire       sh_done;
+    wire [31:0] sh_argb;
+    tsp_shade u_shade (
+        .clk(clk_100m),.reset(reset_100m),.req(sh_req),.px(sh_px),.py(sh_py),
+        .done(sh_done),.argb(sh_argb),
+        .invw_in(sh_invw),
+        .p_ddx(tsp_ddx),.p_ddy(tsp_ddy),.p_c(tsp_c),
+        .tsp(regs[REG_TSP]),.tcw(regs[REG_TCW]),.text_ctrl(regs[REG_TEXT_CTRL][4:0]),
+        .pp_texture(isp_word[25]),.pp_offset(isp_word[24]),
+        .tc_req(dc_creq),.tc_resp(dc_cresp),.vq_req(qc_creq),.vq_resp(qc_cresp));
+
     always @(posedge clk_100m) begin
         if (reset_100m) begin
             state    <= S_IDLE;
@@ -477,6 +550,7 @@ module tile_engine_top #(
             isp_start<= 1'b0;
             tsp_start<= 1'b0;
             ras_in_valid <= 1'b0;
+            sh_req   <= 1'b0;
         end else begin
             cmd_done <= 1'b0;    // default: single-cycle pulse
             mem_rd   <= 1'b0;
@@ -484,6 +558,7 @@ module tile_engine_top #(
             isp_start<= 1'b0;    // default: single-cycle start pulse
             tsp_start<= 1'b0;
             ras_in_valid <= 1'b0;   // default: single-cycle issue pulse
+            sh_req   <= 1'b0;       // default: single-cycle shade start pulse
 
             case (state)
             // --------------------------------------------------------
@@ -512,6 +587,7 @@ module tile_engine_top #(
                                 tsp_start <= 1'b1;
                                 state     <= S_TSP_SETUP;
                             end
+                            CMD_TRIANGLE_TSP_SHADE: state <= S_SH_RD;
                             // nop commands: acknowledge, one cycle before ready
                             default: begin
                                 cmd_done <= 1'b1;
@@ -622,6 +698,32 @@ module tile_engine_top #(
             // latched into tsp_ddx/ddy/c by the dedicated always block above.
             S_TSP_SETUP: begin
                 if (tsp_done) state <= S_DONE;
+            end
+
+            // --------------------------------------------------------
+            // TRIANGLE_TSP_SHADE: for each pixel, read its dt entry (tag+invW);
+            // if tag == REG_TSP_SHADE_TAG, run tsp_shade and write the colour.
+            // idx iterates 0..N_PIX-1; bank=idx[2:0], addr=idx[9:3].
+            S_SH_RD: state <= S_SH_CMP;                 // dt read addr presented
+            S_SH_CMP: begin
+                // dt_rdata[bank] valid now: {invW(32), tag(TAG_BITS)}
+                if (dt_rdata[DTW*idx[2:0] + TAG_BITS-1 -: TAG_BITS]
+                        == regs[REG_TSP_SHADE_TAG][TAG_BITS-1:0]) begin
+                    sh_invw <= dt_rdata[DTW*idx[2:0] + DTW-1 -: 32];
+                    sh_px   <= idx[XW-1:0];
+                    sh_py   <= idx[IDX_W-1:XW];
+                    sh_req  <= 1'b1;
+                    state   <= S_SH_RUN;
+                end else begin
+                    // skip this pixel
+                    if (idx == LAST_IDX) state <= S_DONE;
+                    else begin idx <= idx + 1'b1; state <= S_SH_RD; end
+                end
+            end
+            S_SH_RUN: if (sh_done) state <= S_SH_WR;    // col write driven comb
+            S_SH_WR: begin
+                if (idx == LAST_IDX) state <= S_DONE;
+                else begin idx <= idx + 1'b1; state <= S_SH_RD; end
             end
 
             // --------------------------------------------------------

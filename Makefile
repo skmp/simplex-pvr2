@@ -9,6 +9,11 @@
 #   make ip         - sequenced design wired to Altera FP IP, run via IP stubs (uses MODE)
 #   make ip-tri / ip-quad
 #   make all        - fp + comb + sequenced + IP-path, tri & quad
+#   make test       - fast unit tests: fp prims + TSP texture blocks + pipeline
+#   make tex        - TSP texture-pipeline block tests (randomized vs refsw):
+#                     tex-addr / tex-uv / tex-filter / tex-combiner / tex-fetch
+#   make pipe       - full TSP shading pipeline co-sim (setup->raster->shade),
+#                     VRAM-backed tex_mem, vs refsw model
 #   make quartus    - synthesize the sequenced+IP design (needs Quartus on PATH)
 #   make clean
 #
@@ -32,9 +37,64 @@ CWD  := $(shell pwd)
 MODE ?= tri
 MODEARG = $(if $(filter quad,$(MODE)),quad,)
 
-.PHONY: all vectors fp sim sim-tri sim-quad seq seq-tri seq-quad ip ip-tri ip-quad quartus clean
+.PHONY: all vectors fp sim sim-tri sim-quad seq seq-tri seq-quad ip ip-tri ip-quad quartus clean \
+        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe
+
+# TSP module files (package first). ISP shared FP units come from rtl/isp_min.
+TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
 
 all: fp sim-tri sim-quad seq-tri seq-quad ip-tri ip-quad
+
+# ---- run the fast unit tests (FP prims + TSP texture blocks + full pipeline) ----
+test: fp tex pipe
+
+# ---- TSP texture-pipeline block tests (randomized vectors vs refsw) ----
+TSP = rtl/tsp
+tex: tex-addr tex-uv tex-filter tex-combiner tex-fetch
+	@echo "=== all texture block tests passed ==="
+
+tex-addr: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_addr \
+	  $(TSP)/tex_addr.sv $(CWD)/tb/tex_addr_tb.cpp \
+	  --Mdir $(BUILD)/obj_texaddr -o tb
+	./$(BUILD)/obj_texaddr/tb
+
+tex-uv: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_uv2texel \
+	  $(TSP)/tex_uv2texel.sv $(CWD)/tb/tex_uv2texel_tb.cpp \
+	  --Mdir $(BUILD)/obj_texuv -o tb
+	./$(BUILD)/obj_texuv/tb
+
+tex-filter: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_filter \
+	  $(TSP)/tex_filter.sv $(CWD)/tb/tex_filter_tb.cpp \
+	  --Mdir $(BUILD)/obj_texfilt -o tb
+	./$(BUILD)/obj_texfilt/tb
+
+tex-combiner: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module color_combiner \
+	  $(TSP)/color_combiner.sv $(CWD)/tb/tex_combiner_tb.cpp \
+	  --Mdir $(BUILD)/obj_texcomb -o tb
+	./$(BUILD)/obj_texcomb/tb
+
+# ---- full TSP shading pipeline co-sim (tile_engine_top, VRAM-backed tex_mem) ----
+# Drives regs -> ISP_SETUP -> ISP_RASTERIZE -> TSP_SETUP -> TSP_SHADE and checks
+# the shaded colour buffer vs a refsw-equivalent model.
+DDRSTUB = tb/ddram_stub.sv tb/sysmem_stub.sv
+pipe: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-PINCONNECTEMPTY --public-flat-rw \
+	  --top-module tile_engine_top \
+	  $(TSP_RTL) rtl/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) $(DDRSTUB) \
+	  $(CWD)/tb/tsp_pipe_tb.cpp --Mdir $(BUILD)/obj_pipe -o tb
+	./$(BUILD)/obj_pipe/tb
+
+# tex_fetch integrated test: tex_fetch + 2 injected caches + behavioural DDR.
+tex-fetch: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module texfetch_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/tex_fetch_tb_top.sv $(TSP)/tex_fetch.sv $(TSP)/tex_addr.sv \
+	  $(TSP)/tex_decode.sv $(TSP)/tex_cache.sv $(CWD)/tb/tex_fetch_tb.cpp \
+	  --Mdir $(BUILD)/obj_texfetch -o tb
+	./$(BUILD)/obj_texfetch/tb
 
 # ---- golden vectors ----
 $(BUILD)/gen_vectors: sim/gen_vectors.c | $(BUILD)
