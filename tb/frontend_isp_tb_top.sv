@@ -141,7 +141,8 @@ module frontend_isp_tb_top import tsp_pkg::*; (
     // -------------------- ISP rasterize (as tile_engine_top) --------------------
     localparam integer RAS_LANES = 8;
     reg  [4:0]  ras_y, ras_x;
-    reg         ras_in_valid;
+    // combinational: issue a chunk on every S_RAS cycle, in phase with ras_x/y
+    wire        ras_in_valid = (st == S_RAS);
     wire        ras_out_valid;
     wire [RAS_LANES-1:0]    ras_inside;
     wire [32*RAS_LANES-1:0] ras_invw_flat;
@@ -149,6 +150,7 @@ module frontend_isp_tb_top import tsp_pkg::*; (
         ras_invw = ras_invw_flat[32*lane +: 32];
     endfunction
 
+    wire [4:0] ras_ox, ras_oy;     // coords echoed with the result chunk
     isp_raster_line #(.LANES(RAS_LANES)) u_line (
         .clk(clk), .reset(reset),
         .in_valid(ras_in_valid), .y(ras_y), .x_base(ras_x),
@@ -158,22 +160,23 @@ module frontend_isp_tb_top import tsp_pkg::*; (
         .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
         .out_valid(ras_out_valid),
         .inside_mask(ras_inside),
-        .invw_flat(ras_invw_flat)
+        .invw_flat(ras_invw_flat),
+        .out_x(ras_ox), .out_y(ras_oy)
     );
 
     wire [2:0] depth_mode = isp_word[31:29];
     wire       zwrite_dis = isp_word[26];
 
-    // per-lane refsw DepthMode compare (isp_depth_cmp, shared with the top).
-    // Old depth is read combinationally from the tile buffer at the chunk's
-    // pixels; index {ras_y, ras_x+lane} == y*32 + x (no carry: x+lane <= 31).
+    // per-lane refsw DepthMode compare (isp_depth_cmp). Reads old depth at the
+    // RESULT chunk coords (ras_ox,ras_oy) - the chunks stream out back-to-back,
+    // so the result addresses trail the issue side by the pipeline latency.
     wire [RAS_LANES-1:0] ras_pass;
     generate
         for (genvar gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
             isp_depth_cmp u_cmp (
                 .mode(depth_mode),
                 .nw  (ras_invw_flat[32*gd +: 32]),
-                .ob  (dt_depth[{ras_y, ras_x + 5'(gd)}]),
+                .ob  (dt_depth[{ras_oy, ras_ox + 5'(gd)}]),
                 .pass(ras_pass[gd]));
         end
     endgenerate
@@ -183,7 +186,7 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                S_OL_WAIT=4, S_ENTRY=5,
                S_IT_WAIT=7, S_OL_ACK=8,
                S_RA_ACK=9, S_DONE=10,
-               S_SETUP=11, S_RAS=12, S_RASW=13;
+               S_SETUP=11, S_RAS=12, S_RASDRAIN=13;
     reg [3:0] st;
 
     integer tri_count, cull_count, tri_seen;
@@ -191,16 +194,43 @@ module frontend_isp_tb_top import tsp_pkg::*; (
     integer i, l;
     integer px, py;
 
+    // streamed rasterizer bookkeeping: chunks in flight (issued but not yet
+    // consumed). One triangle = TILE_W/RAS_LANES * TILE_H chunks. The consumer
+    // runs every cycle on ras_out_valid; the sweep is done when all issued and
+    // all drained.
+    localparam integer NCHUNK = (TILE_W/RAS_LANES) * TILE_H;   // 4*32 = 128
+    integer ras_inflight;
+
     always @(posedge clk) begin
         if (reset) begin
             st<=S_IDLE; done<=0; ra_start<=0; ol_start<=0; it_start<=0;
-            isp_start<=0; ras_in_valid<=0;
+            isp_start<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
-            tri_count<=0; cull_count<=0; tri_seen<=0;
+            tri_count<=0; cull_count<=0; tri_seen<=0; ras_inflight<=0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
-            isp_start<=0; ras_in_valid<=0;
+            isp_start<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
+
+            // -------- streamed rasterizer CONSUMER (runs every cycle) --------
+            // A result chunk emerges LAT cycles after issue; write depth/tag for
+            // its passing lanes at the echoed (ras_ox,ras_oy). Independent of the
+            // FSM so results drain while new chunks are still being issued.
+            if (ras_out_valid) begin
+                for (l = 0; l < RAS_LANES; l = l + 1) begin
+                    /* verilator lint_off WIDTH */
+                    if (ras_inside[l] && ras_pass[l]) begin
+                        if (!zwrite_dis)
+                            dt_depth[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = ras_invw(l);
+                        dt_tag[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = tri_tag;
+                    end
+                    /* verilator lint_on WIDTH */
+                end
+            end
+            // inflight = issued (ras_in_valid pulse) - consumed (ras_out_valid).
+            // ras_in_valid is the registered value driving the pipe THIS edge, so
+            // it exactly counts one issue per chunk that actually entered.
+            ras_inflight <= ras_inflight + (ras_in_valid ? 1 : 0) - (ras_out_valid ? 1 : 0);
 
             case (st)
             S_IDLE: if (go) begin ra_start<=1; st<=S_RA; end
@@ -307,31 +337,28 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                 end
             end
 
-            // issue one 8-pixel chunk into the raster pipeline
-            S_RAS: begin ras_in_valid <= 1'b1; st <= S_RASW; end
-
-            // results ready: depth-test + {invW, CoreTag} write per passing lane
-            S_RASW: if (ras_out_valid) begin
-                for (l = 0; l < RAS_LANES; l = l + 1) begin
-                    /* verilator lint_off WIDTH */
-                    if (ras_inside[l] && ras_pass[l]) begin
-                        if (!zwrite_dis)
-                            dt_depth[{27'd0,ras_y}*TILE_W + {27'd0,ras_x} + l] = ras_invw(l);
-                        dt_tag[{27'd0,ras_y}*TILE_W + {27'd0,ras_x} + l] = tri_tag;
-                    end
-                    /* verilator lint_on WIDTH */
-                end
+            // STREAM: issue one 8-pixel chunk EVERY cycle (back-to-back) across
+            // the whole 32x32 tile. ras_in_valid is driven COMBINATIONALLY (see
+            // below) so it is in phase with ras_x/ras_y THIS cycle - a registered
+            // pulse would lag one cycle and pair with the already-advanced ras_x,
+            // dropping the first chunk of every tile.
+            S_RAS: begin
                 if (ras_x == 5'(TILE_W - RAS_LANES)) begin
                     ras_x <= 5'd0;
-                    if (ras_y == 5'(TILE_H - 1)) begin
-                        it_ack.triangle_done <= 1'b1;    // triangle fully rastered
-                        st <= S_IT_WAIT;
-                    end else begin
-                        ras_y <= ras_y + 5'd1; st <= S_RAS;
-                    end
+                    if (ras_y == 5'(TILE_H - 1)) st <= S_RASDRAIN;  // all issued
+                    else ras_y <= ras_y + 5'd1;
                 end else begin
-                    ras_x <= ras_x + 5'(RAS_LANES); st <= S_RAS;
+                    ras_x <= ras_x + 5'(RAS_LANES);
                 end
+            end
+
+            // all chunks issued: wait for the pipeline to fully drain, then ack.
+            // Gate on !ras_in_valid too: the cycle we enter drain, the LAST
+            // issued chunk is still entering the pipe (ras_in_valid high) and its
+            // +1 to ras_inflight hasn't committed yet - acking now would drop it.
+            S_RASDRAIN: if (ras_inflight == 0 && !ras_in_valid && !ras_out_valid) begin
+                it_ack.triangle_done <= 1'b1;
+                st <= S_IT_WAIT;
             end
 
             S_OL_ACK: st <= S_OL_WAIT;

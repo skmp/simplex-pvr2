@@ -58,15 +58,24 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     reg [63:0] ts_do; reg ts_dv;
     assign ts_dresp.busy=1'b0; assign ts_dresp.dout=ts_do; assign ts_dresp.dready=ts_dv;
     always @(posedge clk) begin ts_dv<=0; if(ts_dreq.rd) begin ts_do<=vram[ts_dreq.addr[19:0]]; ts_dv<=1; end end
-    // texture ports (64-bit view = physical, no de-interleave)
-    ddr_rd_req_t  dc_dreq, qc_dreq;
-    ddr_rd_resp_t dc_dresp, qc_dresp;
-    reg [63:0] dc_do; reg dc_dv;
-    assign dc_dresp.busy=1'b0; assign dc_dresp.dout=dc_do; assign dc_dresp.dready=dc_dv;
-    always @(posedge clk) begin dc_dv<=0; if(dc_dreq.rd) begin dc_do<=vram[dc_dreq.addr[19:0]]; dc_dv<=1; end end
-    reg [63:0] qc_do; reg qc_dv;
-    assign qc_dresp.busy=1'b0; assign qc_dresp.dout=qc_do; assign qc_dresp.dready=qc_dv;
-    always @(posedge clk) begin qc_dv<=0; if(qc_dreq.rd) begin qc_do<=vram[qc_dreq.addr[19:0]]; qc_dv<=1; end end
+    // texture ports (64-bit view = physical, no de-interleave). The pipelined
+    // shader has 4 corner fetchers, each with a {data, VQ} cache pair -> 8 DDR
+    // ports. A generate loop builds the read stubs.
+    genvar gi_tex;
+    ddr_rd_req_t  tex_dreq [0:7];
+    ddr_rd_resp_t tex_dresp [0:7];
+    generate
+      for (gi_tex = 0; gi_tex < 8; gi_tex = gi_tex + 1) begin : texddr
+        reg [63:0] do_r; reg dv_r;
+        assign tex_dresp[gi_tex].busy=1'b0;
+        assign tex_dresp[gi_tex].dout=do_r;
+        assign tex_dresp[gi_tex].dready=dv_r;
+        always @(posedge clk) begin
+            dv_r<=0;
+            if (tex_dreq[gi_tex].rd) begin do_r<=vram[tex_dreq[gi_tex].addr[19:0]]; dv_r<=1; end
+        end
+      end
+    endgenerate
 
     // -------------------- caches --------------------
     cache_req256_t ra_creq, ol_creq, pr_creq, ts_creq;
@@ -76,10 +85,20 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     data_cache256 u_pr_c (.clk(clk),.reset(reset),.creq(pr_creq),.cresp(pr_cresp),.dreq(pr_dreq),.dresp(pr_dresp));
     data_cache256 u_ts_c (.clk(clk),.reset(reset),.creq(ts_creq),.cresp(ts_cresp),.dreq(ts_dreq),.dresp(ts_dresp));
 
-    cache_req_t   dc_creq, qc_creq;
-    cache_resp_t  dc_cresp, qc_cresp;
-    tex_cache u_dcache (.clk(clk),.reset(reset),.creq(dc_creq),.cresp(dc_cresp),.dreq(dc_dreq),.dresp(dc_dresp));
-    tex_cache u_qcache (.clk(clk),.reset(reset),.creq(qc_creq),.cresp(qc_cresp),.dreq(qc_dreq),.dresp(qc_dresp));
+    // 4 corner fetchers x {data (tc), VQ codebook}. tex_dreq/dresp index:
+    //   corner c: data = 2*c, VQ = 2*c+1.
+    cache_req_t   pp_tc_req [0:3], pp_vq_req [0:3];
+    cache_resp_t  pp_tc_resp[0:3], pp_vq_resp[0:3];
+    generate
+      for (gi_tex = 0; gi_tex < 4; gi_tex = gi_tex + 1) begin : texcache
+        tex_cache u_tc (.clk(clk),.reset(reset),
+            .creq(pp_tc_req[gi_tex]),.cresp(pp_tc_resp[gi_tex]),
+            .dreq(tex_dreq[2*gi_tex]),.dresp(tex_dresp[2*gi_tex]));
+        tex_cache u_vq (.clk(clk),.reset(reset),
+            .creq(pp_vq_req[gi_tex]),.cresp(pp_vq_resp[gi_tex]),
+            .dreq(tex_dreq[2*gi_tex+1]),.dresp(tex_dresp[2*gi_tex+1]));
+      end
+    endgenerate
 
     // -------------------- parsers --------------------
     reg          ra_start;
@@ -159,7 +178,10 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     // -------------------- ISP rasterize (as tile_engine_top) --------------------
     localparam integer RAS_LANES = 8;
     reg  [4:0]  ras_y, ras_x;
-    reg         ras_in_valid;
+    // combinational: issue a chunk on every S_RAS cycle, in phase with ras_x/y
+    // (a registered pulse lags one cycle -> pairs with the advanced ras_x and
+    //  drops the first chunk of every tile).
+    wire        ras_in_valid = (st == S_RAS);
     wire        ras_out_valid;
     wire [RAS_LANES-1:0]    ras_inside;
     wire [32*RAS_LANES-1:0] ras_invw_flat;
@@ -167,6 +189,7 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
         ras_invw = ras_invw_flat[32*lane +: 32];
     endfunction
 
+    wire [4:0] ras_ox, ras_oy;     // coords echoed with the result chunk
     isp_raster_line #(.LANES(RAS_LANES)) u_line (
         .clk(clk), .reset(reset),
         .in_valid(ras_in_valid), .y(ras_y), .x_base(ras_x),
@@ -176,20 +199,21 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
         .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
         .out_valid(ras_out_valid),
         .inside_mask(ras_inside),
-        .invw_flat(ras_invw_flat)
+        .invw_flat(ras_invw_flat),
+        .out_x(ras_ox), .out_y(ras_oy)
     );
 
     wire [2:0] depth_mode = isp_word[31:29];
     wire       zwrite_dis = isp_word[26];
 
-    // per-lane refsw DepthMode compare (isp_depth_cmp, shared with the top)
+    // per-lane refsw DepthMode compare at the RESULT chunk coords (streamed).
     wire [RAS_LANES-1:0] ras_pass;
     generate
         for (genvar gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
             isp_depth_cmp u_cmp (
                 .mode(depth_mode),
                 .nw  (ras_invw_flat[32*gd +: 32]),
-                .ob  (dt_depth[{ras_y, ras_x + 5'(gd)}]),
+                .ob  (dt_depth[{ras_oy, ras_ox + 5'(gd)}]),
                 .pass(ras_pass[gd]));
         end
     endgenerate
@@ -219,6 +243,7 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     // shade-pass state
     reg [9:0]  shp;           // current tile pixel 0..1023
     reg [31:0] sh_tag;        // that pixel's CoreTag
+    reg [31:0] sh_invw;       // that pixel's depth-buffer invW
     // slot: param_offs low bits XOR tag_offset (strip triangles share param_offs)
     wire [5:0] sh_slot = sh_tag[8:3] ^ {3'b000, sh_tag[2:0]};
     // CoreTag fields (ISP_BACKGND_T layout)
@@ -279,32 +304,53 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
         .o_ddx(tsp_pddx), .o_ddy(tsp_pddy), .o_c(tsp_pc)
     );
 
-    // -------------------- TSP shade (per pixel) --------------------
-    reg         sh_req;
-    reg  [31:0] sh_invw;
-    wire        sh_done;
-    wire [31:0] sh_argb;
-    tsp_shade u_shade (
-        .clk(clk),.reset(reset),.req(sh_req),.px(shp[4:0]),.py(shp[9:5]),
-        .done(sh_done),.argb(sh_argb),
-        .invw_in(sh_invw),
-        .p_ddx(cur_ddx),.p_ddy(cur_ddy),.p_c(cur_c),
-        .tsp(cur_tsp),.tcw(cur_tcw),.text_ctrl(regs.text_control[4:0]),
-        .pp_texture(cur_isp[ISP_TEXTURE_BIT]),.pp_offset(cur_isp[ISP_OFFSET_BIT]),
-        .tc_req(dc_creq),.tc_resp(dc_cresp),.vq_req(qc_creq),.vq_resp(qc_cresp));
+    // -------------------- TSP shade (FULLY PIPELINED, 1 pixel/clock) --------------------
+    // The producer FSM presents a resolved pixel (planes from the plane cache +
+    // its tsp/tcw/isp flags) on pp_in_valid; tsp_shade_pp streams results out on
+    // pp_out_valid, carrying the pixel index (0..1023) as the id so the consumer
+    // can write col_buf[out_id]. pp_stall (any texel fetcher busy) freezes the
+    // pipe; the producer holds while stalled.
+    reg          pp_in_valid;
+    reg  [9:0]   pp_in_id;       // = pixel index shp
+    reg  [4:0]   pp_px, pp_py;
+    reg  [31:0]  pp_invw;
+    reg  [31:0]  pp_tsp, pp_tcw; reg pp_ptex, pp_pofs;
+    reg  [31:0]  pp_ddx [0:9];
+    reg  [31:0]  pp_ddy [0:9];
+    reg  [31:0]  pp_c   [0:9];
+    wire         pp_stall;
+    wire         pp_out_valid;
+    wire [9:0]   pp_out_id;
+    wire [31:0]  pp_out_argb;
+
+    tsp_shade_pp #(.IDW(10)) u_shade (
+        .clk(clk),.reset(reset),
+        .in_valid(pp_in_valid),.in_id(pp_in_id),.px(pp_px),.py(pp_py),.invw_in(pp_invw),
+        .in_ddx(pp_ddx),.in_ddy(pp_ddy),.in_c(pp_c),
+        .tsp(pp_tsp),.tcw(pp_tcw),.text_ctrl(regs.text_control[4:0]),
+        .pp_texture(pp_ptex),.pp_offset(pp_pofs),
+        .out_valid(pp_out_valid),.out_id(pp_out_id),.out_argb(pp_out_argb),
+        .stall(pp_stall),
+        .tc_req(pp_tc_req),.tc_resp(pp_tc_resp),.vq_req(pp_vq_req),.vq_resp(pp_vq_resp));
 
     // -------------------- orchestration FSM --------------------
     localparam S_IDLE=0, S_RA=1, S_STATE=2,
                S_OL_WAIT=4, S_ENTRY=5,
                S_IT_WAIT=7, S_OL_ACK=8,
                S_RA_ACK=9, S_DONE=10,
-               S_SETUP=11, S_RAS=12, S_RASW=13,
-               // shade pass (FLUSH)
+               S_SETUP=11, S_RAS=12, S_RASDRAIN=13,
+               // shade pass (FLUSH): producer walks pixels, feeds tsp_shade_pp
                SH_PIX=16, SH_LOOK=17,
                FH_ISP=18, FH_ISPW=19, FH_TSPW=20, FH_TCWW=21,
                FV_RD=22, FV_W=23,
-               TSP_RUN=24, SH_GO=25, SH_WAIT=26, SH_OUT=27;
+               TSP_RUN=24, SH_PRESENT=25, SH_DRAIN=26, SH_OUT=27;
     reg [4:0] st;
+
+    // shade pass pixel accounting: producer index shp, consumer count sh_out_n
+    integer sh_out_n;
+    // streamed rasterizer: chunks in flight (issued but not yet consumed)
+    localparam integer NCHUNK = (TILE_W/RAS_LANES) * TILE_H;
+    integer ras_inflight;
 
     // vertex field ids for FV_RD/FV_W
     localparam [2:0] FLD_X=0, FLD_Y=1, FLD_Z=2, FLD_UV16=3, FLD_U=4, FLD_V=5,
@@ -318,14 +364,37 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     always @(posedge clk) begin
         if (reset) begin
             st<=S_IDLE; done<=0; ra_start<=0; ol_start<=0; it_start<=0;
-            isp_start<=0; ras_in_valid<=0; tsp_start<=0; sh_req<=0; f_go<=0;
+            isp_start<=0; tsp_start<=0; pp_in_valid<=0; f_go<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             tri_count<=0; cull_count<=0; miss_count<=0; hit_count<=0; tri_seen<=0;
+            sh_out_n<=0; ras_inflight<=0;
             for (i = 0; i < PC_N; i = i + 1) pc_valid[i] = 1'b0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
-            isp_start<=0; ras_in_valid<=0; tsp_start<=0; sh_req<=0; f_go<=0;
+            isp_start<=0; tsp_start<=0; pp_in_valid<=0; f_go<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
+
+            // -------- streamed rasterizer CONSUMER (runs every cycle) --------
+            if (ras_out_valid) begin
+                for (l = 0; l < RAS_LANES; l = l + 1) begin
+                    /* verilator lint_off WIDTH */
+                    if (ras_inside[l] && ras_pass[l]) begin
+                        if (!zwrite_dis)
+                            dt_depth[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = ras_invw(l);
+                        dt_tag[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = tri_tag;
+                    end
+                    /* verilator lint_on WIDTH */
+                end
+            end
+            ras_inflight <= ras_inflight + (ras_in_valid ? 1 : 0) - (ras_out_valid ? 1 : 0);
+
+            // -------- shade pipeline CONSUMER (runs every cycle) --------
+            // a fresh result is present when out_valid && !stall (out_valid holds
+            // through a stall since the whole pipe is frozen).
+            if (pp_out_valid && !pp_stall) begin
+                col_buf[pp_out_id] = pp_out_argb;
+                sh_out_n <= sh_out_n + 1;
+            end
 
             case (st)
             S_IDLE: if (go) begin ra_start<=1; st<=S_RA; end
@@ -357,9 +426,10 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                     st <= S_OL_WAIT;
                 end
                 RSTATE_FLUSH: begin
-                    // shade every pixel of the tile, then write out the colors
+                    // shade every pixel of the tile (stream through tsp_shade_pp),
+                    // then write out the colors
                     $display("[TILE %0d,%0d] shade+flush", cur_tx, cur_ty);
-                    shp <= 10'd0;
+                    shp <= 10'd0; sh_out_n <= 0;
                     st <= SH_PIX;
                 end
                 default: begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
@@ -424,34 +494,31 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                 end
             end
 
-            // issue one 8-pixel chunk into the raster pipeline
-            S_RAS: begin ras_in_valid <= 1'b1; st <= S_RASW; end
-
-            // results ready: depth-test + {invW, CoreTag} write per passing lane
-            S_RASW: if (ras_out_valid) begin
-                for (l = 0; l < RAS_LANES; l = l + 1) begin
-                    /* verilator lint_off WIDTH */
-                    if (ras_inside[l] && ras_pass[l]) begin
-                        if (!zwrite_dis)
-                            dt_depth[{27'd0,ras_y}*TILE_W + {27'd0,ras_x} + l] = ras_invw(l);
-                        dt_tag[{27'd0,ras_y}*TILE_W + {27'd0,ras_x} + l] = tri_tag;
-                    end
-                    /* verilator lint_on WIDTH */
-                end
+            // STREAM: issue one 8-pixel chunk EVERY cycle across the 32x32 tile.
+            // The consumer above drains results in parallel (trailing by LAT).
+            S_RAS: begin
+                // ras_in_valid is combinational (= st==S_RAS), in phase with ras_x/y
                 if (ras_x == 5'(TILE_W - RAS_LANES)) begin
                     ras_x <= 5'd0;
-                    if (ras_y == 5'(TILE_H - 1)) begin
-                        it_ack.triangle_done <= 1'b1;    // triangle fully rastered
-                        st <= S_IT_WAIT;
-                    end else begin
-                        ras_y <= ras_y + 5'd1; st <= S_RAS;
-                    end
+                    if (ras_y == 5'(TILE_H - 1)) st <= S_RASDRAIN;
+                    else ras_y <= ras_y + 5'd1;
                 end else begin
-                    ras_x <= ras_x + 5'(RAS_LANES); st <= S_RAS;
+                    ras_x <= ras_x + 5'(RAS_LANES);
                 end
             end
 
+            // all chunks issued: wait for the pipeline to fully drain, then ack.
+            // Gate on !ras_in_valid too (see frontend_isp_tb_top): the last
+            // issued chunk is still entering the pipe the cycle we enter drain.
+            S_RASDRAIN: if (ras_inflight == 0 && !ras_in_valid && !ras_out_valid) begin
+                it_ack.triangle_done <= 1'b1;
+                st <= S_IT_WAIT;
+            end
+
             // ---------------- shade pass (FLUSH) ----------------
+            // PRODUCER: resolve pixel shp's planes (plane cache; miss = fetch +
+            // tsp_setup) then present it to the pipelined shader. The CONSUMER
+            // (top of the always block) writes results into col_buf by id.
             SH_PIX: begin
                 sh_tag  <= dt_tag[shp];
                 sh_invw <= dt_depth[shp];
@@ -470,7 +537,7 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                         cur_ddy[j] = pc_ddy[sh_slot][j];
                         cur_c[j]   = pc_c[sh_slot][j];
                     end
-                    st <= SH_GO;
+                    st <= SH_PRESENT;
                 end else begin
                     miss_count <= miss_count + 1;
                     f_rec <= param_base + {4'd0, sh_po, 2'b00};
@@ -578,19 +645,33 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                 pc_isp[sh_slot]   = cur_isp;
                 pc_tsp[sh_slot]   = cur_tsp;
                 pc_tcw[sh_slot]   = cur_tcw;
-                st <= SH_GO;
+                st <= SH_PRESENT;
             end
 
-            SH_GO: begin sh_req <= 1'b1; st <= SH_WAIT; end
-
-            SH_WAIT: if (sh_done) begin
-                col_buf[shp] = sh_argb;
-                if (shp == 10'd1023) st <= SH_OUT;
+            // present pixel shp to the pipelined shader. Hold while the pipe is
+            // stalled (a texel miss). The CONSUMER at the top drains col_buf.
+            SH_PRESENT: if (!pp_stall) begin
+                pp_in_valid <= 1'b1;
+                pp_in_id    <= shp;
+                pp_px       <= shp[4:0];
+                pp_py       <= shp[9:5];
+                pp_invw     <= sh_invw;
+                pp_tsp      <= cur_tsp;
+                pp_tcw      <= cur_tcw;
+                pp_ptex     <= cur_isp[ISP_TEXTURE_BIT];
+                pp_pofs     <= cur_isp[ISP_OFFSET_BIT];
+                for (j = 0; j < 10; j = j + 1) begin
+                    pp_ddx[j] <= cur_ddx[j];
+                    pp_ddy[j] <= cur_ddy[j];
+                    pp_c[j]   <= cur_c[j];
+                end
+                if (shp == 10'd1023) st <= SH_DRAIN;
                 else begin shp <= shp + 10'd1; st <= SH_PIX; end
             end
 
-            // write the shaded tile to the 640x480 fb (same as the tag TB's flush)
-            SH_OUT: begin
+            // all 1024 pixels presented: wait for the pipeline to drain, then
+            // write the shaded tile to the 640x480 fb.
+            SH_DRAIN: if (sh_out_n >= 1024) begin
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
                     /* verilator lint_off WIDTH */
                     px = {26'd0, cur_tx}*32 + (i % TILE_W);

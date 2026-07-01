@@ -35,16 +35,34 @@ module isp_raster_line #(
 
     output reg               out_valid,
     output reg [LANES-1:0]    inside_mask,
-    output reg [32*LANES-1:0] invw_flat
+    output reg [32*LANES-1:0] invw_flat,
+    // echo of this chunk's tile coords (aligned with out_valid) so a streaming
+    // consumer can address the depth/tag buffer for the results as they emerge,
+    // back-to-back, without stalling the issue side.
+    output reg [4:0]          out_x,
+    output reg [4:0]          out_y
 );
     localparam integer LAT = 6;
+
+    // s4b-stage results, re-timed by the final output register (below) so all
+    // outputs are co-aligned for back-to-back streaming.
+    reg [LANES-1:0]    im0;
+    reg [32*LANES-1:0] iw0;
 
     function fpos_or_zero(input [31:0] f); fpos_or_zero = ~f[31]; endfunction
 
     reg [LAT-1:0] vpipe;
+    // x_base / y travel the full LAT-deep pipe so they arrive with out_valid.
+    reg [4:0] xpipe [0:LAT-1];
+    reg [4:0] ypipe [0:LAT-1];
+    integer pp;
     always @(posedge clk) begin
         if (reset) vpipe <= '0;
         else       vpipe <= {vpipe[LAT-2:0], in_valid};
+        xpipe[0] <= x_base; ypipe[0] <= y;
+        for (pp = 1; pp < LAT; pp = pp + 1) begin
+            xpipe[pp] <= xpipe[pp-1]; ypipe[pp] <= ypipe[pp-1];
+        end
     end
 
     // carry x_base to stage 3 (line base stages don't need it)
@@ -138,13 +156,25 @@ module isp_raster_line #(
         fp_add24_s2 x3b(.sum(h3s_r),.e_big(h3e_r),.s_big(h3g_r),.y(xh3));
         fp_add24_s2 x4b(.sum(h4s_r),.e_big(h4e_r),.s_big(h4g_r),.y(xh4));
         fp_add24_s2 iwb(.sum(ws_r),.e_big(we_r),.s_big(wg_r),.y(iw));
+        // s4b register -> internal (im0/iw0); aligned one cycle EARLIER than the
+        // final output register below.
         always @(posedge clk) begin
-            inside_mask[gi] <= fpos_or_zero(xh1) & fpos_or_zero(xh2)
-                             & fpos_or_zero(xh3) & fpos_or_zero(xh4);
-            invw_flat[32*gi +: 32] <= iw;
+            im0[gi] <= fpos_or_zero(xh1) & fpos_or_zero(xh2)
+                     & fpos_or_zero(xh3) & fpos_or_zero(xh4);
+            iw0[32*gi +: 32] <= iw;
         end
       end
     endgenerate
 
-    always @(posedge clk) out_valid <= vpipe[LAT-1];
+    // Final output register: re-time inside_mask/invw_flat here so they land on
+    // the SAME cycle as out_valid/out_x/out_y. (Previously mask/invw appeared one
+    // cycle BEFORE out_valid, which only worked when the issue side held data
+    // stable; a back-to-back stream needs them aligned.)
+    always @(posedge clk) begin
+        out_valid   <= vpipe[LAT-1];
+        out_x       <= xpipe[LAT-1];
+        out_y       <= ypipe[LAT-1];
+        inside_mask <= im0;
+        invw_flat   <= iw0;
+    end
 endmodule

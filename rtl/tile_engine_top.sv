@@ -416,7 +416,10 @@ module tile_engine_top import tsp_pkg::*; #(
         .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
         .out_valid(ras_out_valid),
         .inside_mask(ras_inside),
-        .invw_flat(ras_invw_flat)
+        .invw_flat(ras_invw_flat),
+        // this top uses the non-streamed FSM (issue chunk, wait, RMW at ras_x/y),
+        // so the echoed result coords are unused here.
+        .out_x(), .out_y()
     );
 
     // opaque DepthMode compare per rasterizer lane: does the lane's new invW

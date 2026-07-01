@@ -20,7 +20,15 @@
 # MODE selects the scene fed to gen_vectors (default: tri).
 
 VERILATOR ?= verilator
+
+# Parallel build by default. NJOBS = host CPU count (fallback 4). It drives:
+#   - MAKEFLAGS: any `make` (recursive or multi-target) fans out
+#   - Verilator's --build-jobs / -j: parallel model codegen + C++ compile
+NJOBS    := $(shell nproc 2>/dev/null || echo 4)
+MAKEFLAGS += -j$(NJOBS)
+
 VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/tsp/gen \
+            -j $(NJOBS) \
             -CFLAGS "-O3 -march=native"
 
 # combinational (bit-exact) design
@@ -150,6 +158,15 @@ tspshadepp: | $(BUILD)
 	  $(wildcard rtl/isp_min/*.sv) \
 	  $(CWD)/tb/tsp_shade_pp_tb.cpp --Mdir $(BUILD)/obj_tspshadepp -o tb
 	./$(BUILD)/obj_tspshadepp/tb
+
+# streamed rasterizer consume-path equivalence vs serial (bit-exact tile diff).
+rasterstream: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
+	  --top-module isp_raster_stream_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/isp_raster_stream_tb_top.sv \
+	  $(wildcard rtl/isp_min/*.sv) \
+	  $(CWD)/tb/isp_raster_stream_tb.cpp --Mdir $(BUILD)/obj_rasterstream -o tb
+	./$(BUILD)/obj_rasterstream/tb
 
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
