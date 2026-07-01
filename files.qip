@@ -1,0 +1,23 @@
+# Sequenced (area-optimized) setup design: one mul+add per unit, one reciprocal.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fp_add.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fp_mul.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fp_div.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fp_mac.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fp_recip.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/fmac_seq.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/u8_to_float.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_setup_seq.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp_setup_seq.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tri_setup_seq_top.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/simplex_synth_seq.sv
+# Command-driven tile engine top + DC_MiSTer HPS DDR3 bridge (rtl/mister/).
+# tile_engine_top is the TOP_LEVEL_ENTITY (see simplex.qsf). DDR3 is reached
+# through the HPS f2sdram bridge (sysmem_lite) - no external DDRAM pins.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/f2sdram_safe_terminator.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/sysmem.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/ddram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tile_engine_top.sv
+# VRAM ROM init: under `SYNTHESIS, tri_setup_seq_top loads build/vram.mif via the
+# ram_init_file attribute (gsplat gauss_lut pattern). Generate it with
+# `make vectors` before compiling.
+set_global_assignment -name MIF_FILE build/vram.mif
