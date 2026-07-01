@@ -108,6 +108,17 @@ regen:
 	python3 tools/gen_pvr_regs.py $(PVR_REGS_H) > rtl/tsp/gen/pvr_regs_gen.svh
 	@echo "regenerated rtl/tsp/gen/pvr_regs_gen.svh"
 
+# front-end integration run: reg_file + 8MB VRAM + RA/OL/tristrip + faux ISP,
+# driven from real PVR dumps (dumps/pvr_regs_menu.bin, dumps/vram_menu.bin).
+frontend: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
+	  --top-module frontend_tb_top \
+	  $(TSP)/tsp_pkg.sv tb/frontend_tb_top.sv \
+	  $(TSP)/reg_file.sv $(TSP)/region_array_parser.sv $(TSP)/object_list_parser.sv \
+	  $(TSP)/isp_tristrip_iterator.sv $(TSP)/data_cache256.sv \
+	  $(CWD)/tb/frontend_tb.cpp --Mdir $(BUILD)/obj_frontend -o tb
+	./$(BUILD)/obj_frontend/tb
+
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
 	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw -Irtl/tsp/gen \

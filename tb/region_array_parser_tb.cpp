@@ -34,6 +34,9 @@ static uint32_t control_word(uint32_t tx,uint32_t ty,bool z_keep,bool no_writeou
     return (0u<<0) | ((tx&0x3F)<<2) | ((ty&0x3F)<<8) |
            ((no_writeout?1u:0u)<<28) | (0u<<29) | ((z_keep?1u:0u)<<30) | ((last?1u:0u)<<31);
 }
+// refsw ListPointer {pad0:2, ptr_in_words:22, pad1:7, empty:1}: ptr_in_words
+// lives in bits [23:2], byte_addr = ptr_in_words*4. The parser reads rword[23:2]
+// and emits {rword[23:2],2'b00}.
 static uint32_t listptr(uint32_t ptr_words,bool empty){
     return ((ptr_words&0x3FFFFF)<<2) | ((empty?1u:0u)<<31);
 }

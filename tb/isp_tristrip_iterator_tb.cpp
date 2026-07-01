@@ -56,11 +56,12 @@ static uint32_t build_record(uint32_t base, uint32_t isp, uint32_t skip, bool tw
     return p; // end of record
 }
 
-// Golden: RenderTriangleStrip's triangle/vertex selection, mask bit i = LSB.
+// Golden: RenderTriangleStrip's triangle/vertex selection. refsw gates triangle
+// i by mask & (1 << (5-i)) (refsw_lists.cpp:194).
 static std::vector<GoldTri> golden_strip(uint32_t isp, uint32_t mask, Vtx verts[8]){
     std::vector<GoldTri> out;
     for(int i=0;i<6;i++){
-        if (!((mask>>i)&1)) continue;
+        if (!((mask>>(5-i))&1)) continue;
         int not_even = i&1, even = not_even^1;
         out.push_back({isp, verts[i+not_even], verts[i+even], verts[i+2]});
     }

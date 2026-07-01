@@ -127,6 +127,8 @@ module region_array_parser import tsp_pkg::*; (
                         last_r   <=  rword[31];     // last_region
                         raddr<=base+27'd4; rd_go<=1'b1; st<=S_OPW;
                     end
+            // ListPointer (refsw refsw_lists_regtypes.h): {pad0:2, ptr_in_words:22,
+            // pad1:7, empty:1}. ptr_in_words = rword[23:2]; byte addr = ptr_in_words*4.
             S_OPW: if (rword_v) begin
                         op_ptr<=rword[23:2]; op_en<=~rword[31];
                         raddr<=base+27'd12; rd_go<=1'b1; st<=S_TRW;

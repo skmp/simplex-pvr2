@@ -140,9 +140,10 @@ module isp_tristrip_iterator import tsp_pkg::*; (
                 else begin vidx<=vidx+4'd1; st<=S_VADDR; end
             end
 
-            // ---- seek s_i to the next set mask bit (mask[s_i]) ----
+            // ---- seek s_i to the next set mask bit ----
+            // refsw gates triangle i by mask & (1 << (5-i)), so tri i uses mask[5-i].
             S_SEEK: begin
-                if (mask_r[s_i]) begin
+                if (mask_r[3'd5 - s_i]) begin
                     v0_r <= vslot[va(s_i)]; v1_r <= vslot[vb(s_i)]; v2_r <= vslot[{1'b0,s_i}+4'd2];
                     st <= S_PRESENT;
                 end else if (s_i == 3'd5) st <= S_PDONE;
