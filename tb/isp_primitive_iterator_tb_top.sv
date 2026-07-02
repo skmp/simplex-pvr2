@@ -1,4 +1,4 @@
-// TB top: isp_primitive_iterator + injected data_cache256 + behavioral 64-bit DDR.
+// TB top: isp_primitive_iterator (direct-DDR reader) + behavioral 64-bit burst DDR.
 module isp_primitive_iterator_tb_top import tsp_pkg::*; (
     input             clk,
     input             reset,

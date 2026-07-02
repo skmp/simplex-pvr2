@@ -129,12 +129,8 @@ module peel_core import tsp_pkg::*; (
     assign ra_dresp.dready     = ddr_resp.dready && (d_owner==3'd5);
 
     // -------------------- caches --------------------
-    // Region parser + TSP param fetch keep their 256-bit line caches; OL parser and
-    // ISP iterator read DDR directly (own line buffers / burst).
-    cache_req256_t ra_creq, ts_creq;
-    cache_resp256_t ra_cresp, ts_cresp;
-    data_cache256 u_ra_c (.clk(clk),.reset(reset),.creq(ra_creq),.cresp(ra_cresp),.dreq(ra_dreq),.dresp(ra_dresp));
-    data_cache256 u_ts_c (.clk(clk),.reset(reset),.creq(ts_creq),.cresp(ts_cresp),.dreq(ts_dreq),.dresp(ts_dresp));
+    // Region parser, OL parser, ISP iterator AND TSP param fetch all read DDR
+    // directly (each with its own 8-word sliding-window line reader). No caches.
 
     // The 4 corner fetchers share ONE 4-read-port data cache + ONE 4-read-port VQ
     // cache (2x dual-port M10K each, full copy), replacing the 8 per-corner
@@ -154,7 +150,7 @@ module peel_core import tsp_pkg::*; (
     region_array_parser u_ra (.clk(clk),.reset(reset),.start(ra_start),
         .region_base(region_base),.region_v1(region_v1),.busy(ra_busy),
         .tiles_parsed(ra_tiles_parsed),.rout(ra_out),.ack(ra_ack),
-        .creq(ra_creq),.cresp(ra_cresp));
+        .dreq(ra_dreq),.dresp(ra_dresp));
 
     reg          ol_start; reg [26:0] ol_list_ptr;
     wire         ol_busy, ol_done;
@@ -334,21 +330,71 @@ module peel_core import tsp_pkg::*; (
     wire [4:0]  sh_stride_w = 5'd3 + sh_skip * (sh_two_vol ? 5'd2 : 5'd1);
     wire [26:0] sh_stride_b = {sh_stride_w, 2'b00};
 
-    // ---- 32-bit word reader over the TSP data cache (as isp_primitive_iterator) ----
+    // ---- 32-bit word reader: DIRECT DDR, 8-word sliding-window (as object_list_parser) ----
+    // f_go with a byte address (f_addr) returns the word NEXT cycle in
+    // f_word/f_word_v on a resident line. Each miss fetches a whole 256-bit line
+    // (burst=8) into tw0 (demand) or tw1 (prefetch of tw0+1). Drives ts_dreq/ts_dresp.
     reg  [26:0] f_addr; reg f_go; reg [31:0] f_word; reg f_word_v; reg [2:0] f_sel;
-    reg  [26:0] ts_laddr_r; reg ts_req_r;
-    assign ts_creq.req   = ts_req_r;
-    assign ts_creq.laddr = ts_laddr_r;
+    reg  [255:0] tw0; reg [21:0] t0_tag; reg t0_v;
+    reg  [255:0] tw1; reg [21:0] t1_tag; reg t1_v;
+    reg          tpend; reg [21:0] tline; reg [2:0] tsel;
+
+    localparam TF_IDLE=2'd0, TF_MISS=2'd1, TF_FILL=2'd2;
+    reg [1:0]   tfst;
+    reg [21:0]  tf_line; reg tf_is_pf; reg [2:0] tf_beat; reg [255:0] tf_acc;
+    wire        tf_bank    = tf_line[17];
+    wire [19:0] tf_wofs_b  = {tf_line[16:0], 3'b000};
+    wire [28:0] tf_base_wd = {9'b0, tf_wofs_b};
+    wire [31:0] tf_half    = tf_bank ? ts_dresp.dout[63:32] : ts_dresp.dout[31:0];
+
+    reg        ts_rd_r; reg [28:0] ts_addr_r; reg [7:0] ts_burst_r;
+    assign ts_dreq.rd    = ts_rd_r;
+    assign ts_dreq.addr  = ts_addr_r;
+    assign ts_dreq.burst = ts_burst_r;
+
     always @(posedge clk) begin
         f_word_v <= 1'b0;
-        ts_req_r <= 1'b0;                  // default: 1-cycle pulse
-        if (f_go) begin
-            ts_req_r  <= 1'b1;
-            ts_laddr_r<= {5'd0, f_addr[26:5]};
-            f_sel     <= f_addr[4:2];
+        ts_rd_r  <= 1'b0;
+
+        if (f_go) begin tpend <= 1'b1; tline <= f_addr[26:5]; tsel <= f_addr[4:2]; end
+
+        if (tpend) begin
+            if (t0_v && t0_tag == tline) begin
+                f_word <= tw0[32*tsel +: 32]; f_word_v <= 1'b1; if (!f_go) tpend <= 1'b0;
+            end else if (t1_v && t1_tag == tline) begin
+                tw0 <= tw1; t0_tag <= t1_tag; t0_v <= 1'b1; t1_v <= 1'b0;
+                f_word <= tw1[32*tsel +: 32]; f_word_v <= 1'b1; if (!f_go) tpend <= 1'b0;
+            end
         end
-        if (ts_cresp.ack) begin f_word <= ts_cresp.rdata[32*f_sel +: 32]; f_word_v <= 1'b1; end
-        if (reset) ts_req_r <= 1'b0;
+
+        case (tfst)
+        TF_IDLE: begin
+            if (tpend && !(t0_v && t0_tag==tline) && !(t1_v && t1_tag==tline)) begin
+                tf_line <= tline; tf_is_pf <= 1'b0; tf_beat <= 3'd0; t1_v <= 1'b0;
+                tfst <= TF_MISS;
+            end else if (t0_v && !(t1_v && t1_tag == t0_tag + 22'd1)) begin
+                tf_line <= t0_tag + 22'd1; tf_is_pf <= 1'b1; tf_beat <= 3'd0;
+                tfst <= TF_MISS;
+            end
+        end
+        TF_MISS: if (!ts_dresp.busy) begin
+            ts_rd_r    <= 1'b1;
+            ts_addr_r  <= {4'b0011, tf_base_wd[24:0]};
+            ts_burst_r <= 8'd8;
+            tfst       <= TF_FILL;
+        end
+        TF_FILL: if (ts_dresp.dready) begin
+            tf_acc[32*tf_beat +: 32] <= tf_half;
+            if (tf_beat == 3'd7) begin
+                if (tf_is_pf) begin tw1 <= { tf_half, tf_acc[223:0] }; t1_tag <= tf_line; t1_v <= 1'b1; end
+                else          begin tw0 <= { tf_half, tf_acc[223:0] }; t0_tag <= tf_line; t0_v <= 1'b1; end
+                tfst <= TF_IDLE;
+            end else tf_beat <= tf_beat + 3'd1;
+        end
+        default: tfst <= TF_IDLE;
+        endcase
+
+        if (reset) begin t0_v<=0; t1_v<=0; tpend<=0; tfst<=TF_IDLE; ts_rd_r<=0; end
     end
 
     // fetched vertices (3) - decode_pvr_vertex fields

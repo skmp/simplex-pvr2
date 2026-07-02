@@ -10,9 +10,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_setup_seq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp_setup_seq.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tri_setup_seq_top.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/simplex_synth_seq.sv
-# Command-driven tile engine top + DC_MiSTer HPS DDR3 bridge (rtl/mister/).
-# tile_engine_top is the TOP_LEVEL_ENTITY (see simplex.qsf). DDR3 is reached
-# through the HPS f2sdram bridge (sysmem_lite) - no external DDRAM pins.
+# DC_MiSTer HPS DDR3 bridge (rtl/mister/). The synth top (mister_top_isp; see
+# simplex.qsf) reaches DDR3 through the HPS f2sdram bridge (sysmem_lite) - no
+# external DDRAM pins. (Legacy tile_engine_top lives in legacy/, not synthesized.)
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/f2sdram_safe_terminator.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/sysmem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister/ddram.sv
@@ -41,15 +41,14 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_fetch.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/color_combiner.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_mem.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_shade.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/tile_engine_top.sv
 # --- Layer-peeling render core (peel_core) + mister_top (TOP_LEVEL_ENTITY) -------
-# Autonomous region/objlist walk + direct-DDR data cache, pipelined TSP shade
-# (blend + mip), and the unified PT+TL layer peel.
+# Autonomous region/objlist walk (all readers use a direct-DDR 8-word sliding-
+# window line reader; no data_cache256), pipelined TSP shade (blend + mip), and
+# the unified PT+TL layer peel.
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/reg_file.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/region_array_parser.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/object_list_parser.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/isp_primitive_iterator.sv
-set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/data_cache256.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/f2u8.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_fetch_pp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_cache_4p.sv
@@ -63,6 +62,11 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_depth_cmp_lp.sv
 # a faux behavioral backend.
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/peel_core.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister_top.sv
+# isp_core: ISP-only render core (no TSP; framebuffer holds the per-pixel CoreTag).
+# mister_top_isp wraps it with the same HPS Avalon backend as mister_top. Only one
+# of {mister_top, mister_top_isp} is the TOP_LEVEL_ENTITY at a time (see simplex.qsf).
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/isp_core.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/mister_top_isp.sv
 # VRAM ROM init: under `SYNTHESIS, tri_setup_seq_top loads build/vram.mif via the
 # ram_init_file attribute (gsplat gauss_lut pattern). Generate it with
 # `make vectors` before compiling.

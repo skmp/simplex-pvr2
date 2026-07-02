@@ -54,7 +54,7 @@ MODE ?= tri
 MODEARG = $(if $(filter quad,$(MODE)),quad,)
 
 .PHONY: all vectors fp sim sim-tri sim-quad seq seq-tri seq-quad ip ip-tri ip-quad quartus clean \
-        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe dcache256 oparse isprim region regfile regen planecache
+        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe oparse isprim region regfile regen planecache
 
 # TSP module files (package first). ISP shared FP units come from rtl/isp_min.
 TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
@@ -62,7 +62,7 @@ TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/
 all: fp sim-tri sim-quad seq-tri seq-quad ip-tri ip-quad
 
 # ---- run the fast unit tests (FP prims + TSP texture blocks + full pipeline) ----
-test: fp tex dcache256 oparse isprim region regfile pipe
+test: fp tex oparse isprim region regfile pipe
 
 # ---- TSP texture-pipeline block tests (randomized vectors vs refsw) ----
 TSP = rtl/tsp
@@ -93,28 +93,22 @@ tex-combiner: | $(BUILD)
 	  --Mdir $(BUILD)/obj_texcomb -o tb
 	./$(BUILD)/obj_texcomb/tb
 
-# ---- full TSP shading pipeline co-sim (tile_engine_top, VRAM-backed tex_mem) ----
+# ---- LEGACY full TSP shading pipeline co-sim (legacy/tile_engine_top) ----
 # Drives regs -> ISP_SETUP -> ISP_RASTERIZE -> TSP_SETUP -> TSP_SHADE and checks
-# the shaded colour buffer vs a refsw-equivalent model.
+# the shaded colour buffer vs a refsw-equivalent model. tile_engine_top is the
+# superseded host-sequenced top (now in legacy/); peel_core/isp_core are current.
 DDRSTUB = tb/ddram_stub.sv tb/sysmem_stub.sv
 pipe: | $(BUILD)
-	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-PINCONNECTEMPTY --public-flat-rw \
+	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-PINCONNECTEMPTY -Wno-PINMISSING --public-flat-rw \
 	  --top-module tile_engine_top \
-	  $(TSP_RTL) rtl/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) $(DDRSTUB) \
-	  $(CWD)/tb/tsp_pipe_tb.cpp --Mdir $(BUILD)/obj_pipe -o tb
+	  $(TSP_RTL) legacy/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) $(DDRSTUB) \
+	  $(CWD)/legacy/tsp_pipe_tb.cpp --Mdir $(BUILD)/obj_pipe -o tb
 	./$(BUILD)/obj_pipe/tb
 
-# data_cache256 unit test: 256-bit line cache + behavioural 64-bit DDR.
-dcache256: | $(BUILD)
-	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module data_cache256_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/data_cache256_tb_top.sv $(TSP)/data_cache256.sv $(CWD)/tb/data_cache256_tb.cpp \
-	  --Mdir $(BUILD)/obj_dcache256 -o tb
-	./$(BUILD)/obj_dcache256/tb
-
-# object_list_parser unit test: list walker + injected 256b data$ + behav DDR.
+# object_list_parser unit test: list walker (direct-DDR reader) + behav burst DDR.
 oparse: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module object_list_parser_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/object_list_parser_tb_top.sv $(TSP)/object_list_parser.sv $(TSP)/data_cache256.sv \
+	  $(TSP)/tsp_pkg.sv tb/object_list_parser_tb_top.sv $(TSP)/object_list_parser.sv \
 	  $(CWD)/tb/object_list_parser_tb.cpp --Mdir $(BUILD)/obj_oparse -o tb
 	./$(BUILD)/obj_oparse/tb
 
@@ -131,18 +125,17 @@ frontend: | $(BUILD)
 	  --top-module frontend_tb_top \
 	  $(TSP)/tsp_pkg.sv tb/frontend_tb_top.sv \
 	  $(TSP)/reg_file.sv $(TSP)/region_array_parser.sv $(TSP)/object_list_parser.sv \
-	  $(TSP)/isp_primitive_iterator.sv $(TSP)/data_cache256.sv \
+	  $(TSP)/isp_primitive_iterator.sv \
 	  $(CWD)/tb/frontend_tb.cpp --Mdir $(BUILD)/obj_frontend -o tb
 	./$(BUILD)/obj_frontend/tb
 
-# front-end + real ISP integration: adds isp_setup_min + isp_raster_line +
-# depth-test + CoreTag tag writes; tile FLUSH -> 640x480 fb -> output.bmp.
+# front-end + real ISP integration: isp_core (region/objlist walk + isp_setup_min
+# + isp_raster_line + depth/tag compare) driven through the shared sim backend
+# (sim_ddr_fb); tile FLUSH -> 640x480 fb (CoreTags) -> output.bmp.
 frontendisp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module frontend_isp_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/frontend_isp_tb_top.sv \
-	  $(TSP)/reg_file.sv $(TSP)/region_array_parser.sv $(TSP)/object_list_parser.sv \
-	  $(TSP)/isp_primitive_iterator.sv $(TSP)/data_cache256.sv \
+	  $(TSP_RTL) tb/frontend_isp_tb_top.sv tb/sim_ddr_fb.sv \
 	  $(wildcard rtl/isp_min/*.sv) \
 	  $(CWD)/tb/frontend_isp_tb.cpp --Mdir $(BUILD)/obj_frontendisp -o tb
 	./$(BUILD)/obj_frontendisp/tb $(DUMP)
@@ -164,7 +157,7 @@ frontendtsp: | $(BUILD)
 frontendtsplp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module frontend_tsp_lp_tb_top \
-	  $(TSP_RTL) tb/frontend_tsp_lp_tb_top.sv \
+	  $(TSP_RTL) tb/frontend_tsp_lp_tb_top.sv tb/sim_ddr_fb.sv \
 	  $(wildcard rtl/isp_min/*.sv) \
 	  $(CWD)/tb/frontend_tsp_lp_tb.cpp --Mdir $(BUILD)/obj_frontendtsplp -o tb
 	./$(BUILD)/obj_frontendtsplp/tb $(DUMP)
@@ -215,14 +208,14 @@ regfile: | $(BUILD)
 # region_array_parser unit test: region walk -> per-tile ordered states.
 region: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module region_array_parser_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/region_array_parser_tb_top.sv $(TSP)/region_array_parser.sv $(TSP)/data_cache256.sv \
+	  $(TSP)/tsp_pkg.sv tb/region_array_parser_tb_top.sv $(TSP)/region_array_parser.sv \
 	  $(CWD)/tb/region_array_parser_tb.cpp --Mdir $(BUILD)/obj_region -o tb
 	./$(BUILD)/obj_region/tb
 
 # isp_primitive_iterator unit test: strip + tri-array iterator (XYZ only).
 isprim: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module isp_primitive_iterator_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/isp_primitive_iterator_tb_top.sv $(TSP)/isp_primitive_iterator.sv $(TSP)/data_cache256.sv \
+	  $(TSP)/tsp_pkg.sv tb/isp_primitive_iterator_tb_top.sv $(TSP)/isp_primitive_iterator.sv \
 	  $(CWD)/tb/isp_primitive_iterator_tb.cpp --Mdir $(BUILD)/obj_isprim -o tb
 	./$(BUILD)/obj_isprim/tb
 

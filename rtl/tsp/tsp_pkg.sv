@@ -106,18 +106,9 @@ package tsp_pkg;
         logic [63:0] rdata;     // 64-bit line
     } cache_resp_t;
 
-    // ---- 32-byte (256-bit) line data-cache client port ----
-    // Used by the ISP/TSP param data caches (data_cache256). laddr is a
-    // 32-byte-line address (i.e. byte_addr >> 5). The 256-bit line holds 8
-    // 32-bit words; a client selects the word it wants from rdata.
-    typedef struct packed {
-        logic        req;        // 1-cycle request strobe
-        logic [26:0] laddr;      // 32-byte-line address (byte_addr[31:5])
-    } cache_req256_t;
-    typedef struct packed {
-        logic         ack;       // 1-cycle response strobe
-        logic [255:0] rdata;     // 256-bit line (8 x 32-bit words)
-    } cache_resp256_t;
+    // (The 256-bit line data-cache client port cache_req256_t/cache_resp256_t was
+    //  removed with data_cache256 - all readers now use a direct-DDR 8-word
+    //  sliding-window line reader.)
 
     // ---- PVR core tag (mirrors ISP_BACKGND_T_type, pvr_regs.h:318) ----
     // Packed so that {msb..lsb} == the 32-bit tag word: bit31=invalid,

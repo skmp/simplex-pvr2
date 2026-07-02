@@ -129,9 +129,7 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     // -------------------- caches --------------------
     // Region parser keeps its 256-bit line cache; the OL parser, ISP iterator,
     // and TSP param reader read DDR DIRECTLY (own line buffers / burst).
-    cache_req256_t ra_creq;
-    cache_resp256_t ra_cresp;
-    data_cache256 u_ra_c (.clk(clk),.reset(reset),.creq(ra_creq),.cresp(ra_cresp),.dreq(ra_dreq),.dresp(ra_dresp));
+    // region parser reads DDR directly via the shared arbiter (no data_cache256).
 
     // The 4 corner fetchers share ONE 4-read-port data cache + ONE 4-read-port VQ
     // cache (2x dual-port M10K each, full copy), replacing the 8 per-corner
@@ -150,7 +148,7 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     region_out_t ra_out; region_ack_t ra_ack;
     region_array_parser u_ra (.clk(clk),.reset(reset),.start(ra_start),
         .region_base(region_base),.region_v1(region_v1),.busy(ra_busy),
-        .tiles_parsed(ra_tiles_parsed),.rout(ra_out),.ack(ra_ack),.creq(ra_creq),.cresp(ra_cresp));
+        .tiles_parsed(ra_tiles_parsed),.rout(ra_out),.ack(ra_ack),.dreq(ra_dreq),.dresp(ra_dresp));
 
     reg          ol_start; reg [26:0] ol_list_ptr;
     wire         ol_busy, ol_done;

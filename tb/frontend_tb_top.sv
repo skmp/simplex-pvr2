@@ -40,30 +40,64 @@ module frontend_tb_top import tsp_pkg::*; (
     // -------------------- 8 MB behavioral VRAM (1M x 64-bit) --------------------
     (* verilator public_flat_rw *) reg [63:0] vram [0:1048575];
 
-    // generic behavioral DDR read stub for a data_cache256's injected port
-    // (1-cycle latency, never busy). Macro-like via a task per port below.
+    // All three parsers (region / objlist / iterator) read DDR DIRECTLY with an
+    // 8-word burst line reader (no data_cache256). Each gets a BURST + latency DDR
+    // stub (a single-beat stub would hang the 8-beat line fill).
+    localparam integer RD_LAT = 8;
     // region port
     ddr_rd_req_t  ra_dreq; ddr_rd_resp_t ra_dresp;
+    reg ra_busy_d; reg [19:0] ra_word; reg [7:0] ra_beats, ra_lat;
     reg [63:0] ra_do; reg ra_dv;
-    assign ra_dresp.busy=1'b0; assign ra_dresp.dout=ra_do; assign ra_dresp.dready=ra_dv;
-    always @(posedge clk) begin ra_dv<=0; if(ra_dreq.rd) begin ra_do<=vram[ra_dreq.addr[19:0]]; ra_dv<=1; end end
+    assign ra_dresp.busy=ra_busy_d; assign ra_dresp.dout=ra_do; assign ra_dresp.dready=ra_dv;
+    always @(posedge clk) begin
+        ra_dv <= 1'b0;
+        if (reset) ra_busy_d <= 1'b0;
+        else if (!ra_busy_d) begin
+            if (ra_dreq.rd) begin ra_busy_d<=1'b1; ra_word<=ra_dreq.addr[19:0];
+                ra_beats<=ra_dreq.burst; ra_lat<=RD_LAT[7:0]; end
+        end else if (ra_lat != 0) ra_lat <= ra_lat - 8'd1;
+        else begin
+            ra_do<=vram[ra_word]; ra_dv<=1'b1; ra_word<=ra_word+20'd1;
+            if (ra_beats <= 8'd1) ra_busy_d <= 1'b0;
+            ra_beats <= ra_beats - 8'd1;
+        end
+    end
     // objlist port
     ddr_rd_req_t  ol_dreq; ddr_rd_resp_t ol_dresp;
+    reg ol_busy_d; reg [19:0] ol_word; reg [7:0] ol_beats, ol_lat;
     reg [63:0] ol_do; reg ol_dv;
-    assign ol_dresp.busy=1'b0; assign ol_dresp.dout=ol_do; assign ol_dresp.dready=ol_dv;
-    always @(posedge clk) begin ol_dv<=0; if(ol_dreq.rd) begin ol_do<=vram[ol_dreq.addr[19:0]]; ol_dv<=1; end end
+    assign ol_dresp.busy=ol_busy_d; assign ol_dresp.dout=ol_do; assign ol_dresp.dready=ol_dv;
+    always @(posedge clk) begin
+        ol_dv <= 1'b0;
+        if (reset) ol_busy_d <= 1'b0;
+        else if (!ol_busy_d) begin
+            if (ol_dreq.rd) begin ol_busy_d<=1'b1; ol_word<=ol_dreq.addr[19:0];
+                ol_beats<=ol_dreq.burst; ol_lat<=RD_LAT[7:0]; end
+        end else if (ol_lat != 0) ol_lat <= ol_lat - 8'd1;
+        else begin
+            ol_do<=vram[ol_word]; ol_dv<=1'b1; ol_word<=ol_word+20'd1;
+            if (ol_beats <= 8'd1) ol_busy_d <= 1'b0;
+            ol_beats <= ol_beats - 8'd1;
+        end
+    end
     // param port
     ddr_rd_req_t  pr_dreq; ddr_rd_resp_t pr_dresp;
+    reg pr_busy_d; reg [19:0] pr_word; reg [7:0] pr_beats, pr_lat;
     reg [63:0] pr_do; reg pr_dv;
-    assign pr_dresp.busy=1'b0; assign pr_dresp.dout=pr_do; assign pr_dresp.dready=pr_dv;
-    always @(posedge clk) begin pr_dv<=0; if(pr_dreq.rd) begin pr_do<=vram[pr_dreq.addr[19:0]]; pr_dv<=1; end end
-
-    // -------------------- caches --------------------
-    cache_req256_t ra_creq, ol_creq, pr_creq;
-    cache_resp256_t ra_cresp, ol_cresp, pr_cresp;
-    data_cache256 u_ra_c (.clk(clk),.reset(reset),.creq(ra_creq),.cresp(ra_cresp),.dreq(ra_dreq),.dresp(ra_dresp));
-    data_cache256 u_ol_c (.clk(clk),.reset(reset),.creq(ol_creq),.cresp(ol_cresp),.dreq(ol_dreq),.dresp(ol_dresp));
-    data_cache256 u_pr_c (.clk(clk),.reset(reset),.creq(pr_creq),.cresp(pr_cresp),.dreq(pr_dreq),.dresp(pr_dresp));
+    assign pr_dresp.busy=pr_busy_d; assign pr_dresp.dout=pr_do; assign pr_dresp.dready=pr_dv;
+    always @(posedge clk) begin
+        pr_dv <= 1'b0;
+        if (reset) pr_busy_d <= 1'b0;
+        else if (!pr_busy_d) begin
+            if (pr_dreq.rd) begin pr_busy_d<=1'b1; pr_word<=pr_dreq.addr[19:0];
+                pr_beats<=pr_dreq.burst; pr_lat<=RD_LAT[7:0]; end
+        end else if (pr_lat != 0) pr_lat <= pr_lat - 8'd1;
+        else begin
+            pr_do<=vram[pr_word]; pr_dv<=1'b1; pr_word<=pr_word+20'd1;
+            if (pr_beats <= 8'd1) pr_busy_d <= 1'b0;
+            pr_beats <= pr_beats - 8'd1;
+        end
+    end
 
     // -------------------- parsers --------------------
     reg          ra_start;
@@ -72,14 +106,14 @@ module frontend_tb_top import tsp_pkg::*; (
     region_array_parser u_ra (.clk(clk),.reset(reset),.start(ra_start),
         .region_base(region_base),.region_v1(region_v1),.busy(ra_busy),
         .tiles_parsed(ra_tiles_parsed),.rout(ra_out),.ack(ra_ack),
-        .creq(ra_creq),.cresp(ra_cresp));
+        .dreq(ra_dreq),.dresp(ra_dresp));
 
     reg          ol_start; reg [26:0] ol_list_ptr;
     wire         ol_busy, ol_done;
     prim_out_t   ol_prim; prim_ack_t ol_ack;
     object_list_parser u_ol (.clk(clk),.reset(reset),.start(ol_start),
         .list_ptr(ol_list_ptr),.busy(ol_busy),.done(ol_done),
-        .prim(ol_prim),.ack(ol_ack),.creq(ol_creq),.cresp(ol_cresp));
+        .prim(ol_prim),.ack(ol_ack),.dreq(ol_dreq),.dresp(ol_dresp));
 
     reg              it_start; objlist_entry_t it_entry; entry_type_e it_etype;
     wire             it_busy;
@@ -87,7 +121,7 @@ module frontend_tb_top import tsp_pkg::*; (
     isp_primitive_iterator u_it (.clk(clk),.reset(reset),.start(it_start),
         .intensity_shadow(regs.fpu_shad_scale.intensity_shadow),
         .param_base(param_base),.entry_type(it_etype),.entry(it_entry),.busy(it_busy),
-        .trio(it_trio),.ack(it_ack),.creq(pr_creq),.cresp(pr_cresp));
+        .trio(it_trio),.ack(it_ack),.dreq(pr_dreq),.dresp(pr_dresp));
 
     // -------------------- orchestration FSM --------------------
     // region -> (op state) -> objlist -> (strip entry) -> tristrip -> faux ISP.

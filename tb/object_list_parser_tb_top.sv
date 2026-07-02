@@ -1,4 +1,4 @@
-// TB top: object_list_parser + injected data_cache256 + behavioral 64-bit DDR.
+// TB top: object_list_parser (direct-DDR reader) + behavioral 64-bit burst DDR.
 // `consume` pulses ack.entry_done: the C++ TB pulses it when it wants the
 // parser to advance past the currently-presented entry.
 module object_list_parser_tb_top import tsp_pkg::*; (

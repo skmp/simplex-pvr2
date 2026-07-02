@@ -513,14 +513,12 @@ module tile_engine_top import tsp_pkg::*; #(
     // ISP/TSP param data caches (32-byte line). Client ports are driven by the
     // object-list parser (ISP$) and the plane cache (TSP$) in later stages; for
     // now they sit idle. Both share the tex_mem 4-port arbiter.
+    // These two tex_mem ISP$/TSP$ read ports are unused in this legacy top; idle
+    // them (no data_cache256 - that module has been removed).
     ddr_rd_req_t  ispd_dreq, tspd_dreq;
     ddr_rd_resp_t ispd_dresp, tspd_dresp;
-    cache_req256_t  ispd_creq, tspd_creq;
-    cache_resp256_t ispd_cresp, tspd_cresp;
-    data_cache256 u_isp_data (.clk(clk_100m),.reset(reset_100m),
-        .creq(ispd_creq),.cresp(ispd_cresp),.dreq(ispd_dreq),.dresp(ispd_dresp));
-    data_cache256 u_tsp_data (.clk(clk_100m),.reset(reset_100m),
-        .creq(tspd_creq),.cresp(tspd_cresp),.dreq(tspd_dreq),.dresp(tspd_dresp));
+    assign ispd_dreq = '0;
+    assign tspd_dreq = '0;
 
     tex_mem u_texmem (.clk(clk_100m),.reset(reset_100m),
         .d_dreq(dc_dreq),.d_dresp(dc_dresp),.q_dreq(qc_dreq),.q_dresp(qc_dresp),
@@ -534,9 +532,6 @@ module tile_engine_top import tsp_pkg::*; #(
 `ifndef SYNTHESIS
     assign tex_ram2_address=29'd0; assign tex_ram2_burstcount=8'd0; assign tex_ram2_read=1'b0;
 `endif
-    // idle the param data$ client ports until the parser/plane-cache drive them
-    assign ispd_creq = '0;
-    assign tspd_creq = '0;
 
     // flatten the plane arrays for the tsp_shade port (packed vectors)
     // tsp_shade takes p_ddx/p_ddy/p_c as [0:9] arrays directly.

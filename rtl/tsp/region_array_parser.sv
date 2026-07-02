@@ -25,7 +25,12 @@
 // Termination: control.last_region set on the just-read entry, OR after 16384
 // tiles read (runaway guard). tiles_parsed pulses when done.
 //
-// DI: the VRAM read port is the INJECTED 256-bit data cache (creq/cresp).
+// MEMORY: DIRECT DDR read port (dreq/dresp, single 64-bit channel via the shared
+// arbiter) - same 8-word sliding-window line reader the object_list_parser uses,
+// NOT a data_cache256. A region entry is at most 6 words (24 bytes), so a single
+// 8-word (256-bit) line burst covers a whole entry; entries are a sequential
+// address stream (base += 24), so the window + prefetch streams words ~1/cycle
+// and a new tile is a warm hit until the line boundary is crossed.
 //
 module region_array_parser import tsp_pkg::*; (
     input                  clk,
@@ -39,26 +44,76 @@ module region_array_parser import tsp_pkg::*; (
     output region_out_t    rout,
     input  region_ack_t    ack,
 
-    // injected 256-bit data cache (region-array region)
-    output cache_req256_t  creq,
-    input  cache_resp256_t cresp
+    // direct DDR3 read port (64-bit beats, via shared arbiter)
+    output ddr_rd_req_t    dreq,
+    input  ddr_rd_resp_t   dresp
 );
-    // ---- 32-bit word reader over the 256-bit line cache ----
-    reg  [26:0] raddr; reg rd_go; reg [31:0] rword; reg rword_v; reg [2:0] rsel;
-    reg  [26:0] creq_laddr_r; reg creq_req_r;
-    assign creq.req   = creq_req_r;
-    assign creq.laddr = creq_laddr_r;
+    // ============ 8-word (256-bit) line reader: 2-line window + prefetch ============
+    // rd_go with a byte address (raddr) returns the word NEXT cycle in
+    // rword/rword_v on a resident line. Each miss fetches a whole 256-bit line
+    // (burst=8) into win0 (demand) or win1 (prefetch of win0+1). Identical to the
+    // reader in object_list_parser.
+    reg  [26:0] raddr; reg rd_go; reg [31:0] rword; reg rword_v;
+    reg  [255:0] win0; reg [21:0] w0_tag; reg w0_v;
+    reg  [255:0] win1; reg [21:0] w1_tag; reg w1_v;
+    reg          dpend; reg [21:0] dline; reg [2:0] dsel;
+
+    localparam F_IDLE=2'd0, F_MISS=2'd1, F_FILL=2'd2;
+    reg [1:0]   fst;
+    reg [21:0]  f_line; reg f_is_pf; reg [2:0] f_beat; reg [255:0] f_acc;
+    wire        f_bank    = f_line[17];
+    wire [19:0] f_wofs_b  = {f_line[16:0], 3'b000};
+    wire [28:0] f_base_wd = {9'b0, f_wofs_b};
+    wire [31:0] f_half    = f_bank ? dresp.dout[63:32] : dresp.dout[31:0];
+
+    reg        dreq_rd_r; reg [28:0] dreq_addr_r; reg [7:0] dreq_burst_r;
+    assign dreq.rd    = dreq_rd_r;
+    assign dreq.addr  = dreq_addr_r;
+    assign dreq.burst = dreq_burst_r;
 
     always @(posedge clk) begin
-        rword_v    <= 1'b0;
-        creq_req_r <= 1'b0;                // 1-cycle pulse
-        if (rd_go) begin
-            creq_req_r   <= 1'b1;
-            creq_laddr_r <= raddr[26:5];
-            rsel         <= raddr[4:2];
+        rword_v   <= 1'b0;
+        dreq_rd_r <= 1'b0;
+
+        if (rd_go) begin dpend <= 1'b1; dline <= raddr[26:5]; dsel <= raddr[4:2]; end
+
+        if (dpend) begin
+            if (w0_v && w0_tag == dline) begin
+                rword <= win0[32*dsel +: 32]; rword_v <= 1'b1; if (!rd_go) dpend <= 1'b0;
+            end else if (w1_v && w1_tag == dline) begin
+                win0 <= win1; w0_tag <= w1_tag; w0_v <= 1'b1; w1_v <= 1'b0;
+                rword <= win1[32*dsel +: 32]; rword_v <= 1'b1; if (!rd_go) dpend <= 1'b0;
+            end
         end
-        if (cresp.ack) begin rword <= cresp.rdata[32*rsel +: 32]; rword_v <= 1'b1; end
-        if (reset) creq_req_r <= 1'b0;
+
+        case (fst)
+        F_IDLE: begin
+            if (dpend && !(w0_v && w0_tag==dline) && !(w1_v && w1_tag==dline)) begin
+                f_line <= dline; f_is_pf <= 1'b0; f_beat <= 3'd0; w1_v <= 1'b0;
+                fst <= F_MISS;
+            end else if (w0_v && !(w1_v && w1_tag == w0_tag + 22'd1)) begin
+                f_line <= w0_tag + 22'd1; f_is_pf <= 1'b1; f_beat <= 3'd0;
+                fst <= F_MISS;
+            end
+        end
+        F_MISS: if (!dresp.busy) begin
+            dreq_rd_r    <= 1'b1;
+            dreq_addr_r  <= {4'b0011, f_base_wd[24:0]};
+            dreq_burst_r <= 8'd8;                       // 8 words at a time
+            fst          <= F_FILL;
+        end
+        F_FILL: if (dresp.dready) begin
+            f_acc[32*f_beat +: 32] <= f_half;
+            if (f_beat == 3'd7) begin
+                if (f_is_pf) begin win1 <= { f_half, f_acc[223:0] }; w1_tag <= f_line; w1_v <= 1'b1; end
+                else          begin win0 <= { f_half, f_acc[223:0] }; w0_tag <= f_line; w0_v <= 1'b1; end
+                fst <= F_IDLE;
+            end else f_beat <= f_beat + 3'd1;
+        end
+        default: fst <= F_IDLE;
+        endcase
+
+        if (reset) begin w0_v<=0; w1_v<=0; dpend<=0; fst<=F_IDLE; dreq_rd_r<=0; end
     end
 
     // ---- output regs ----
