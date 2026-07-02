@@ -205,17 +205,13 @@ module tsp_shade_pp import tsp_pkg::*; #(
         .c00u(c00u),.c00v(c00v),.c01u(c01u),.c01v(c01v),
         .c10u(c10u),.c10v(c10v),.c11u(c11u),.c11v(c11v),.ufrac(ufr),.vfrac(vfr));
 
-    function [7:0] f2u8(input [31:0] f);
-        reg [8:0] iv;
-        begin
-            if (f[31] || f[30:23] < 8'd127) f2u8 = 8'd0;
-            else if (f[30:23] >= 8'd135)     f2u8 = 8'd255;
-            else begin
-                iv = {1'b1, f[22:15]} >> (8'd134 - f[30:23]);
-                f2u8 = (iv > 9'd255) ? 8'd255 : iv[7:0];
-            end
-        end
-    endfunction
+    // float -> u8 per colour/offset channel (planes 2..9), shared f2u8 module.
+    wire [7:0] u8a [2:9];
+    generate
+      for (gi = 2; gi <= 9; gi = gi + 1) begin : cvt
+        f2u8 u_c (.f(i4_attr[gi]), .u(u8a[gi]));
+      end
+    endgenerate
 
     // UV-stage registers
     reg        vU;
@@ -228,8 +224,8 @@ module tsp_shade_pp import tsp_pkg::*; #(
             vU<=v4;
             U00u<=c00u;U00v<=c00v;U01u<=c01u;U01v<=c01v;
             U10u<=c10u;U10v<=c10v;U11u<=c11u;U11v<=c11v;Uuf<=ufr;Uvf<=vfr;
-            U_base<={f2u8(i4_attr[5]),f2u8(i4_attr[4]),f2u8(i4_attr[3]),f2u8(i4_attr[2])};
-            U_ofs <={f2u8(i4_attr[9]),f2u8(i4_attr[8]),f2u8(i4_attr[7]),f2u8(i4_attr[6])};
+            U_base<={u8a[5],u8a[4],u8a[3],u8a[2]};
+            U_ofs <={u8a[9],u8a[8],u8a[7],u8a[6]};
             U_tsp<=tsp4; U_tcw<=tcw4; U_tc<=tcc4; U_ptx<=ptx4; U_pof<=pof4; U_id<=id4;
         end
     end

@@ -59,20 +59,18 @@ module tsp_shade import tsp_pkg::*; (
     fp_rcp_fast u_rc (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(rc_req),.x(rc_in),
                       .out_valid(rc_ack),.y(rc_y));
 
-    function [7:0] f2u8(input [31:0] f);
-        reg [8:0] iv;
-        begin
-            if (f[31] || f[30:23] < 8'd127) f2u8 = 8'd0;
-            else if (f[30:23] >= 8'd135)     f2u8 = 8'd255;
-            else begin
-                iv = {1'b1, f[22:15]} >> (8'd134 - f[30:23]);
-                f2u8 = (iv > 9'd255) ? 8'd255 : iv[7:0];
-            end
-        end
-    endfunction
-
     reg [31:0] Wp;
     reg [31:0] attr [0:9];
+
+    // float -> u8 per colour/offset channel (attr planes 2..9), shared f2u8 module.
+    wire [7:0] u8a [2:9];
+    genvar gci;
+    generate
+      for (gci = 2; gci <= 9; gci = gci + 1) begin : cvt
+        f2u8 u_c (.f(attr[gci]), .u(u8a[gci]));
+      end
+    endgenerate
+
     reg [3:0]  pidx; reg [2:0] istep;
     reg [31:0] t_ddx_x;
 
@@ -141,8 +139,8 @@ module tsp_shade import tsp_pkg::*; (
             // uv2texel combinational block -> breaks the long chain into the
             // filter/combiner cycles below). Also pack base/offset colours.
             S_TEXSEL: begin
-                base_col <= {f2u8(attr[5]),f2u8(attr[4]),f2u8(attr[3]),f2u8(attr[2])};
-                ofs_col  <= {f2u8(attr[9]),f2u8(attr[8]),f2u8(attr[7]),f2u8(attr[6])};
+                base_col <= {u8a[5],u8a[4],u8a[3],u8a[2]};
+                ofs_col  <= {u8a[9],u8a[8],u8a[7],u8a[6]};
                 r00u<=c00u; r00v<=c00v; r01u<=c01u; r01v<=c01v;
                 r10u<=c10u; r10v<=c10v; r11u<=c11u; r11v<=c11v;
                 uf_r<=ufrac; vf_r<=vfrac;

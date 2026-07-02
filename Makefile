@@ -168,6 +168,13 @@ rasterstream: | $(BUILD)
 	  $(CWD)/tb/isp_raster_stream_tb.cpp --Mdir $(BUILD)/obj_rasterstream -o tb
 	./$(BUILD)/obj_rasterstream/tb
 
+# fp_mul_c9 (colour*z) fuzz vs float*int
+mulc9: | $(BUILD)
+	$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_mul_c9_tb_top \
+	  rtl/tsp/fp_mul_c9.sv tb/fp_mul_c9_tb_top.sv \
+	  $(CWD)/tb/fp_mul_c9_tb.cpp --Mdir $(BUILD)/obj_mulc9 -o tb
+	./$(BUILD)/obj_mulc9/tb
+
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
 	$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw -Irtl/tsp/gen \
