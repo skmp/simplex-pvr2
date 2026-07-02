@@ -29,6 +29,7 @@ MAKEFLAGS += -j$(NJOBS)
 
 VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/tsp/gen \
             -j $(NJOBS) \
+            --output-split 40000 --output-split-cfuncs 500 \
             -CFLAGS "-O3 -march=native"
 
 # combinational (bit-exact) design

@@ -195,36 +195,39 @@ module frontend_isp_tb_top import tsp_pkg::*; (
         end
     endgenerate
 
-    // -------------------- orchestration FSM --------------------
-    // Outer walk: region -> list -> entry. Inside an entry, THREE parallel sub-
-    // FSMs form a pipeline so triangle N+2's vertex FETCH, triangle N+1's SETUP,
-    // and triangle N's raster SCAN all run concurrently, via two 1-deep handoffs:
-    //   fetch : pull a triangle (isp+3 XYZ) from the iterator -> fh_* + fh_valid,
-    //           ack the iterator so it advances (isolates the ~25-read fetch).
-    //   setup : consume fh_* -> isp_setup_min -> pend_* + pend_valid (cull here).
-    //   raster: consume pend_* -> active isp_*, stream the 32x32 sweep + drain.
+    // -------------------- orchestration: decoupled producer / consumer --------------------
+    // PRODUCER (region -> objlist -> iterator) runs AHEAD, pushing each triangle
+    // into an 8-deep triangle FIFO. CONSUMER (setup ∥ raster) pops the FIFO and
+    // rasterizes into the tile buffer. This hides the iterator's ~87-cyc per-
+    // triangle read latency behind the setup+raster of earlier triangles.
+    //
+    // BARRIER: the FIFO holds triangles of ONE region-state only. CLEAR/OP/PT/TR/
+    // FLUSH all touch the SAME tile depth/tag buffer and MUST stay ordered, so at
+    // every region-state boundary the producer waits until the FIFO is empty AND
+    // the consumer is idle (current state fully rastered) before advancing.
     localparam S_IDLE=0, S_RA=1, S_STATE=2,
                S_OL_WAIT=4, S_ENTRY=5,
                S_PRIM=7, S_OL_ACK=8,
-               S_RA_ACK=9, S_DONE=10;
+               S_RA_ACK=9, S_DONE=10,
+               S_DRAIN=11;                 // barrier: wait consumer idle + FIFO empty
     reg [3:0] st;
 
-    // fetch sub-FSM (iterator -> fetch handoff). Single state: accept when the
-    // iterator has a triangle and the fetch handoff is free. The iterator drops
-    // triangle_ready for a cycle after each ack, so no re-accept guard is needed.
-    localparam FE_IDLE=0;
-    reg fe_st;
-    // setup sub-FSM
-    localparam SU_IDLE=0, SU_RUN=1;
-    reg su_st;
-    // raster sub-FSM
-    localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;
-    reg [1:0] rs_st;
+    // consumer sub-FSMs
+    localparam SU_IDLE=0, SU_RUN=1;              reg su_st;
+    localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;  reg [1:0] rs_st;
 
-    // 1-deep FETCH handoff (fetch -> setup): the pulled triangle's geometry.
-    reg        fh_valid;
-    reg [31:0] fh_x1,fh_y1,fh_z1, fh_x2,fh_y2,fh_z2, fh_x3,fh_y3,fh_z3;
-    reg [31:0] fh_isp, fh_tag;
+    // ---- triangle FIFO (producer -> consumer), depth 8 ----
+    localparam integer FIFO_N = 8;
+    reg [31:0] fq_isp [0:FIFO_N-1];
+    reg [31:0] fq_tag [0:FIFO_N-1];
+    reg [31:0] fq_x1[0:FIFO_N-1], fq_y1[0:FIFO_N-1], fq_z1[0:FIFO_N-1];
+    reg [31:0] fq_x2[0:FIFO_N-1], fq_y2[0:FIFO_N-1], fq_z2[0:FIFO_N-1];
+    reg [31:0] fq_x3[0:FIFO_N-1], fq_y3[0:FIFO_N-1], fq_z3[0:FIFO_N-1];
+    reg [3:0]  fq_head, fq_tail;   // ring indices 0..FIFO_N-1
+    reg [4:0]  fq_count;
+    reg        fifo_push, fifo_pop; // 1-cycle intents (reconciled into fq_count)
+    wire fq_full  = (fq_count == FIFO_N);
+    wire fq_empty = (fq_count == 0);
 
     // 1-deep pending-planes handoff (setup -> raster)
     reg        pend_valid;
@@ -235,6 +238,8 @@ module frontend_isp_tb_top import tsp_pkg::*; (
     reg [31:0] pend_isp, pend_tag;
 
     reg prim_seen;   // iterator pulsed prim_done for the current entry
+    // consumer fully idle (nothing in setup, raster, pend handoff)
+    wire consumer_idle = (su_st==SU_IDLE) && (rs_st==RS_IDLE) && !pend_valid;
 
     integer tri_count, cull_count, tri_seen;
     // profiling counters (cycles spent in each activity while walking entries)
@@ -264,8 +269,8 @@ module frontend_isp_tb_top import tsp_pkg::*; (
             isp_start<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             tri_count<=0; cull_count<=0; tri_seen<=0; ras_inflight<=0;
-            fe_st<=FE_IDLE; su_st<=SU_IDLE; rs_st<=RS_IDLE;
-            fh_valid<=0; pend_valid<=0; prim_seen<=0;
+            su_st<=SU_IDLE; rs_st<=RS_IDLE; pend_valid<=0; prim_seen<=0;
+            fq_head<=0; fq_tail<=0; fq_count<=0;
             cyc_setup_run<=0; cyc_su_wait<=0; cyc_ras<=0; cyc_ras_drain<=0;
             cyc_ras_idle<=0; cyc_prim<=0;
             cyc_su_wfetch<=0; cyc_su_wrast<=0; cyc_fe_wait<=0;
@@ -307,8 +312,9 @@ module frontend_isp_tb_top import tsp_pkg::*; (
 
             S_STATE: begin
                 case (ra_out.state)
-                RSTATE_CLEAR: begin
-                    // as tile_engine_top TILE_CLEAR: {bg depth, bg CoreTag}
+                // CLEAR touches the whole tile buffer: BARRIER first (consumer of
+                // the previous state must be fully done).
+                RSTATE_CLEAR: if (consumer_idle && fq_empty) begin
                     for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
                         dt_depth[i] = regs.isp_backgnd_d;
                         dt_tag[i]   = regs.isp_backgnd_t;
@@ -322,8 +328,8 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                     t_ybase <= i2f({10'd0, cur_ty} * 16'd32);
                     st <= S_OL_WAIT;
                 end
-                RSTATE_FLUSH: begin
-                    // flush this tile's tags to the 640x480 fb at (tx*32, ty*32)
+                // FLUSH reads the whole tile buffer: BARRIER first.
+                RSTATE_FLUSH: if (consumer_idle && fq_empty) begin
                     for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
                         /* verilator lint_off WIDTH */
                         px = {26'd0, cur_tx}*32 + (i % TILE_W);
@@ -338,8 +344,10 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                 endcase
             end
 
+            // walk the object list, enqueueing triangles. On list end, BARRIER
+            // (S_DRAIN) before acking so the next state sees a drained tile buffer.
             S_OL_WAIT: begin
-                if (ol_done) begin ra_ack.list_done<=1'b1; st<=S_RA_ACK; end
+                if (ol_done) st<=S_DRAIN;
                 else if (ol_prim.entry_ready) st<=S_ENTRY;
             end
 
@@ -357,13 +365,19 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                 end
             end
 
-            // S_PRIM: the three sub-FSMs below pipeline fetch/setup/raster. The
-            // entry is finished when the iterator reported prim_done AND all three
-            // sub-FSMs are idle AND both handoffs are empty.
-            S_PRIM: if (prim_seen && fe_st==FE_IDLE && su_st==SU_IDLE && rs_st==RS_IDLE
-                        && !fh_valid && !pend_valid) begin
+            // S_PRIM: PRODUCER only - drain the iterator's triangles into the FIFO
+            // (see the enqueue block below). When the iterator finished this entry
+            // (prim_seen) and its last triangle is enqueued, ack the entry and get
+            // the next one. The CONSUMER runs concurrently, independent of `st`.
+            S_PRIM: if (prim_seen) begin
                 ol_ack.entry_done <= 1'b1;
                 st <= S_OL_ACK;
+            end
+
+            // BARRIER at list end: wait for the FIFO to drain and the consumer to
+            // go idle (this state fully rastered) before letting region advance.
+            S_DRAIN: if (fq_empty && consumer_idle) begin
+                ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
             end
 
             S_OL_ACK: st <= S_OL_WAIT;
@@ -385,95 +399,94 @@ module frontend_isp_tb_top import tsp_pkg::*; (
             default: st<=S_IDLE;
             endcase
 
-            // ============ parallel FETCH / SETUP / RASTER sub-FSMs ============
-            // Active only while walking an entry (st==S_PRIM). Three-deep pipeline:
-            // fetch(N+2) || setup(N+1) || raster(N), via fh_* and pend_* handoffs.
+            // ---- profiling (whole render) ----
+            cyc_prim <= cyc_prim + 1;
+            if (su_st==SU_RUN)          cyc_setup_run <= cyc_setup_run + 1;
+            else if (fq_empty)          cyc_su_wfetch <= cyc_su_wfetch + 1; // consumer starved (producer/iterator behind)
+            else if (pend_valid)        cyc_su_wrast  <= cyc_su_wrast  + 1; // FIFO has work but raster busy
+            if (rs_st==RS_RAS)          cyc_ras       <= cyc_ras + 1;
+            else if (rs_st==RS_DRAIN)   cyc_ras_drain <= cyc_ras_drain + 1;
+            else if (!pend_valid)       cyc_ras_idle  <= cyc_ras_idle + 1;
+
+            // ================= PRODUCER: iterator -> triangle FIFO =================
+            // Runs while walking an entry (st==S_PRIM). Push each triangle the
+            // iterator presents; stall (don't ack) when the FIFO is full.
+            fifo_push = 1'b0;
             if (st == S_PRIM) begin
-                // ---- profiling ----
-                cyc_prim <= cyc_prim + 1;
-                if (su_st==SU_RUN)  cyc_setup_run <= cyc_setup_run + 1;
-                else begin // SU_IDLE: split the stall cause
-                    if (!fh_valid)          cyc_su_wfetch <= cyc_su_wfetch + 1; // no triangle from fetch yet
-                    else if (pend_valid)    cyc_su_wrast  <= cyc_su_wrast  + 1; // fetch ready but pend full (raster busy)
-                end
-                // fetch stage actively blocked on the iterator producing a triangle
-                if (!fh_valid && !it_trio.triangle_ready) cyc_fe_wait <= cyc_fe_wait + 1;
-                if (rs_st==RS_RAS)       cyc_ras       <= cyc_ras + 1;
-                else if (rs_st==RS_DRAIN) cyc_ras_drain <= cyc_ras_drain + 1;
-                else if (!pend_valid)     cyc_ras_idle  <= cyc_ras_idle + 1;
-
-                // iterator finished producing this entry's triangles (may pulse
-                // any time; capture it).
                 if (it_trio.prim_done) prim_seen <= 1'b1;
-
-                // ---- FETCH FSM: iterator -> fh_* handoff ----
-                if (fe_st==FE_IDLE && it_trio.triangle_ready && !fh_valid && !it_ack.triangle_done) begin
-                    fh_isp <= it_trio.isp; fh_tag <= it_trio.tag;
-                    fh_x1<=it_trio.v0.x; fh_y1<=it_trio.v0.y; fh_z1<=it_trio.v0.z;
-                    fh_x2<=it_trio.v1.x; fh_y2<=it_trio.v1.y; fh_z2<=it_trio.v1.z;
-                    fh_x3<=it_trio.v2.x; fh_y3<=it_trio.v2.y; fh_z3<=it_trio.v2.z;
+                if (it_trio.triangle_ready && !fq_full && !it_ack.triangle_done) begin
+                    fq_isp[fq_tail[2:0]] <= it_trio.isp;
+                    fq_tag[fq_tail[2:0]] <= it_trio.tag;
+                    fq_x1[fq_tail[2:0]]<=it_trio.v0.x; fq_y1[fq_tail[2:0]]<=it_trio.v0.y; fq_z1[fq_tail[2:0]]<=it_trio.v0.z;
+                    fq_x2[fq_tail[2:0]]<=it_trio.v1.x; fq_y2[fq_tail[2:0]]<=it_trio.v1.y; fq_z2[fq_tail[2:0]]<=it_trio.v1.z;
+                    fq_x3[fq_tail[2:0]]<=it_trio.v2.x; fq_y3[fq_tail[2:0]]<=it_trio.v2.y; fq_z3[fq_tail[2:0]]<=it_trio.v2.z;
                     it_ack.triangle_done <= 1'b1;   // advance iterator to next tri
-                    fh_valid <= 1'b1;
+                    fq_tail  <= (fq_tail==FIFO_N-1) ? 4'd0 : fq_tail+4'd1;
+                    fifo_push = 1'b1;
                     tri_seen <= tri_seen + 1;
                     if (tri_seen % 100 == 0)
                         $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h",
                             cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp);
                 end
-
-                // ---- SETUP FSM: fh_* -> isp_setup_min -> pend_* ----
-                case (su_st)
-                SU_IDLE: if (fh_valid && !pend_valid) begin
-                    isp_word_su <= fh_isp; su_tag <= fh_tag;
-                    t_x1<=fh_x1; t_y1<=fh_y1; t_z1<=fh_z1;
-                    t_x2<=fh_x2; t_y2<=fh_y2; t_z2<=fh_z2;
-                    t_x3<=fh_x3; t_y3<=fh_y3; t_z3<=fh_z3;
-                    fh_valid <= 1'b0;               // free fetch handoff
-                    isp_start <= 1'b1;
-                    su_st <= SU_RUN;
-                end
-                SU_RUN: if (isp_done) begin
-                    if (isp_cull) begin
-                        cull_count <= cull_count + 1;   // culled: don't fill pend
-                    end else begin
-                        pend_dx12<=w_dx12; pend_dx23<=w_dx23; pend_dx31<=w_dx31; pend_dx41<=w_dx41;
-                        pend_dy12<=w_dy12; pend_dy23<=w_dy23; pend_dy31<=w_dy31; pend_dy41<=w_dy41;
-                        pend_c1<=w_c1; pend_c2<=w_c2; pend_c3<=w_c3; pend_c4<=w_c4;
-                        pend_ddx<=w_ddx; pend_ddy<=w_ddy; pend_cinvw<=w_cinvw;
-                        pend_isp<=isp_word_su; pend_tag<=su_tag;
-                        pend_valid <= 1'b1;
-                    end
-                    su_st <= SU_IDLE;
-                end
-                endcase
-
-                // ---- raster FSM: pend_* -> active planes -> 32x32 sweep ----
-                case (rs_st)
-                RS_IDLE: if (pend_valid) begin
-                    isp_dx12<=pend_dx12; isp_dx23<=pend_dx23; isp_dx31<=pend_dx31; isp_dx41<=pend_dx41;
-                    isp_dy12<=pend_dy12; isp_dy23<=pend_dy23; isp_dy31<=pend_dy31; isp_dy41<=pend_dy41;
-                    isp_c1<=pend_c1; isp_c2<=pend_c2; isp_c3<=pend_c3; isp_c4<=pend_c4;
-                    isp_ddx_invw<=pend_ddx; isp_ddy_invw<=pend_ddy; isp_c_invw<=pend_cinvw;
-                    isp_word<=pend_isp; tri_tag<=pend_tag;
-                    pend_valid <= 1'b0;             // free the handoff for setup
-                    tri_count  <= tri_count + 1;
-                    ras_y <= 5'd0; ras_x <= 5'd0;
-                    rs_st <= RS_RAS;
-                end
-                // STREAM: one 8-pixel chunk per cycle across the 32x32 tile.
-                RS_RAS: begin
-                    if (ras_x == 5'(TILE_W - RAS_LANES)) begin
-                        ras_x <= 5'd0;
-                        if (ras_y == 5'(TILE_H - 1)) rs_st <= RS_DRAIN;
-                        else ras_y <= ras_y + 5'd1;
-                    end else begin
-                        ras_x <= ras_x + 5'(RAS_LANES);
-                    end
-                end
-                // drain: wait for the pipeline to empty (see ras_inflight note).
-                RS_DRAIN: if (ras_inflight == 0 && !ras_in_valid && !ras_out_valid)
-                    rs_st <= RS_IDLE;
-                endcase
             end
+
+            // ================= CONSUMER: FIFO -> setup -> raster =================
+            // ---- SETUP: pop FIFO -> isp_setup_min -> pend_* ----
+            fifo_pop = 1'b0;
+            case (su_st)
+            SU_IDLE: if (!fq_empty && !pend_valid) begin
+                isp_word_su <= fq_isp[fq_head[2:0]]; su_tag <= fq_tag[fq_head[2:0]];
+                t_x1<=fq_x1[fq_head[2:0]]; t_y1<=fq_y1[fq_head[2:0]]; t_z1<=fq_z1[fq_head[2:0]];
+                t_x2<=fq_x2[fq_head[2:0]]; t_y2<=fq_y2[fq_head[2:0]]; t_z2<=fq_z2[fq_head[2:0]];
+                t_x3<=fq_x3[fq_head[2:0]]; t_y3<=fq_y3[fq_head[2:0]]; t_z3<=fq_z3[fq_head[2:0]];
+                fq_head <= (fq_head==FIFO_N-1) ? 4'd0 : fq_head+4'd1;
+                fifo_pop = 1'b1;
+                isp_start <= 1'b1;
+                su_st <= SU_RUN;
+            end
+            SU_RUN: if (isp_done) begin
+                if (isp_cull) begin
+                    cull_count <= cull_count + 1;   // culled: don't fill pend
+                end else begin
+                    pend_dx12<=w_dx12; pend_dx23<=w_dx23; pend_dx31<=w_dx31; pend_dx41<=w_dx41;
+                    pend_dy12<=w_dy12; pend_dy23<=w_dy23; pend_dy31<=w_dy31; pend_dy41<=w_dy41;
+                    pend_c1<=w_c1; pend_c2<=w_c2; pend_c3<=w_c3; pend_c4<=w_c4;
+                    pend_ddx<=w_ddx; pend_ddy<=w_ddy; pend_cinvw<=w_cinvw;
+                    pend_isp<=isp_word_su; pend_tag<=su_tag;
+                    pend_valid <= 1'b1;
+                end
+                su_st <= SU_IDLE;
+            end
+            endcase
+
+            // ---- RASTER: pend_* -> active planes -> 32x32 sweep ----
+            case (rs_st)
+            RS_IDLE: if (pend_valid) begin
+                isp_dx12<=pend_dx12; isp_dx23<=pend_dx23; isp_dx31<=pend_dx31; isp_dx41<=pend_dx41;
+                isp_dy12<=pend_dy12; isp_dy23<=pend_dy23; isp_dy31<=pend_dy31; isp_dy41<=pend_dy41;
+                isp_c1<=pend_c1; isp_c2<=pend_c2; isp_c3<=pend_c3; isp_c4<=pend_c4;
+                isp_ddx_invw<=pend_ddx; isp_ddy_invw<=pend_ddy; isp_c_invw<=pend_cinvw;
+                isp_word<=pend_isp; tri_tag<=pend_tag;
+                pend_valid <= 1'b0;             // free the handoff for setup
+                tri_count  <= tri_count + 1;
+                ras_y <= 5'd0; ras_x <= 5'd0;
+                rs_st <= RS_RAS;
+            end
+            RS_RAS: begin
+                if (ras_x == 5'(TILE_W - RAS_LANES)) begin
+                    ras_x <= 5'd0;
+                    if (ras_y == 5'(TILE_H - 1)) rs_st <= RS_DRAIN;
+                    else ras_y <= ras_y + 5'd1;
+                end else begin
+                    ras_x <= ras_x + 5'(RAS_LANES);
+                end
+            end
+            RS_DRAIN: if (ras_inflight == 0 && !ras_in_valid && !ras_out_valid)
+                rs_st <= RS_IDLE;
+            endcase
+
+            // ---- FIFO count maintenance (single update; push/pop may coincide) ----
+            fq_count <= fq_count + (fifo_push ? 5'd1 : 5'd0) - (fifo_pop ? 5'd1 : 5'd0);
         end
     end
 endmodule
