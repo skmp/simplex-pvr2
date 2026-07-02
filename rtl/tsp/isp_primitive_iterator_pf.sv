@@ -73,6 +73,27 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
     wire [4:0] ex_hdr_words = ex_two_vol ? 5'd5 : 5'd3;
     wire [26:0] ex_rec_bytes = {22'b0, ex_hdr_words, 2'b00} + 27'd3 * {ex_stride_w, 2'b00};
     wire [20:0] ex_rec_words = ex_rec_bytes[22:2];
+    // For a STRIP, read only up to the LAST vertex any enabled triangle needs, not
+    // all 8. Triangle i (mask[5-i]) uses verts i,i+1,i+2; the highest enabled i =
+    // 5 - (lowest set bit of mask), so verts needed = (5-lsb)+3 = 8-lsb. (Array
+    // records always read exactly 3.)
+    function automatic [2:0] lsb6(input [5:0] m);
+        casez (m)
+            6'b?????1: lsb6 = 3'd0;
+            6'b????10: lsb6 = 3'd1;
+            6'b???100: lsb6 = 3'd2;
+            6'b??1000: lsb6 = 3'd3;
+            6'b?10000: lsb6 = 3'd4;
+            6'b100000: lsb6 = 3'd5;
+            default:   lsb6 = 3'd5;   // mask==0 (no tris): read minimal (3 verts)
+        endcase
+    endfunction
+    // ex_-sourced record span (mirrors the old combinational rd_span_vw but from the
+    // ex_* latch sources) so it can be registered into rd_span_r at record start.
+    wire [3:0] ex_strip_nv = 4'd8 - {1'b0, lsb6(ex_mask)};   // 3..8
+    wire [3:0] ex_nverts   = ex_array ? 4'd3 : ex_strip_nv;
+    wire [8:0] ex_span_vw  = {4'b0, ex_hdr_words}
+                           + ({5'b0,(ex_nverts-4'd1)} * {4'b0, ex_stride_w}) + 9'd3;
 
     // outstanding-record bookkeeping: reader has fetched (or is fetching) records
     // that emit has not yet finished. flush + none-outstanding + reader idle -> done.
@@ -87,32 +108,19 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
     // geometry of the record currently being READ (latched when reader starts it)
     reg [26:0] rd_base;   reg [2:0] rd_skip;  reg rd_shadow; reg [5:0] rd_mask;
     reg [20:0] rd_po;     reg rd_array;
-    wire       rd_two_vol   = rd_shadow & ~intensity_shadow;
-    wire [4:0] rd_stride_w  = 5'd3 + rd_skip * (rd_two_vol ? 5'd2 : 5'd1);
-    wire [4:0] rd_hdr_words = rd_two_vol ? 5'd5 : 5'd3;
-    // For a STRIP, read only up to the LAST vertex any enabled triangle needs,
-    // not all 8. Triangle i (mask[5-i]) uses verts i,i+1,i+2; the highest enabled
-    // i = 5 - (lowest set bit of mask), so verts needed = (5-lsb)+3 = 8-lsb.
-    // (Array records always read exactly 3.)
-    function automatic [2:0] lsb6(input [5:0] m);
-        casez (m)
-            6'b?????1: lsb6 = 3'd0;
-            6'b????10: lsb6 = 3'd1;
-            6'b???100: lsb6 = 3'd2;
-            6'b??1000: lsb6 = 3'd3;
-            6'b?10000: lsb6 = 3'd4;
-            6'b100000: lsb6 = 3'd5;
-            default:   lsb6 = 3'd5;   // mask==0 (no tris): read minimal (3 verts)
-        endcase
-    endfunction
-    wire [3:0] rd_strip_nv = 4'd8 - {1'b0, lsb6(rd_mask)};   // 3..8
-    wire [3:0] rd_nverts    = rd_array ? 4'd3 : rd_strip_nv;
+    // Record geometry (span/header/stride) is CONSTANT for the whole record and
+    // depends only on the latched shadow/skip/mask/array. Computing the span
+    // combinationally (it has a multiply) used to feed the per-beat
+    // `beat==span-1` end-of-record comparator straight from rd_shadow -> the 100 MHz
+    // critical path. Instead we precompute the geometry from the ex_* sources at the
+    // R_IDLE latch and REGISTER it here, so the per-beat comparator and the
+    // need_off_r stepping read plain registers, not a rd_shadow->multiply chain.
+    reg  [8:0] rd_span_r;              // record span in vwords, registered at start
+    reg  [4:0] rd_hdr_r, rd_stride_r;  // header words / per-vertex stride, registered
 
     wire [24:0] rd_base_vw  = rd_base[26:2];
     wire        rd_bank     = rd_base_vw[20];
     wire [19:0] rd_phys     = rd_base_vw[19:0];
-    wire [8:0]  rd_span_vw  = {4'b0, rd_hdr_words}
-                            + ({5'b0,(rd_nverts-4'd1)} * {4'b0, rd_stride_w}) + 9'd3;
 
     reg  [5:0]  ni;                    // needed-item index
     wire        ni_isp = (ni == 6'd0);
@@ -210,13 +218,19 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
                     rd_mask   <= ex_mask;
                     rd_po     <= ex_po;
                     rd_array  <= ex_array;
+                    // register the record geometry (constant for the whole record)
+                    // so the per-beat comparator / stepping never re-derive it from
+                    // rd_shadow through a multiply.
+                    rd_span_r   <= ex_span_vw;
+                    rd_hdr_r    <= ex_hdr_words;
+                    rd_stride_r <= ex_stride_w;
                     rst       <= R_REQ;
                 end
             end
             R_REQ: if (!dresp.busy) begin
                 dreq_rd_r    <= 1'b1;
                 dreq_addr_r  <= {4'b0011, 5'b0, rd_phys};
-                dreq_burst_r <= rd_span_vw[7:0];
+                dreq_burst_r <= rd_span_r[7:0];
                 beat         <= 9'd0;
                 ni           <= 6'd0;
                 ni_vx        <= 4'd0;
@@ -242,15 +256,15 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
                     //   ISP word     -> first vertex x  : jump to header size
                     //   z of vertex  -> x of next vertex : + (stride - 2)
                     //   x/y within a vertex             : + 1
-                    if (ni_isp)              need_off_r <= {4'b0, rd_hdr_words};
-                    else if (ni_cmp == 2'd2) need_off_r <= need_off_r + {4'b0, rd_stride_w} - 9'd2;
+                    if (ni_isp)              need_off_r <= {4'b0, rd_hdr_r};
+                    else if (ni_cmp == 2'd2) need_off_r <= need_off_r + {4'b0, rd_stride_r} - 9'd2;
                     else                     need_off_r <= need_off_r + 9'd1;
                     if (!ni_isp) begin
                         if (ni_cmp == 2'd2) begin ni_cmp<=2'd0; ni_vx<=ni_vx+4'd1; end
                         else                       ni_cmp<=ni_cmp+2'd1;
                     end
                 end
-                if (beat == rd_span_vw - 9'd1) begin
+                if (beat == rd_span_r - 9'd1) begin
                     // record fully read: publish geometry, mark buffer ready, and
                     // advance the entry expansion / free the reader for the next.
                     b_mask [rd_buf] <= rd_mask;
@@ -329,7 +343,7 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
             // a same-cycle fetch-complete (+1) and buffer-release (-1) reconcile.
             begin : os_update
                 reg push, pop;
-                push = (rst==R_STREAM) && dresp.dready && (beat==rd_span_vw-9'd1);
+                push = (rst==R_STREAM) && dresp.dready && (beat==rd_span_r-9'd1);
                 pop  = (est==E_REL);
                 outstanding <= outstanding + (push ? 4'd1 : 4'd0) - (pop ? 4'd1 : 4'd0);
             end
