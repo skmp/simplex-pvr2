@@ -50,7 +50,26 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
         assign NM``_dresp.busy=1'b0; assign NM``_dresp.dout=NM``_do; assign NM``_dresp.dready=NM``_dv; \
         always @(posedge clk) begin NM``_dv<=0; if(NM``_dreq.rd) begin NM``_do<=vram[NM``_dreq.addr[19:0]]; NM``_dv<=1; end end
 
-    `DDRPORT(ra) `DDRPORT(ts)
+    `DDRPORT(ra)
+
+    // TSP param port - BURST + latency model (single 64-bit channel), like ol/pr.
+    ddr_rd_req_t  ts_dreq; ddr_rd_resp_t ts_dresp;
+    reg ts_busy_d; reg [19:0] ts_word; reg [7:0] ts_beats, ts_lat;
+    reg [63:0] ts_do; reg ts_dv;
+    assign ts_dresp.busy=ts_busy_d; assign ts_dresp.dout=ts_do; assign ts_dresp.dready=ts_dv;
+    always @(posedge clk) begin
+        ts_dv <= 1'b0;
+        if (reset) ts_busy_d <= 1'b0;
+        else if (!ts_busy_d) begin
+            if (ts_dreq.rd) begin ts_busy_d<=1'b1; ts_word<=ts_dreq.addr[19:0];
+                ts_beats<=ts_dreq.burst; ts_lat<=8'd8; end
+        end else if (ts_lat != 0) ts_lat <= ts_lat - 8'd1;
+        else begin
+            ts_do<=vram[ts_word]; ts_dv<=1'b1; ts_word<=ts_word+20'd1;
+            if (ts_beats <= 8'd1) ts_busy_d <= 1'b0;
+            ts_beats <= ts_beats - 8'd1;
+        end
+    end
 
     // objlist + param ports - BURST + latency model (each a single 64-bit channel):
     // a read is accepted for RD_LAT dead cycles, then `burst` consecutive beats
@@ -110,12 +129,11 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     endgenerate
 
     // -------------------- caches --------------------
-    // Region parser + TSP param reader keep their 256-bit line caches; the OL
-    // parser and ISP iterator read DDR DIRECTLY (own line buffers / burst).
-    cache_req256_t ra_creq, ts_creq;
-    cache_resp256_t ra_cresp, ts_cresp;
+    // Region parser keeps its 256-bit line cache; the OL parser, ISP iterator,
+    // and TSP param reader read DDR DIRECTLY (own line buffers / burst).
+    cache_req256_t ra_creq;
+    cache_resp256_t ra_cresp;
     data_cache256 u_ra_c (.clk(clk),.reset(reset),.creq(ra_creq),.cresp(ra_cresp),.dreq(ra_dreq),.dresp(ra_dresp));
-    data_cache256 u_ts_c (.clk(clk),.reset(reset),.creq(ts_creq),.cresp(ts_cresp),.dreq(ts_dreq),.dresp(ts_dresp));
 
     cache_req_t   pp_tc_req [0:3], pp_vq_req [0:3];
     cache_resp_t  pp_tc_resp[0:3], pp_vq_resp[0:3];
@@ -400,15 +418,58 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     wire [4:0]  sh_stride_w = 5'd3 + sh_skip * (sh_two_vol ? 5'd2 : 5'd1);
     wire [26:0] sh_stride_b = {sh_stride_w, 2'b00};
 
-    // TSP param reader over ts$
-    reg  [26:0] f_addr; reg f_go; reg [31:0] f_word; reg f_word_v; reg [2:0] f_sel;
-    reg  [26:0] ts_laddr_r; reg ts_req_r;
-    assign ts_creq.req = ts_req_r; assign ts_creq.laddr = ts_laddr_r;
+    // TSP param reader: DIRECT DDR with a 2-line sliding window + burst=8 fills
+    // and next-line prefetch (same reader the ISP iterator/OL parser use). Serves
+    // f_go/f_addr -> f_word/f_word_v: a resident word returns next cycle in ~1
+    // cycle; the param record's fields (mostly sequential) stream without a cache
+    // round-trip per word. 32-bit VIEW de-interleave: line -> 8 physical beats,
+    // same bank, one 32-bit half each.
+    reg  [26:0] f_addr; reg f_go; reg [31:0] f_word; reg f_word_v;
+    reg  [255:0] fw0; reg [21:0] fw0_tag; reg fw0_v;   // current line
+    reg  [255:0] fw1; reg [21:0] fw1_tag; reg fw1_v;   // prefetched next line
+    reg          fdpend; reg [21:0] fdline; reg [2:0] fdsel;
+    localparam FF_IDLE=2'd0, FF_MISS=2'd1, FF_FILL=2'd2;
+    reg [1:0]   ffst;
+    reg [21:0]  ff_line; reg ff_pf; reg [2:0] ff_beat; reg [255:0] ff_acc;
+    wire        ff_bank   = ff_line[17];
+    wire [19:0] ff_wofs_b = {ff_line[16:0], 3'b000};
+    wire [28:0] ff_base_w = {9'b0, ff_wofs_b};
+    wire [31:0] ff_half   = ff_bank ? ts_dresp.dout[63:32] : ts_dresp.dout[31:0];
+    reg  ts_rd_r; reg [28:0] ts_addr_r; reg [7:0] ts_burst_r;
+    assign ts_dreq.rd = ts_rd_r; assign ts_dreq.addr = ts_addr_r; assign ts_dreq.burst = ts_burst_r;
     always @(posedge clk) begin
-        f_word_v<=1'b0; ts_req_r<=1'b0;
-        if (f_go) begin ts_req_r<=1'b1; ts_laddr_r<={5'd0,f_addr[26:5]}; f_sel<=f_addr[4:2]; end
-        if (ts_cresp.ack) begin f_word<=ts_cresp.rdata[32*f_sel +: 32]; f_word_v<=1'b1; end
-        if (reset) ts_req_r<=1'b0;
+        f_word_v <= 1'b0; ts_rd_r <= 1'b0;
+        if (f_go) begin fdpend<=1'b1; fdline<=f_addr[26:5]; fdsel<=f_addr[4:2]; end
+        if (fdpend) begin
+            if (fw0_v && fw0_tag==fdline) begin
+                f_word <= fw0[32*fdsel +: 32]; f_word_v<=1'b1; if (!f_go) fdpend<=1'b0;
+            end else if (fw1_v && fw1_tag==fdline) begin
+                fw0<=fw1; fw0_tag<=fw1_tag; fw0_v<=1'b1; fw1_v<=1'b0;
+                f_word <= fw1[32*fdsel +: 32]; f_word_v<=1'b1; if (!f_go) fdpend<=1'b0;
+            end
+        end
+        case (ffst)
+        FF_IDLE: begin
+            if (fdpend && !(fw0_v && fw0_tag==fdline) && !(fw1_v && fw1_tag==fdline)) begin
+                ff_line<=fdline; ff_pf<=1'b0; ff_beat<=3'd0; fw1_v<=1'b0; ffst<=FF_MISS;
+            end else if (fw0_v && !(fw1_v && fw1_tag==fw0_tag+22'd1)) begin
+                ff_line<=fw0_tag+22'd1; ff_pf<=1'b1; ff_beat<=3'd0; ffst<=FF_MISS;
+            end
+        end
+        FF_MISS: if (!ts_dresp.busy) begin
+            ts_rd_r<=1'b1; ts_addr_r<={4'b0011, ff_base_w[24:0]}; ts_burst_r<=8'd8; ffst<=FF_FILL;
+        end
+        FF_FILL: if (ts_dresp.dready) begin
+            ff_acc[32*ff_beat +: 32] <= ff_half;
+            if (ff_beat==3'd7) begin
+                if (ff_pf) begin fw1<={ff_half,ff_acc[223:0]}; fw1_tag<=ff_line; fw1_v<=1'b1; end
+                else        begin fw0<={ff_half,ff_acc[223:0]}; fw0_tag<=ff_line; fw0_v<=1'b1; end
+                ffst<=FF_IDLE;
+            end else ff_beat<=ff_beat+3'd1;
+        end
+        default: ffst<=FF_IDLE;
+        endcase
+        if (reset) begin fw0_v<=0; fw1_v<=0; fdpend<=0; ffst<=FF_IDLE; ts_rd_r<=0; end
     end
 
     reg [31:0] fv_x[0:2], fv_y[0:2], fv_z[0:2];
@@ -419,6 +480,43 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     wire f_offset  = cur_isp[ISP_OFFSET_BIT];
     wire f_gouraud = cur_isp[ISP_GOURAUD_BIT];
     wire f_uv16    = cur_isp[ISP_UV16_BIT];
+
+    // ---- next-field sequencing (combinational, for the pipelined fetch) ----
+    // Given the current field fv_fld / vertex fv_i / vertex base f_vtx, compute
+    // the NEXT field id (nf_fld), its vertex index (nf_i) and base (nf_vtx), its
+    // byte address (nf_addr), and whether the record is complete (nf_last). This
+    // mirrors exactly the original per-field state transitions + addresses.
+    reg [2:0]  nf_fld; reg [1:0] nf_i; reg [26:0] nf_vtx; reg [26:0] nf_addr; reg nf_last;
+    // address of a field `fld` within a vertex whose base is `vb`
+    function automatic [26:0] fld_addr(input [2:0] fld, input [26:0] vb);
+        case (fld)
+        FLD_X: fld_addr = vb;         FLD_Y: fld_addr = vb+27'd4;  FLD_Z: fld_addr = vb+27'd8;
+        FLD_UV16,FLD_U: fld_addr = vb+27'd12;  FLD_V: fld_addr = vb+27'd16;
+        FLD_COL: fld_addr = vb+27'd12+(f_texture?(f_uv16?27'd4:27'd8):27'd0);
+        default: fld_addr = vb+27'd16+(f_texture?(f_uv16?27'd4:27'd8):27'd0); // FLD_OFS
+        endcase
+    endfunction
+    always @* begin
+        nf_i=fv_i; nf_vtx=f_vtx; nf_fld=FLD_X; nf_last=1'b0;
+        case (fv_fld)
+        FLD_X: nf_fld=FLD_Y;
+        FLD_Y: nf_fld=FLD_Z;
+        FLD_Z: nf_fld = f_texture ? (f_uv16?FLD_UV16:FLD_U) : FLD_COL;
+        FLD_UV16: nf_fld=FLD_COL;
+        FLD_U: nf_fld=FLD_V;
+        FLD_V: nf_fld=FLD_COL;
+        FLD_COL: begin
+            if (f_offset) nf_fld=FLD_OFS;
+            else if (fv_i==2'd2) nf_last=1'b1;
+            else begin nf_i=fv_i+2'd1; nf_vtx=f_vtx+sh_stride_b; nf_fld=FLD_X; end
+        end
+        default: begin // FLD_OFS
+            if (fv_i==2'd2) nf_last=1'b1;
+            else begin nf_i=fv_i+2'd1; nf_vtx=f_vtx+sh_stride_b; nf_fld=FLD_X; end
+        end
+        endcase
+        nf_addr = fld_addr(nf_fld, nf_vtx);
+    end
 
     reg         tsp_start;
     wire        tsp_done, tsp_pvalid; wire [3:0] tsp_pidx;
@@ -462,6 +560,7 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     integer cyc_b_miss;    // in the miss fetch/setup path (B_FH_*/B_FV_*/B_RUN)
     integer cyc_b_drain;   // B_DRAIN waiting for the pipe to empty
     integer cyc_b_idle;    // B_IDLE/B_GETSLOT/B_WAITDROP (no granted slot)
+    integer cyc_b_fetch, cyc_b_setup;
 
     // ===================================================================
     // WRITEOUT STAGE (engine C): finds a SL_WRRDY slot, copies col_buf -> fb.
@@ -684,7 +783,7 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
             st_b<=B_IDLE; tsp_start<=0; pp_in_valid<=0; f_go<=0; tsp_fin<=0;
             sh_out_n<=0; miss_count<=0; hit_count<=0;
             cyc_b_total<=0; cyc_b_present<=0; cyc_b_stall<=0; cyc_b_miss<=0;
-            cyc_b_drain<=0; cyc_b_idle<=0;
+            cyc_b_drain<=0; cyc_b_idle<=0;  cyc_b_fetch<=0; cyc_b_setup<=0;
             for (bj=0; bj<PC_N; bj=bj+1) pc_valid[bj] <= 1'b0;
         end else begin
             tsp_start<=0; pp_in_valid<=0; f_go<=0; tsp_fin<=0;
@@ -699,7 +798,11 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
                     if (pp_accept)          cyc_b_present <= cyc_b_present + 1;
                     else if (pp_in_valid)   cyc_b_stall   <= cyc_b_stall + 1;
                 end
-                else                        cyc_b_miss    <= cyc_b_miss + 1; // FH_/FV_/RUN
+                else begin
+                    cyc_b_miss    <= cyc_b_miss + 1; // FH_/FV_/RUN
+                    if (st_b==B_RUN) cyc_b_setup <= cyc_b_setup + 1; // tsp_setup wait
+                    else             cyc_b_fetch <= cyc_b_fetch + 1; // param read
+                end
             end
 
             // shade pipeline consumer -> col_buf[slot_tsp]
@@ -777,6 +880,9 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
                     pp_in_valid <= 1'b1;
                 end
             end
+            // Header read: issue isp, then tsp/tcw back-to-back (issue the next
+            // word the same cycle we capture the current one - the window reader
+            // accepts a new f_go while returning a word, so ~1 cyc/word).
             B_FH_ISP:  begin f_addr<=f_rec; f_go<=1'b1; st_b<=B_FH_ISPW; end
             B_FH_ISPW: if (f_word_v) begin cur_isp=f_word; f_addr<=f_rec+27'd4; f_go<=1'b1; st_b<=B_FH_TSPW; end
             B_FH_TSPW: if (f_word_v) begin cur_tsp=f_word; f_addr<=f_rec+27'd8; f_go<=1'b1; st_b<=B_FH_TCWW; end
@@ -785,44 +891,39 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
                 f_vtx <= f_rec + (sh_two_vol?27'd20:27'd12) + {22'd0,sh_toff}*sh_stride_b;
                 fv_i<=2'd0; fv_fld<=FLD_X;
                 for (bj=0;bj<3;bj=bj+1) begin fv_u[bj]=32'd0; fv_v[bj]=32'd0; fv_col[bj]=32'd0; fv_ofs[bj]=32'd0; end
-                st_b<=B_FV_RD;
+                // issue the first vertex field (X @ f_vtx) right away.
+                f_addr <= f_rec + (sh_two_vol?27'd20:27'd12) + {22'd0,sh_toff}*sh_stride_b;
+                f_go<=1'b1; st_b<=B_FV_W;
             end
-            B_FV_RD: begin
-                case (fv_fld)
-                FLD_X: f_ptr=f_vtx; FLD_Y: f_ptr=f_vtx+27'd4; FLD_Z: f_ptr=f_vtx+27'd8;
-                FLD_UV16,FLD_U: f_ptr=f_vtx+27'd12; FLD_V: f_ptr=f_vtx+27'd16;
-                FLD_COL: f_ptr=f_vtx+27'd12+(f_texture?(f_uv16?27'd4:27'd8):27'd0);
-                default: f_ptr=f_vtx+27'd16+(f_texture?(f_uv16?27'd4:27'd8):27'd0);
-                endcase
-                f_addr<=f_ptr; f_go<=1'b1; st_b<=B_FV_W;
-            end
+            // PIPELINED vertex-field read: each cycle a word arrives (f_word_v) we
+            // store it AND issue the NEXT field's read in the SAME cycle, so fields
+            // stream at ~1 cyc each from the window instead of a RD+W pair. The
+            // combinational nf_* helpers pick the next field id and its address.
             B_FV_W: if (f_word_v) begin
+                // store the field that just arrived
                 case (fv_fld)
-                FLD_X: begin fv_x[fv_i]=f_word; fv_fld<=FLD_Y; st_b<=B_FV_RD; end
-                FLD_Y: begin fv_y[fv_i]=f_word; fv_fld<=FLD_Z; st_b<=B_FV_RD; end
-                FLD_Z: begin fv_z[fv_i]=f_word;
-                    if (f_texture) begin fv_fld<=f_uv16?FLD_UV16:FLD_U; st_b<=B_FV_RD; end
-                    else begin fv_fld<=FLD_COL; st_b<=B_FV_RD; end
-                end
-                FLD_UV16: begin fv_u[fv_i]={f_word[31:16],16'd0}; fv_v[fv_i]={f_word[15:0],16'd0}; fv_fld<=FLD_COL; st_b<=B_FV_RD; end
-                FLD_U: begin fv_u[fv_i]=f_word; fv_fld<=FLD_V; st_b<=B_FV_RD; end
-                FLD_V: begin fv_v[fv_i]=f_word; fv_fld<=FLD_COL; st_b<=B_FV_RD; end
-                FLD_COL: begin fv_col[fv_i]=f_word;
-                    if (f_offset) begin fv_fld<=FLD_OFS; st_b<=B_FV_RD; end
-                    else if (fv_i==2'd2) begin
-                        for (bj=0;bj<10;bj=bj+1) begin cur_ddx[bj]=32'd0;cur_ddy[bj]=32'd0;cur_c[bj]=32'd0;
-                            pc_ddx[sh_slot][bj]=32'd0;pc_ddy[sh_slot][bj]=32'd0;pc_c[sh_slot][bj]=32'd0; end
-                        tsp_start<=1'b1; st_b<=B_RUN;
-                    end else begin fv_i<=fv_i+2'd1; f_vtx<=f_vtx+sh_stride_b; fv_fld<=FLD_X; st_b<=B_FV_RD; end
-                end
-                default: begin fv_ofs[fv_i]=f_word;
-                    if (fv_i==2'd2) begin
-                        for (bj=0;bj<10;bj=bj+1) begin cur_ddx[bj]=32'd0;cur_ddy[bj]=32'd0;cur_c[bj]=32'd0;
-                            pc_ddx[sh_slot][bj]=32'd0;pc_ddy[sh_slot][bj]=32'd0;pc_c[sh_slot][bj]=32'd0; end
-                        tsp_start<=1'b1; st_b<=B_RUN;
-                    end else begin fv_i<=fv_i+2'd1; f_vtx<=f_vtx+sh_stride_b; fv_fld<=FLD_X; st_b<=B_FV_RD; end
-                end
+                FLD_X:    fv_x[fv_i]=f_word;
+                FLD_Y:    fv_y[fv_i]=f_word;
+                FLD_Z:    fv_z[fv_i]=f_word;
+                FLD_UV16: begin fv_u[fv_i]={f_word[31:16],16'd0}; fv_v[fv_i]={f_word[15:0],16'd0}; end
+                FLD_U:    fv_u[fv_i]=f_word;
+                FLD_V:    fv_v[fv_i]=f_word;
+                FLD_COL:  fv_col[fv_i]=f_word;
+                default:  fv_ofs[fv_i]=f_word;   // FLD_OFS
                 endcase
+                if (nf_last) begin
+                    // last field of the last vertex: kick tsp_setup
+                    for (bj=0;bj<10;bj=bj+1) begin cur_ddx[bj]=32'd0;cur_ddy[bj]=32'd0;cur_c[bj]=32'd0;
+                        pc_ddx[sh_slot][bj]=32'd0;pc_ddy[sh_slot][bj]=32'd0;pc_c[sh_slot][bj]=32'd0; end
+                    tsp_start<=1'b1; st_b<=B_RUN;
+                end else begin
+                    // advance to the next field/vertex and issue its read now
+                    fv_i   <= nf_i;
+                    fv_fld <= nf_fld;
+                    f_vtx  <= nf_vtx;
+                    f_addr <= nf_addr;
+                    f_go   <= 1'b1;
+                end
             end
             B_RUN: if (tsp_done) begin
                 pc_valid[sh_slot]=1'b1; pc_tag[sh_slot]=sh_tag;
@@ -866,7 +967,7 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
                     $display("=== done ===");
                     $display("=== TSP engine: total=%0d present=%0d stall=%0d miss=%0d drain=%0d idle=%0d (hits=%0d misses=%0d) ===",
                              cyc_b_total, cyc_b_present, cyc_b_stall, cyc_b_miss,
-                             cyc_b_drain, cyc_b_idle, hit_count, miss_count);
+                             cyc_b_drain, cyc_b_idle, hit_count, miss_count); $display("===   miss split: fetch=%0d setup=%0d ===", cyc_b_fetch, cyc_b_setup);
                     done<=1'b1; st_c<=C_IDLE;
                 end
             end
