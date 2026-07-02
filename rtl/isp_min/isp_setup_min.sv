@@ -152,10 +152,11 @@ module isp_setup_min (
     wire body = (phase == 2'd0);     // run the scheduled body this clock?
 
     // early-cull: cull depends only on tri_area's sign + CullMode (isp_word).
-    // Evaluated at c6 (tri_area stable from c5) to short-circuit setup.
+    // Evaluated at c5 on la_q (the combinational P0-P1 subtract = tri_area this
+    // cycle) to short-circuit setup as early as the area sign is known.
     wire [1:0] ec_cm    = isp_word[28:27];
-    wire       ec_wrong = (ec_cm[0]==1'b0 && fneg(tri_area)) ||
-                          (ec_cm[0]==1'b1 && fpos(tri_area));
+    wire       ec_wrong = (ec_cm[0]==1'b0 && fneg(la_q)) ||
+                          (ec_cm[0]==1'b1 && fpos(la_q));
     wire       early_cull = (ec_cm >= 2'd2) && ec_wrong;
 
     always @(posedge clk) begin
@@ -208,31 +209,33 @@ module isp_setup_min (
                     L2(d_X3X1,d_Z2Z1,ZERO,0);   // Ba0=(X3-X1)*(z2-z1)
                     L3(X2,ONE,XB,1);            // XL2
                 end
-                // c5: store tri_area (req recip), Aa0/Ba0/XL2; issue Aa,Ba,YT2
+                // c5: tri_area = P0-P1 is valid COMBINATIONALLY as la_q this cycle
+                //     (that is why we can feed rc_in<=la_q here). EARLY CULL: the
+                //     cull decision needs only tri_area's sign + CullMode, so test
+                //     la_q directly and, if culled, jump straight to done - skipping
+                //     the reciprocal + all of c6..c13 (~32 clocks). Otherwise store
+                //     tri_area, request the reciprocal, and continue.
                 5: begin
-                    tri_area<=la_q; Aa0<=lb_q; Ba0<=lc_q; XL2<=ld_q;
-                    rc_in<=la_q; rc_req<=1;     // recip(tri_area); c7 waits on rc_ack
-                    // Aa=Aa0-(z2-z1)*(Y3-Y1) = (-(z2-z1))*(Y3-Y1)+Aa0
-                    L1(fneg32(d_Z2Z1),d_Y3Y1,lb_q,0);
-                    L2(fneg32(d_X2X1),d_Z3Z1,lc_q,0); // Ba=Ba0-(X2-X1)*(z3-z1)
-                    L3(Y2,ONE,YB,1);            // YT2
-                end
-                // c6: store Aa/Ba/YT2; sgn; issue XL3/YT3.
-                // EARLY CULL: the cull decision needs only tri_area's sign (stable
-                // from c5) + CullMode. If this triangle is culled, skip the entire
-                // remaining edge/plane/reciprocal computation (c7..c13, ~28 clocks)
-                // and jump straight to done with cull=1.
-                6: begin
+                    tri_area<=la_q;
                     if (early_cull) begin
                         cull <= 1'b1;
                         st   <= FIN;
                     end else begin
-                        Aa<=lb_q; Ba<=lc_q; YT2<=ld_q;
-                        sgn_neg <= fpos(tri_area);
-                        sgn     <= fpos(tri_area) ? NEG1 : ONE;
-                        L0(X3,ONE,XB,1);            // XL3
-                        L1(Y3,ONE,YB,1);            // YT3
+                        Aa0<=lb_q; Ba0<=lc_q; XL2<=ld_q;
+                        rc_in<=la_q; rc_req<=1;     // recip(tri_area); c7 waits on rc_ack
+                        // Aa=Aa0-(z2-z1)*(Y3-Y1) = (-(z2-z1))*(Y3-Y1)+Aa0
+                        L1(fneg32(d_Z2Z1),d_Y3Y1,lb_q,0);
+                        L2(fneg32(d_X2X1),d_Z3Z1,lc_q,0); // Ba=Ba0-(X2-X1)*(z3-z1)
+                        L3(Y2,ONE,YB,1);            // YT2
                     end
+                end
+                // c6: store Aa/Ba/YT2; sgn; issue XL3/YT3.
+                6: begin
+                    Aa<=lb_q; Ba<=lc_q; YT2<=ld_q;
+                    sgn_neg <= fpos(tri_area);
+                    sgn     <= fpos(tri_area) ? NEG1 : ONE;
+                    L0(X3,ONE,XB,1);            // XL3
+                    L1(Y3,ONE,YB,1);            // YT3
                 end
                 // c7: WAIT for reciprocal (rc_ack). When ready: store inv, issue
                 //     ddx=-Aa*inv, ddy=-Ba*inv, and the first edge diffs.
