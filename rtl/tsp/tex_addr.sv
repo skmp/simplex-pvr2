@@ -1,7 +1,10 @@
 //
-// tex_addr - texture texel address generation (no mipmap; MipLevel 0).
-// Computes the byte address in DDR3 for texel (u,v), per refsw
-// TexAddressGen + TexOffsetGen + TexStride + fBitsPerPixel.
+// tex_addr - texture texel address generation. Supports mip level selection
+// (miplevel input; 0 = base level, matching the old behaviour). Computes the
+// byte address in DDR3 for texel (u,v), per refsw TexAddressGen + TexOffsetGen +
+// TexStride + fBitsPerPixel, with MipLevel folded in:
+//   mip_offset = MipPoint[3 + TexU - MipLevel]   (refsw TexOffsetGen)
+//   size       = (8 << TexU) >> MipLevel          (twiddle + stride)
 //
 //   base = TexAddr<<3  (+ 256*4*2 when VQ)
 //   twiddled (VQ or !ScanOrder): offset = twop(u,v,TexU,TexV) = bit-interleave
@@ -23,6 +26,7 @@ module tex_addr (
     input  [2:0]  pixfmt,       // TCW.PixelFmt
     input  [2:0]  texu,         // TSP.TexU
     input  [2:0]  texv,         // TSP.TexV
+    input  [3:0]  miplevel,     // selected mip level (0 = base; 0..TexU+3)
     input  [4:0]  text_ctrl,    // TEXT_CONTROL&31 (stride unit)
     input  [10:0] u,            // texel u (0..1023)
     input  [10:0] v,            // texel v
@@ -41,22 +45,32 @@ module tex_addr (
     // VQ: 8*2 / (64/rv) = 16*rv/64 = rv/4
     assign fbpp = vq ? (rv >> 2) : (rv << 1);   // refsw: rv*2 non-VQ
 
+    // mip-adjusted texture size: (8<<TexU) >> MipLevel (refsw TexStride/sizeU).
+    wire [12:0] size_mip = (13'd8 << texu) >> miplevel;
+
     // stride
     wire [12:0] stride = (strd_e && scan_e) ? ({8'd0, text_ctrl} << 5)   // *32
-                                            : (13'd8 << texu);
+                                            : size_mip;
 
     // ---- twiddle (bit interleave) ----
     // twop: for i-th step take y bit then x bit while that dim's size>1.
     // size_x = 8<<texu, size_y = 8<<texv. We interleave up to 11 bits each.
+    // Twiddle sizes. refsw's mipmapped path twiddles with (TexU-MipLevel) for BOTH
+    // dims (square mip levels): twop(u,v,TexU-Mip,TexU-Mip). The non-mip path keeps
+    // the rectangular (TexU,TexV) sizes. mip_sx/mip_sy pick per mipmapped.
     reg  [21:0] tw;
     integer bx, by, sh;
     reg [10:0] xr, yr;
     integer sx, sy;
+    integer sx0, sy0;
     always @(*) begin
         tw = 0; sh = 0;
         xr = u; yr = v;
-        sx = (8 << texu) >> 1;    // x_sz>>=1
-        sy = (8 << texv) >> 1;    // y_sz>>=1
+        // mipmapped: square (8<<TexU)>>Mip on both dims; else (8<<TexU),(8<<TexV)
+        sx0 = mipmapped ? ((8 << texu) >> miplevel) : (8 << texu);
+        sy0 = mipmapped ? ((8 << texu) >> miplevel) : (8 << texv);
+        sx = sx0 >> 1;    // x_sz>>=1
+        sy = sy0 >> 1;    // y_sz>>=1
         // up to 11 interleave iterations (max 1024)
         for (integer it = 0; it < 11; it = it + 1) begin
             if (sy != 0) begin
@@ -68,21 +82,25 @@ module tex_addr (
         end
     end
 
-    // mipmap base-level offset (refsw TexOffsetGen, MipLevel 0):
-    //   mip_offset = MipPoint[3 + TexU]  (texels to skip the mip pyramid).
-    // MipPoint[3..10] for TexU 0..7 (from refsw_tile.cpp:493). Added to the
-    // texel offset before the *fbpp/16 byte conversion, when TCW.MipMapped.
+    // mip offset (refsw TexOffsetGen): mip_offset = MipPoint[3 + TexU - MipLevel]
+    // (texels to skip the coarser mip levels). MipPoint[0..10] from refsw_tile.cpp:
+    //   [0]=0x3 [1]=0x4 [2]=0x8 [3]=0x18 [4]=0x58 [5]=0x158 [6]=0x558
+    //   [7]=0x1558 [8]=0x5558 [9]=0x15558 [10]=0x55558
+    wire [3:0] mip_idx = 4'(3) + {1'b0,texu} - miplevel;   // 0..10
     reg [19:0] mip_off;
     always @(*) begin
-        case (texu)
-            3'd0: mip_off = 20'h00018;   // MipPoint[3]
-            3'd1: mip_off = 20'h00058;   // MipPoint[4]
-            3'd2: mip_off = 20'h00158;   // MipPoint[5]
-            3'd3: mip_off = 20'h00558;   // MipPoint[6]
-            3'd4: mip_off = 20'h01558;   // MipPoint[7]
-            3'd5: mip_off = 20'h05558;   // MipPoint[8]
-            3'd6: mip_off = 20'h15558;   // MipPoint[9]
-            default: mip_off = 20'h55558;// MipPoint[10] (texu=7)
+        case (mip_idx)
+            4'd0:  mip_off = 20'h00003;   // MipPoint[0]
+            4'd1:  mip_off = 20'h00004;   // MipPoint[1]
+            4'd2:  mip_off = 20'h00008;   // MipPoint[2]
+            4'd3:  mip_off = 20'h00018;   // MipPoint[3]
+            4'd4:  mip_off = 20'h00058;   // MipPoint[4]
+            4'd5:  mip_off = 20'h00158;   // MipPoint[5]
+            4'd6:  mip_off = 20'h00558;   // MipPoint[6]
+            4'd7:  mip_off = 20'h01558;   // MipPoint[7]
+            4'd8:  mip_off = 20'h05558;   // MipPoint[8]
+            4'd9:  mip_off = 20'h15558;   // MipPoint[9]
+            default: mip_off = 20'h55558; // MipPoint[10]
         endcase
     end
     wire [23:0] mip_add = mipmapped ? {4'd0, mip_off} : 24'd0;

@@ -42,7 +42,7 @@ module tex_fetch import tsp_pkg::*; (
     wire [28:0] ta_byte; wire [5:0] ta_fbpp; wire [19:0] ta_off;
     tex_addr u_ta (
         .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.mipmapped(mipmapped),.pixfmt(pixfmt),
-        .texu(texu),.texv(texv),.text_ctrl(text_ctrl),.u(u),.v(v),
+        .texu(texu),.texv(texv),.miplevel(4'd0),.text_ctrl(text_ctrl),.u(u),.v(v),
         .byte_addr(ta_byte),.fbpp(ta_fbpp),.offset(ta_off));
 
     // palette ROM placeholder (ARGB8888)

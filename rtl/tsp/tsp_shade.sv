@@ -78,6 +78,7 @@ module tsp_shade import tsp_pkg::*; (
     wire [10:0] c00u,c00v,c01u,c01v,c10u,c10v,c11u,c11v; wire [7:0] ufrac,vfrac;
     tex_uv2texel u_uv (
         .u(attr[0]), .v(attr[1]), .texu(texu), .texv(texv),
+        .miplevel(4'd0),
         .clampu(clampu),.clampv(clampv),.flipu(flipu),.flipv(flipv),
         .c00u(c00u),.c00v(c00v),.c01u(c01u),.c01v(c01v),
         .c10u(c10u),.c10v(c10v),.c11u(c11u),.c11v(c11v),.ufrac(ufrac),.vfrac(vfrac));

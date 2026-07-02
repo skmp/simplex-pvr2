@@ -16,6 +16,7 @@ module tex_uv2texel (
     input      [31:0] v,          // float
     input      [2:0]  texu,
     input      [2:0]  texv,
+    input      [3:0]  miplevel,   // mip level (0 = base); size = (8<<TexU)>>mip
     input             clampu, clampv, flipu, flipv,
 
     output [10:0] c00u, output [10:0] c00v,   // (u+1,v+1)
@@ -53,8 +54,13 @@ module tex_uv2texel (
         end
     endfunction
 
-    wire signed [26:0] ui = to_fixed(u, {2'b0,texu} + 5'd11);
-    wire signed [26:0] vi = to_fixed(v, {2'b0,texv} + 5'd11);
+    // mip-adjusted shift: sizeU*256 = 2^(11 + TexU - MipLevel). MipLevel is only
+    // non-zero for mipmapped (square) textures, so subtracting it from both dims
+    // matches refsw's twop(u,v,TexU-Mip,TexU-Mip).
+    wire [4:0] shift_u = ({2'b0,texu} + 5'd11) - {1'b0,miplevel};
+    wire [4:0] shift_v = ({2'b0,texv} + 5'd11) - {1'b0,miplevel};
+    wire signed [26:0] ui = to_fixed(u, shift_u);
+    wire signed [26:0] vi = to_fixed(v, shift_v);
 
     // arithmetic >>8 (floors toward -inf, matching refsw int shift); the low 8
     // bits are the (positive) fraction even for negative ui, as refsw's `ui&255`.
@@ -63,8 +69,8 @@ module tex_uv2texel (
     assign ufrac = ui[7:0];
     assign vfrac = vi[7:0];
 
-    wire [10:0] sizeU = 11'd8 << texu;
-    wire [10:0] sizeV = 11'd8 << texv;
+    wire [10:0] sizeU = (11'd8 << texu) >> miplevel;
+    wire [10:0] sizeV = (11'd8 << texv) >> miplevel;
 
     // ClampFlip(coord, size): clamp / flip(mirror) / wrap
     function [10:0] clampflip(input clamp, input flip, input signed [20:0] coord, input [10:0] size);

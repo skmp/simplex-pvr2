@@ -165,6 +165,29 @@ module tsp_shade_pp import tsp_pkg::*; #(
       end
     endgenerate
 
+    // ==============================================================
+    // MIP LEVEL (exponent-domain LOD). refsw:
+    //   ddx = U.ddx + V.ddx ; ddy = U.ddy + V.ddy
+    //   dMip = min(|ddx|,|ddy|) * W * sizeU * MipMapD/4 ; sizeU = 8<<TexU
+    //   MipLevel = #halvings until dMip<=1.5, clamped 0..11
+    // We approximate in the exponent domain (cheap, ~+/-1 level near boundaries):
+    //   log2(dMip) ~= (e_min-127) + (e_W-127) + (3+TexU) + (log2(MipMapD)-2)
+    //   e_x = biased exponent (f[30:23]); sum of two floats approximated by the
+    //   larger exponent. MipLevel = clamp(round(log2(dMip)), 0, TexU+3).
+    // Computed off the RCP-aligned planes (plane 0 = U, plane 1 = V) and rc_W.
+    // ==============================================================
+    wire [3:0] mip_lvl;
+    tsp_miplevel u_mip (
+        .ddxU(d_ddx[RCPLAT-1][0]), .ddxV(d_ddx[RCPLAT-1][1]),
+        .ddyU(d_ddy[RCPLAT-1][0]), .ddyV(d_ddy[RCPLAT-1][1]),
+        .w(rc_W),
+        .texu(d_tsp[RCPLAT-1][5:3]), .mipmapd(d_tsp[RCPLAT-1][11:8]),
+        .mipmapped(d_tcw[RCPLAT-1][31]),
+        .miplevel(mip_lvl));
+
+    // carry the computed mip level through the interp substages to the UV/TEX stage
+    reg [3:0] mip1, mip2, mip3, mip4;
+
     always @(posedge clk) begin
         if (reset) begin v1<=0;v2<=0;v3<=0;v4<=0; end
         else if (en) begin
@@ -172,24 +195,24 @@ module tsp_shade_pp import tsp_pkg::*; #(
             for (k=0;k<10;k=k+1) begin
                 i1_prx[k]<=mprx[k]; i1_pry[k]<=mpry[k]; i1_c[k]<=d_c[RCPLAT-1][k];
             end
-            i1_W<=rc_W; v1<=rc_ov;
+            i1_W<=rc_W; v1<=rc_ov; mip1<=mip_lvl;
             px1<=rc_px; py1<=rc_py; tsp1<=d_tsp[RCPLAT-1]; tcw1<=d_tcw[RCPLAT-1];
             tcc1<=d_tc[RCPLAT-1]; ptx1<=d_ptx[RCPLAT-1]; pof1<=d_pof[RCPLAT-1];
             id1<=d_id[RCPLAT-1];
 
             // i2: prx+pry; carry c, W
             for (k=0;k<10;k=k+1) begin i2_sum[k]<=asum[k]; i2_c[k]<=i1_c[k]; end
-            i2_W<=i1_W; v2<=v1;
+            i2_W<=i1_W; v2<=v1; mip2<=mip1;
             px2<=px1;py2<=py1;tsp2<=tsp1;tcw2<=tcw1;tcc2<=tcc1;ptx2<=ptx1;pof2<=pof1;id2<=id1;
 
             // i3: sum + c; carry W
             for (k=0;k<10;k=k+1) i3_sum[k]<=asc[k];
-            i3_W<=i2_W; v3<=v2;
+            i3_W<=i2_W; v3<=v2; mip3<=mip2;
             px3<=px2;py3<=py2;tsp3<=tsp2;tcw3<=tcw2;tcc3<=tcc2;ptx3<=ptx2;pof3<=pof2;id3<=id2;
 
             // i4: sum3 * W -> attr
             for (k=0;k<10;k=k+1) i4_attr[k]<=mattr[k];
-            v4<=v3;
+            v4<=v3; mip4<=mip3;
             px4<=px3;py4<=py3;tsp4<=tsp3;tcw4<=tcw3;tcc4<=tcc3;ptx4<=ptx3;pof4<=pof3;id4<=id3;
         end
     end
@@ -202,6 +225,7 @@ module tsp_shade_pp import tsp_pkg::*; #(
     wire [10:0] c00u,c00v,c01u,c01v,c10u,c10v,c11u,c11v; wire [7:0] ufr,vfr;
     tex_uv2texel u_uv (
         .u(i4_attr[0]), .v(i4_attr[1]), .texu(u_texu), .texv(u_texv),
+        .miplevel(mip4),
         .clampu(u_clampu),.clampv(u_clampv),.flipu(u_flipu),.flipv(u_flipv),
         .c00u(c00u),.c00v(c00v),.c01u(c01u),.c01v(c01v),
         .c10u(c10u),.c10v(c10v),.c11u(c11u),.c11v(c11v),.ufrac(ufr),.vfrac(vfr));
@@ -218,7 +242,7 @@ module tsp_shade_pp import tsp_pkg::*; #(
     reg        vU;
     reg [10:0] U00u,U00v,U01u,U01v,U10u,U10v,U11u,U11v; reg [7:0] Uuf,Uvf;
     reg [31:0] U_base, U_ofs, U_tsp, U_tcw; reg [4:0] U_tc;
-    reg        U_ptx, U_pof; reg [IDW-1:0] U_id;
+    reg        U_ptx, U_pof; reg [IDW-1:0] U_id; reg [3:0] U_mip;
     always @(posedge clk) begin
         if (reset) vU<=0;
         else if (en) begin
@@ -228,8 +252,10 @@ module tsp_shade_pp import tsp_pkg::*; #(
             U_base<={u8a[5],u8a[4],u8a[3],u8a[2]};
             U_ofs <={u8a[9],u8a[8],u8a[7],u8a[6]};
             U_tsp<=tsp4; U_tcw<=tcw4; U_tc<=tcc4; U_ptx<=ptx4; U_pof<=pof4; U_id<=id4;
+            U_mip<=mip4;
         end
     end
+
 
     // ==============================================================
     // STAGE TEX: 4 parallel tex_fetch_pp. They accept a request when the
@@ -256,7 +282,7 @@ module tsp_shade_pp import tsp_pkg::*; #(
         tex_fetch_pp u_tf (
             .clk(clk),.reset(reset),
             .in_valid(tex_start),
-            .u(cu[gi]),.v(cv[gi]),
+            .u(cu[gi]),.v(cv[gi]),.miplevel(U_mip),
             .tsp(U_tsp),.tcw(U_tcw),.text_ctrl(U_tc),
             .out_valid(tf_ov[gi]),.argb(tf_argb[gi]),.busy(tf_busy[gi]),
             .tc_req(tc_req[gi]),.tc_resp(tc_resp[gi]),

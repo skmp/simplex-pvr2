@@ -25,6 +25,7 @@ module tex_fetch_pp import tsp_pkg::*; (
     input             in_valid,
     input      [10:0] u,
     input      [10:0] v,
+    input      [3:0]  miplevel,     // selected mip level (0 = base)
     input      [31:0] tsp,
     input      [31:0] tcw,
     input      [4:0]  text_ctrl,
@@ -40,6 +41,7 @@ module tex_fetch_pp import tsp_pkg::*; (
 );
     // latch the request fields at accept time so the address gen is stable
     reg [10:0] u_r, v_r;
+    reg [3:0]  mip_r;
     reg [31:0] tsp_r, tcw_r_f;
     reg [4:0]  tc_r;
 
@@ -55,7 +57,7 @@ module tex_fetch_pp import tsp_pkg::*; (
     wire [28:0] ta_byte; wire [5:0] ta_fbpp; wire [19:0] ta_off;
     tex_addr u_ta (
         .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.mipmapped(mipmapped),.pixfmt(pixfmt),
-        .texu(texu),.texv(texv),.text_ctrl(tc_r),.u(u_r),.v(v_r),
+        .texu(texu),.texv(texv),.miplevel(mip_r),.text_ctrl(tc_r),.u(u_r),.v(v_r),
         .byte_addr(ta_byte),.fbpp(ta_fbpp),.offset(ta_off));
 
     // palette ROM placeholder (ARGB8888) - matches tex_fetch
@@ -97,7 +99,7 @@ module tex_fetch_pp import tsp_pkg::*; (
             case (st)
             S_IDLE: if (in_valid) begin
                 // latch request; address gen (ta_byte) settles next clock
-                u_r<=u; v_r<=v; tsp_r<=tsp; tcw_r_f<=tcw; tc_r<=text_ctrl;
+                u_r<=u; v_r<=v; mip_r<=miplevel; tsp_r<=tsp; tcw_r_f<=tcw; tc_r<=text_ctrl;
                 st<=S_RD;
             end
             S_RD: begin
