@@ -24,6 +24,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_rcp_fast.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_mul_i5.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/mac16.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_setup_min.sv
+# 4-way interleaved streaming setup (isp_core): ~14 cyc/tri throughput, same 4 mac
+# lanes. isp_setup_min stays for peel_core + the setupstream unit test reference.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_setup_streamed.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_raster_line.sv
 # Banked M10K tile buffer (depth/tag + colour).
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/tile_ram.sv
@@ -49,6 +52,9 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/reg_file.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/region_array_parser.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/object_list_parser.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/isp_primitive_iterator.sv
+# prefetching (ping-pong) primitive iterator used by isp_core; the original stays
+# for peel_core + the isprim unit test.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/isp_primitive_iterator_pf.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/f2u8.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_fetch_pp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_cache_4p.sv

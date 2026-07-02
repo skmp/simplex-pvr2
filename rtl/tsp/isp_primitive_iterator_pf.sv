@@ -146,11 +146,16 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
     function automatic [3:0] va(input [2:0] i); va = {1'b0,i} + (i[0] ? 4'd1 : 4'd0); endfunction
     function automatic [3:0] vb(input [2:0] i); vb = {1'b0,i} + (i[0] ? 4'd0 : 4'd1); endfunction
 
-    function automatic core_tag_t mk_tag(input b, input [2:0] toff);
+    // NOTE: pass the per-slot fields IN (read the arrays at the call site) rather
+    // than indexing them inside the function - Quartus 17.0's Verific frontend
+    // crashes ("read to RAM wasn't mapped") on an array read via a function-arg
+    // index inside an assignment-pattern.
+    function automatic core_tag_t mk_tag(input isp_cbp, input shdw,
+                                         input [2:0] skp, input [20:0] po,
+                                         input [2:0] toff);
         mk_tag = '{ invalid:1'b0, pad:2'b00,
-                    cache_bypass:b_isp[b][ISP_CACHEBYPASS_BIT],
-                    shadow:b_shadow[b], skip:b_skip[b],
-                    param_offs_in_words:b_po[b], tag_offset:toff };
+                    cache_bypass:isp_cbp, shadow:shdw, skip:skp,
+                    param_offs_in_words:po, tag_offset:toff };
     endfunction
 
     localparam E_IDLE=2'd0, E_SEEK=2'd1, E_PRESENT=2'd2, E_REL=2'd3;
@@ -272,7 +277,8 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
                     v0_r <= vslot[em_buf][va(s_i)];
                     v1_r <= vslot[em_buf][vb(s_i)];
                     v2_r <= vslot[em_buf][{1'b0,s_i}+4'd2];
-                    tag_r <= mk_tag(em_buf, s_i);
+                    tag_r <= mk_tag(b_isp[em_buf][ISP_CACHEBYPASS_BIT], b_shadow[em_buf],
+                                    b_skip[em_buf], b_po[em_buf], s_i);
                     tri_ready_r <= 1'b1;
                     est <= E_PRESENT;
                 end
@@ -281,7 +287,8 @@ module isp_primitive_iterator_pf import tsp_pkg::*; (
                 if (b_array[em_buf] && !tri_ready_r) begin
                     if (b_nfill[em_buf] >= 4'd3) begin
                         v0_r<=vslot[em_buf][0]; v1_r<=vslot[em_buf][1]; v2_r<=vslot[em_buf][2];
-                        tag_r<=mk_tag(em_buf, 3'd0);
+                        tag_r<=mk_tag(b_isp[em_buf][ISP_CACHEBYPASS_BIT], b_shadow[em_buf],
+                                      b_skip[em_buf], b_po[em_buf], 3'd0);
                         tri_ready_r <= 1'b1;
                     end
                 end else begin
