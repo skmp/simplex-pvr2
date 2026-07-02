@@ -101,9 +101,11 @@ module isp_primitive_iterator import tsp_pkg::*; (
     reg  [5:0]  ni;                 // needed-item index 0..(1+3*nverts-1)
     wire [5:0]  n_last = 6'd1 + 6'd3 * {2'b0, nverts} - 6'd1;
     wire        ni_isp = (ni == 6'd0);
-    wire [5:0]  ni_v   = ni - 6'd1;
-    wire [3:0]  ni_vx  = ni_v / 6'd3;
-    wire [1:0]  ni_cmp = ni_v % 6'd3;
+    // ni_vx = (ni-1)/3, ni_cmp = (ni-1)%3 : instead of a hardware divider, these
+    // are tracked incrementally (ni advances by 1, so cmp cycles 0->1->2->0 and vx
+    // increments on the wrap). See the R_STREAM `ni <= ni + 1` step.
+    reg  [3:0]  ni_vx;              // vertex index for the current ni
+    reg  [1:0]  ni_cmp;             // component (0=x,1=y,2=z) for the current ni
     wire [8:0]  need_off = ni_isp ? 9'd0
                          : {4'b0, hdr_words} + ({5'b0, ni_vx} * {4'b0, stride_w})
                                              + {7'b0, ni_cmp};
@@ -161,6 +163,8 @@ module isp_primitive_iterator import tsp_pkg::*; (
                 dreq_burst_r <= span_vw[7:0];                  // one beat per view-word
                 beat         <= 9'd0;
                 ni           <= 6'd0;
+                ni_vx        <= 4'd0;   // ni=1 -> (vertex 0, comp 0)
+                ni_cmp       <= 2'd0;
                 rst          <= R_STREAM;
             end
             R_STREAM: if (dresp.dready) begin
@@ -176,6 +180,17 @@ module isp_primitive_iterator import tsp_pkg::*; (
                         if (ni_cmp == 2'd2) nfilled <= nfilled + 4'd1;
                     end
                     ni <= ni + 6'd1;
+                    // advance the (vertex, component) trackers in lockstep with ni
+                    // (replaces (ni-1)/3 and (ni-1)%3 -> no hardware divider).
+                    // Leaving isp (ni==0): next is (v0,c0), already 0 from R_REQ.
+                    if (!ni_isp) begin
+                        if (ni_cmp == 2'd2) begin
+                            ni_cmp <= 2'd0;
+                            ni_vx  <= ni_vx + 4'd1;
+                        end else begin
+                            ni_cmp <= ni_cmp + 2'd1;
+                        end
+                    end
                 end
                 if (beat == span_vw - 9'd1) begin
                     rst <= R_IDLE; rd_done <= 1'b1;   // burst complete
