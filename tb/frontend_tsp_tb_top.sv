@@ -147,18 +147,20 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     endfunction
 
     // -------------------- ISP triangle setup (as tile_engine_top) --------------------
+    // isp_word_su/su_tag feed the SETUP stage (triangle N+1); isp_word/tri_tag are
+    // the ACTIVE raster triangle (N) used by the depth compare / tag write.
     reg         isp_start;
-    reg  [31:0] isp_word;
+    reg  [31:0] isp_word, isp_word_su;
     reg  [31:0] t_x1,t_y1,t_z1, t_x2,t_y2,t_z2, t_x3,t_y3,t_z3;
     reg  [31:0] t_xbase, t_ybase;
-    reg  [31:0] tri_tag;                 // this triangle's CoreTag (raw 32-bit)
+    reg  [31:0] tri_tag, su_tag;          // active / setup triangle CoreTag
     wire        isp_done, isp_sgn_neg, isp_cull;
     wire [31:0] w_dx12,w_dx23,w_dx31,w_dx41, w_dy12,w_dy23,w_dy31,w_dy41;
     wire [31:0] w_c1,w_c2,w_c3,w_c4, w_ddx,w_ddy,w_cinvw;
 
     isp_setup_min u_isp (
         .clk(clk), .reset(reset), .start(isp_start), .done(isp_done),
-        .isp_word(isp_word),
+        .isp_word(isp_word_su),
         .x1(t_x1), .y1(t_y1), .z1(t_z1),
         .x2(t_x2), .y2(t_y2), .z2(t_z2),
         .x3(t_x3), .y3(t_y3), .z3(t_z3),
@@ -177,12 +179,16 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     reg [31:0] isp_ddx_invw, isp_ddy_invw, isp_c_invw;
 
     // -------------------- ISP rasterize (as tile_engine_top) --------------------
-    localparam integer RAS_LANES = 8;
+`ifdef VERILATOR
+    localparam integer RAS_LANES = 32;   // sim: full line/clock (HW depth width)
+`else
+    localparam integer RAS_LANES = 8;    // synth: DSP-limited
+`endif
     reg  [4:0]  ras_y, ras_x;
-    // combinational: issue a chunk on every S_RAS cycle, in phase with ras_x/y
+    // combinational: issue a chunk every raster-sweep cycle, in phase with ras_x/y
     // (a registered pulse lags one cycle -> pairs with the advanced ras_x and
     //  drops the first chunk of every tile).
-    wire        ras_in_valid = (st == S_RAS);
+    wire        ras_in_valid = (rs_st == RS_RAS);
     wire        ras_out_valid;
     wire [RAS_LANES-1:0]    ras_inside;
     wire [32*RAS_LANES-1:0] ras_invw_flat;
@@ -337,15 +343,29 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
     // -------------------- orchestration FSM --------------------
     localparam S_IDLE=0, S_RA=1, S_STATE=2,
                S_OL_WAIT=4, S_ENTRY=5,
-               S_IT_WAIT=7, S_OL_ACK=8,
+               S_PRIM=7, S_OL_ACK=8,
                S_RA_ACK=9, S_DONE=10,
-               S_SETUP=11, S_RAS=12, S_RASDRAIN=13,
                // shade pass (FLUSH): producer walks pixels, feeds tsp_shade_pp
                SH_PIX=16, SH_LOOK=17,
                FH_ISP=18, FH_ISPW=19, FH_TSPW=20, FH_TCWW=21,
                FV_RD=22, FV_W=23,
                TSP_RUN=24, SH_PRESENT=25, SH_DRAIN=26, SH_OUT=27;
     reg [4:0] st;
+
+    // 3-stage ISP pipeline (fetch(N+2) || setup(N+1) || raster(N)), run while
+    // st==S_PRIM. (ifh_* = ISP fetch handoff, distinct from the shade-pass FH_*
+    // states above.)
+    localparam FE_IDLE=0;                 reg fe_st;
+    localparam SU_IDLE=0, SU_RUN=1;       reg su_st;
+    localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2; reg [1:0] rs_st;
+    reg        ifh_valid;
+    reg [31:0] ifh_x1,ifh_y1,ifh_z1, ifh_x2,ifh_y2,ifh_z2, ifh_x3,ifh_y3,ifh_z3;
+    reg [31:0] ifh_isp, ifh_tag;
+    reg        pend_valid, prim_seen;
+    reg [31:0] pend_dx12,pend_dx23,pend_dx31,pend_dx41;
+    reg [31:0] pend_dy12,pend_dy23,pend_dy31,pend_dy41;
+    reg [31:0] pend_c1,pend_c2,pend_c3,pend_c4;
+    reg [31:0] pend_ddx,pend_ddy,pend_cinvw, pend_isp, pend_tag;
 
     // shade pass pixel accounting: producer index shp, consumer count sh_out_n
     integer sh_out_n;
@@ -369,6 +389,8 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             tri_count<=0; cull_count<=0; miss_count<=0; hit_count<=0; tri_seen<=0;
             sh_out_n<=0; ras_inflight<=0;
+            fe_st<=FE_IDLE; su_st<=SU_IDLE; rs_st<=RS_IDLE;
+            ifh_valid<=0; pend_valid<=0; prim_seen<=0;
             for (i = 0; i < PC_N; i = i + 1) pc_valid[i] = 1'b0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
@@ -453,7 +475,8 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                     it_entry <= ol_prim.entry;
                     it_etype <= ol_prim.entry_type;
                     it_start <= 1'b1;
-                    st <= S_IT_WAIT;
+                    prim_seen <= 1'b0;
+                    st <= S_PRIM;
                 end else begin
                     // quad array: skip for now
                     ol_ack.entry_done <= 1'b1;
@@ -461,66 +484,12 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
                 end
             end
 
-            // per triangle: latch verts + tag, run setup, rasterize, then ack.
-            S_IT_WAIT: begin
-                if (it_trio.triangle_ready && !it_ack.triangle_done) begin
-                    isp_word <= it_trio.isp;
-                    t_x1<=it_trio.v0.x; t_y1<=it_trio.v0.y; t_z1<=it_trio.v0.z;
-                    t_x2<=it_trio.v1.x; t_y2<=it_trio.v1.y; t_z2<=it_trio.v1.z;
-                    t_x3<=it_trio.v2.x; t_y3<=it_trio.v2.y; t_z3<=it_trio.v2.z;
-                    tri_tag <= it_trio.tag;
-                    isp_start <= 1'b1;
-                    st <= S_SETUP;
-                    // count PRESENTED triangles (tri_count only counts the
-                    // non-culled ones, which would re-print through cull runs)
-                    tri_seen <= tri_seen + 1;
-                    if (tri_seen % 100 == 0)
-                        $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h",
-                            cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp);
-                end
-                if (it_trio.prim_done) begin
-                    ol_ack.entry_done <= 1'b1;
-                    st <= S_OL_ACK;
-                end
-            end
-
-            S_SETUP: begin
-                if (isp_done) begin
-                    if (isp_cull) begin
-                        cull_count <= cull_count + 1;
-                        it_ack.triangle_done <= 1'b1;   // culled: skip raster
-                        st <= S_IT_WAIT;
-                    end else begin
-                        isp_dx12<=w_dx12; isp_dx23<=w_dx23; isp_dx31<=w_dx31; isp_dx41<=w_dx41;
-                        isp_dy12<=w_dy12; isp_dy23<=w_dy23; isp_dy31<=w_dy31; isp_dy41<=w_dy41;
-                        isp_c1<=w_c1; isp_c2<=w_c2; isp_c3<=w_c3; isp_c4<=w_c4;
-                        isp_ddx_invw<=w_ddx; isp_ddy_invw<=w_ddy; isp_c_invw<=w_cinvw;
-                        tri_count <= tri_count + 1;
-                        ras_y <= 5'd0; ras_x <= 5'd0;
-                        st <= S_RAS;
-                    end
-                end
-            end
-
-            // STREAM: issue one 8-pixel chunk EVERY cycle across the 32x32 tile.
-            // The consumer above drains results in parallel (trailing by LAT).
-            S_RAS: begin
-                // ras_in_valid is combinational (= st==S_RAS), in phase with ras_x/y
-                if (ras_x == 5'(TILE_W - RAS_LANES)) begin
-                    ras_x <= 5'd0;
-                    if (ras_y == 5'(TILE_H - 1)) st <= S_RASDRAIN;
-                    else ras_y <= ras_y + 5'd1;
-                end else begin
-                    ras_x <= ras_x + 5'(RAS_LANES);
-                end
-            end
-
-            // all chunks issued: wait for the pipeline to fully drain, then ack.
-            // Gate on !ras_in_valid too (see frontend_isp_tb_top): the last
-            // issued chunk is still entering the pipe the cycle we enter drain.
-            S_RASDRAIN: if (ras_inflight == 0 && !ras_in_valid && !ras_out_valid) begin
-                it_ack.triangle_done <= 1'b1;
-                st <= S_IT_WAIT;
+            // S_PRIM: 3-stage ISP pipeline (fetch/setup/raster sub-FSMs below).
+            // Entry done when prim_done seen AND all three idle AND handoffs empty.
+            S_PRIM: if (prim_seen && fe_st==FE_IDLE && su_st==SU_IDLE && rs_st==RS_IDLE
+                        && !ifh_valid && !pend_valid) begin
+                ol_ack.entry_done <= 1'b1;
+                st <= S_OL_ACK;
             end
 
             // ---------------- shade pass (FLUSH) ----------------
@@ -701,6 +670,68 @@ module frontend_tsp_tb_top import tsp_pkg::*; (
             end
             default: st<=S_IDLE;
             endcase
+
+            // ======= parallel FETCH / SETUP / RASTER sub-FSMs (S_PRIM) =======
+            // 3-stage ISP pipeline: fetch(N+2) || setup(N+1) || raster(N).
+            if (st == S_PRIM) begin
+                if (it_trio.prim_done) prim_seen <= 1'b1;
+
+                // ---- FETCH: iterator -> ifh_* handoff ----
+                if (fe_st==FE_IDLE && it_trio.triangle_ready && !ifh_valid && !it_ack.triangle_done) begin
+                    ifh_isp <= it_trio.isp; ifh_tag <= it_trio.tag;
+                    ifh_x1<=it_trio.v0.x; ifh_y1<=it_trio.v0.y; ifh_z1<=it_trio.v0.z;
+                    ifh_x2<=it_trio.v1.x; ifh_y2<=it_trio.v1.y; ifh_z2<=it_trio.v1.z;
+                    ifh_x3<=it_trio.v2.x; ifh_y3<=it_trio.v2.y; ifh_z3<=it_trio.v2.z;
+                    it_ack.triangle_done <= 1'b1;      // advance iterator to next tri
+                    ifh_valid <= 1'b1; tri_seen <= tri_seen + 1;
+                    if (tri_seen % 100 == 0)
+                        $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h",
+                            cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp);
+                end
+
+                // ---- SETUP: ifh_* -> isp_setup_min -> pend_* ----
+                case (su_st)
+                SU_IDLE: if (ifh_valid && !pend_valid) begin
+                    isp_word_su <= ifh_isp; su_tag <= ifh_tag;
+                    t_x1<=ifh_x1; t_y1<=ifh_y1; t_z1<=ifh_z1;
+                    t_x2<=ifh_x2; t_y2<=ifh_y2; t_z2<=ifh_z2;
+                    t_x3<=ifh_x3; t_y3<=ifh_y3; t_z3<=ifh_z3;
+                    ifh_valid <= 1'b0;
+                    isp_start <= 1'b1; su_st <= SU_RUN;
+                end
+                SU_RUN: if (isp_done) begin
+                    if (isp_cull) cull_count <= cull_count + 1;
+                    else begin
+                        pend_dx12<=w_dx12;pend_dx23<=w_dx23;pend_dx31<=w_dx31;pend_dx41<=w_dx41;
+                        pend_dy12<=w_dy12;pend_dy23<=w_dy23;pend_dy31<=w_dy31;pend_dy41<=w_dy41;
+                        pend_c1<=w_c1;pend_c2<=w_c2;pend_c3<=w_c3;pend_c4<=w_c4;
+                        pend_ddx<=w_ddx;pend_ddy<=w_ddy;pend_cinvw<=w_cinvw;
+                        pend_isp<=isp_word_su; pend_tag<=su_tag; pend_valid<=1'b1;
+                    end
+                    su_st <= SU_IDLE;
+                end
+                endcase
+
+                // ---- RASTER: pend_* -> active planes -> 32x32 sweep ----
+                case (rs_st)
+                RS_IDLE: if (pend_valid) begin
+                    isp_dx12<=pend_dx12;isp_dx23<=pend_dx23;isp_dx31<=pend_dx31;isp_dx41<=pend_dx41;
+                    isp_dy12<=pend_dy12;isp_dy23<=pend_dy23;isp_dy31<=pend_dy31;isp_dy41<=pend_dy41;
+                    isp_c1<=pend_c1;isp_c2<=pend_c2;isp_c3<=pend_c3;isp_c4<=pend_c4;
+                    isp_ddx_invw<=pend_ddx;isp_ddy_invw<=pend_ddy;isp_c_invw<=pend_cinvw;
+                    isp_word<=pend_isp; tri_tag<=pend_tag;
+                    pend_valid<=1'b0; tri_count<=tri_count+1;
+                    ras_y<=5'd0; ras_x<=5'd0; rs_st<=RS_RAS;
+                end
+                RS_RAS: begin
+                    if (ras_x==5'(TILE_W-RAS_LANES)) begin
+                        ras_x<=5'd0;
+                        if (ras_y==5'(TILE_H-1)) rs_st<=RS_DRAIN; else ras_y<=ras_y+5'd1;
+                    end else ras_x<=ras_x+5'(RAS_LANES);
+                end
+                RS_DRAIN: if (ras_inflight==0 && !ras_in_valid && !ras_out_valid) rs_st<=RS_IDLE;
+                endcase
+            end
 
             // plane stream capture (runs regardless of FSM state)
             if (tsp_pvalid) begin

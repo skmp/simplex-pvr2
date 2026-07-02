@@ -196,26 +196,35 @@ module frontend_isp_tb_top import tsp_pkg::*; (
     endgenerate
 
     // -------------------- orchestration FSM --------------------
-    // Outer walk: region -> list -> entry. Inside an entry, TWO parallel sub-FSMs
-    // run so ISP SETUP of the NEXT triangle overlaps the raster SCAN of the
-    // current one, handed off via a 1-deep "pending planes" register:
-    //   sst (setup) : pull a triangle from the iterator, run isp_setup_min, latch
-    //                 its planes into pend_* + pend_valid, ack the iterator (so it
-    //                 advances to the next triangle) - then immediately prefetch.
-    //   rst (raster): when pend_valid, copy pend_* -> active isp_*, clear
-    //                 pend_valid (freeing setup), stream the 32x32 sweep + drain.
+    // Outer walk: region -> list -> entry. Inside an entry, THREE parallel sub-
+    // FSMs form a pipeline so triangle N+2's vertex FETCH, triangle N+1's SETUP,
+    // and triangle N's raster SCAN all run concurrently, via two 1-deep handoffs:
+    //   fetch : pull a triangle (isp+3 XYZ) from the iterator -> fh_* + fh_valid,
+    //           ack the iterator so it advances (isolates the ~25-read fetch).
+    //   setup : consume fh_* -> isp_setup_min -> pend_* + pend_valid (cull here).
+    //   raster: consume pend_* -> active isp_*, stream the 32x32 sweep + drain.
     localparam S_IDLE=0, S_RA=1, S_STATE=2,
                S_OL_WAIT=4, S_ENTRY=5,
                S_PRIM=7, S_OL_ACK=8,
                S_RA_ACK=9, S_DONE=10;
     reg [3:0] st;
 
+    // fetch sub-FSM (iterator -> fetch handoff). Single state: accept when the
+    // iterator has a triangle and the fetch handoff is free. The iterator drops
+    // triangle_ready for a cycle after each ack, so no re-accept guard is needed.
+    localparam FE_IDLE=0;
+    reg fe_st;
     // setup sub-FSM
     localparam SU_IDLE=0, SU_RUN=1;
     reg su_st;
     // raster sub-FSM
     localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;
     reg [1:0] rs_st;
+
+    // 1-deep FETCH handoff (fetch -> setup): the pulled triangle's geometry.
+    reg        fh_valid;
+    reg [31:0] fh_x1,fh_y1,fh_z1, fh_x2,fh_y2,fh_z2, fh_x3,fh_y3,fh_z3;
+    reg [31:0] fh_isp, fh_tag;
 
     // 1-deep pending-planes handoff (setup -> raster)
     reg        pend_valid;
@@ -230,7 +239,10 @@ module frontend_isp_tb_top import tsp_pkg::*; (
     integer tri_count, cull_count, tri_seen;
     // profiling counters (cycles spent in each activity while walking entries)
     integer cyc_setup_run;   // isp_setup_min actively running (SU_RUN)
-    integer cyc_su_wait;     // setup idle waiting on the iterator (SU_IDLE, no accept)
+    integer cyc_su_wait;     // (unused now; kept for compat)
+    integer cyc_su_wfetch;   // setup idle: no triangle from fetch yet (fetch-bound)
+    integer cyc_su_wrast;    // setup idle: triangle ready but pend full (raster-bound)
+    integer cyc_fe_wait;     // fetch blocked on the iterator producing a triangle
     integer cyc_ras;         // raster sweeping (RS_RAS)
     integer cyc_ras_drain;   // raster draining (RS_DRAIN)
     integer cyc_ras_idle;    // raster idle waiting on pend (RS_IDLE, in S_PRIM)
@@ -252,9 +264,11 @@ module frontend_isp_tb_top import tsp_pkg::*; (
             isp_start<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             tri_count<=0; cull_count<=0; tri_seen<=0; ras_inflight<=0;
-            su_st<=SU_IDLE; rs_st<=RS_IDLE; pend_valid<=0; prim_seen<=0;
+            fe_st<=FE_IDLE; su_st<=SU_IDLE; rs_st<=RS_IDLE;
+            fh_valid<=0; pend_valid<=0; prim_seen<=0;
             cyc_setup_run<=0; cyc_su_wait<=0; cyc_ras<=0; cyc_ras_drain<=0;
             cyc_ras_idle<=0; cyc_prim<=0;
+            cyc_su_wfetch<=0; cyc_su_wrast<=0; cyc_fe_wait<=0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
             isp_start<=0;
@@ -343,10 +357,11 @@ module frontend_isp_tb_top import tsp_pkg::*; (
                 end
             end
 
-            // S_PRIM: the two sub-FSMs below run in parallel (setup(N+1) overlaps
-            // raster(N)). The entry is finished when the iterator reported
-            // prim_done AND both sub-FSMs are idle AND the handoff is empty.
-            S_PRIM: if (prim_seen && su_st==SU_IDLE && rs_st==RS_IDLE && !pend_valid) begin
+            // S_PRIM: the three sub-FSMs below pipeline fetch/setup/raster. The
+            // entry is finished when the iterator reported prim_done AND all three
+            // sub-FSMs are idle AND both handoffs are empty.
+            S_PRIM: if (prim_seen && fe_st==FE_IDLE && su_st==SU_IDLE && rs_st==RS_IDLE
+                        && !fh_valid && !pend_valid) begin
                 ol_ack.entry_done <= 1'b1;
                 st <= S_OL_ACK;
             end
@@ -357,55 +372,66 @@ module frontend_isp_tb_top import tsp_pkg::*; (
             S_DONE: begin
                 $display("=== done: %0d triangles rasterized, %0d culled ===",
                          tri_count, cull_count);
-                $display("=== profile (cyc in S_PRIM=%0d): setup_run=%0d su_wait=%0d ras=%0d ras_drain=%0d ras_idle=%0d ===",
-                         cyc_prim, cyc_setup_run, cyc_su_wait, cyc_ras, cyc_ras_drain, cyc_ras_idle);
+                $display("=== profile (S_PRIM=%0d of %0d total): setup_run=%0d su_wait_fetch=%0d su_wait_rast=%0d fe_wait=%0d ras=%0d ras_drain=%0d ras_idle=%0d ===",
+                         cyc_prim, /*total via $time not avail*/ cyc_prim,
+                         cyc_setup_run, cyc_su_wfetch, cyc_su_wrast, cyc_fe_wait,
+                         cyc_ras, cyc_ras_drain, cyc_ras_idle);
                 if (tri_count > 0)
-                    $display("=== per-triangle: setup_run=%0d su_wait=%0d ras=%0d drain=%0d ===",
-                             cyc_setup_run/tri_count, cyc_su_wait/tri_count,
-                             cyc_ras/tri_count, cyc_ras_drain/tri_count);
+                    $display("=== per-triangle: setup_run=%0d su_wait_fetch=%0d su_wait_rast=%0d fe_wait=%0d ras=%0d drain=%0d ===",
+                             cyc_setup_run/tri_count, cyc_su_wfetch/tri_count, cyc_su_wrast/tri_count,
+                             cyc_fe_wait/tri_count, cyc_ras/tri_count, cyc_ras_drain/tri_count);
                 done<=1'b1; st<=S_IDLE;
             end
             default: st<=S_IDLE;
             endcase
 
-            // ================= parallel SETUP / RASTER sub-FSMs =================
-            // Active only while walking an entry (st==S_PRIM). Setup runs one
-            // triangle ahead of the raster sweep via the pend_* handoff.
+            // ============ parallel FETCH / SETUP / RASTER sub-FSMs ============
+            // Active only while walking an entry (st==S_PRIM). Three-deep pipeline:
+            // fetch(N+2) || setup(N+1) || raster(N), via fh_* and pend_* handoffs.
             if (st == S_PRIM) begin
                 // ---- profiling ----
                 cyc_prim <= cyc_prim + 1;
                 if (su_st==SU_RUN)  cyc_setup_run <= cyc_setup_run + 1;
-                else if (!(it_trio.triangle_ready && !pend_valid && !it_ack.triangle_done))
-                                    cyc_su_wait   <= cyc_su_wait + 1;
+                else begin // SU_IDLE: split the stall cause
+                    if (!fh_valid)          cyc_su_wfetch <= cyc_su_wfetch + 1; // no triangle from fetch yet
+                    else if (pend_valid)    cyc_su_wrast  <= cyc_su_wrast  + 1; // fetch ready but pend full (raster busy)
+                end
+                // fetch stage actively blocked on the iterator producing a triangle
+                if (!fh_valid && !it_trio.triangle_ready) cyc_fe_wait <= cyc_fe_wait + 1;
                 if (rs_st==RS_RAS)       cyc_ras       <= cyc_ras + 1;
                 else if (rs_st==RS_DRAIN) cyc_ras_drain <= cyc_ras_drain + 1;
                 else if (!pend_valid)     cyc_ras_idle  <= cyc_ras_idle + 1;
 
-                // iterator finished producing this entry's triangles (capture in
-                // any setup state - the pulse may land during SU_RUN).
+                // iterator finished producing this entry's triangles (may pulse
+                // any time; capture it).
                 if (it_trio.prim_done) prim_seen <= 1'b1;
-                // ---- setup FSM: pull triangle -> isp_setup_min -> pend_* ----
+
+                // ---- FETCH FSM: iterator -> fh_* handoff ----
+                if (fe_st==FE_IDLE && it_trio.triangle_ready && !fh_valid && !it_ack.triangle_done) begin
+                    fh_isp <= it_trio.isp; fh_tag <= it_trio.tag;
+                    fh_x1<=it_trio.v0.x; fh_y1<=it_trio.v0.y; fh_z1<=it_trio.v0.z;
+                    fh_x2<=it_trio.v1.x; fh_y2<=it_trio.v1.y; fh_z2<=it_trio.v1.z;
+                    fh_x3<=it_trio.v2.x; fh_y3<=it_trio.v2.y; fh_z3<=it_trio.v2.z;
+                    it_ack.triangle_done <= 1'b1;   // advance iterator to next tri
+                    fh_valid <= 1'b1;
+                    tri_seen <= tri_seen + 1;
+                    if (tri_seen % 100 == 0)
+                        $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h",
+                            cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp);
+                end
+
+                // ---- SETUP FSM: fh_* -> isp_setup_min -> pend_* ----
                 case (su_st)
-                SU_IDLE: begin
-                    // accept a new triangle only if the handoff slot is free
-                    if (it_trio.triangle_ready && !pend_valid && !it_ack.triangle_done) begin
-                        isp_word_su <= it_trio.isp;
-                        su_tag      <= it_trio.tag;
-                        t_x1<=it_trio.v0.x; t_y1<=it_trio.v0.y; t_z1<=it_trio.v0.z;
-                        t_x2<=it_trio.v1.x; t_y2<=it_trio.v1.y; t_z2<=it_trio.v1.z;
-                        t_x3<=it_trio.v2.x; t_y3<=it_trio.v2.y; t_z3<=it_trio.v2.z;
-                        isp_start <= 1'b1;
-                        su_st <= SU_RUN;
-                        tri_seen <= tri_seen + 1;
-                        if (tri_seen % 100 == 0)
-                            $display("[TILE %0d,%0d] TRI %0d tag=%08h isp=%08h",
-                                cur_tx, cur_ty, tri_seen, it_trio.tag, it_trio.isp);
-                    end
+                SU_IDLE: if (fh_valid && !pend_valid) begin
+                    isp_word_su <= fh_isp; su_tag <= fh_tag;
+                    t_x1<=fh_x1; t_y1<=fh_y1; t_z1<=fh_z1;
+                    t_x2<=fh_x2; t_y2<=fh_y2; t_z2<=fh_z2;
+                    t_x3<=fh_x3; t_y3<=fh_y3; t_z3<=fh_z3;
+                    fh_valid <= 1'b0;               // free fetch handoff
+                    isp_start <= 1'b1;
+                    su_st <= SU_RUN;
                 end
                 SU_RUN: if (isp_done) begin
-                    // ack the iterator now so it advances to the next triangle
-                    // while we hand these planes to the raster stage.
-                    it_ack.triangle_done <= 1'b1;
                     if (isp_cull) begin
                         cull_count <= cull_count + 1;   // culled: don't fill pend
                     end else begin

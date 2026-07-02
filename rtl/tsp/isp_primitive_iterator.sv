@@ -46,22 +46,77 @@ module isp_primitive_iterator import tsp_pkg::*; (
 );
     wire is_array = (entry_type != ENT_STRIP);
 
-    // ---- 32-bit word reader over the 256-bit line cache ----
+    // ---- LINE-BUFFERED word reader with NEXT-LINE PREFETCH ----
+    // A record's isp + 3-8 vertices' XYZ are 21-25 words spanning a few 256-bit
+    // (8-word) lines, read in INCREASING address order.
+    //  * line buffer (lbuf): a word in the current line is served in 1 cycle.
+    //  * next-line prefetch (pf): whenever the cache is idle and pf doesn't
+    //    already hold lbuf+1, speculatively request lbuf+1 into pf. When the walk
+    //    crosses into that line, PROMOTE pf->lbuf with no cache access.
+    //
+    // A demand read (rd_go) is LATCHED into (dpend,dsel,dline) so it is never
+    // lost if the cache is momentarily busy with a prefetch. The shared
+    // data_cache256 is single-outstanding: cq_busy serializes all requests.
     reg  [26:0] raddr; reg rd_go; reg [31:0] rword; reg rword_v; reg [2:0] rsel;
     reg  [26:0] creq_laddr_r; reg creq_req_r;
     assign creq.req   = creq_req_r;
     assign creq.laddr = creq_laddr_r;
 
+    reg  [255:0] lbuf;  reg [21:0] lbuf_tag; reg lbuf_v;    // current line
+    reg  [255:0] pf;    reg [21:0] pf_tag;   reg pf_v;      // prefetched line+1
+    reg          cq_busy, cq_is_pf; reg [21:0] cq_line;     // outstanding request
+    reg          dpend; reg [21:0] dline; reg [2:0] dsel;   // latched demand read
+
     always @(posedge clk) begin
         rword_v    <= 1'b0;
-        creq_req_r <= 1'b0;                // default: 1-cycle pulse
-        if (rd_go) begin
-            creq_req_r   <= 1'b1;
-            creq_laddr_r <= raddr[26:5];
-            rsel         <= raddr[4:2];
+        creq_req_r <= 1'b0;
+
+        // (1) latch a new demand read
+        if (rd_go) begin dpend <= 1'b1; dline <= raddr[26:5]; dsel <= raddr[4:2]; end
+
+        // (2) a requested line arrives -> fill lbuf or pf
+        if (cresp.ack) begin
+            cq_busy <= 1'b0;
+            if (cq_is_pf) begin pf   <= cresp.rdata; pf_tag   <= cq_line; pf_v   <= 1'b1; end
+            else          begin lbuf <= cresp.rdata; lbuf_tag <= cq_line; lbuf_v <= 1'b1; end
         end
-        if (cresp.ack) begin rword <= cresp.rdata[32*rsel +: 32]; rword_v <= 1'b1; end
-        if (reset) creq_req_r <= 1'b0;
+
+        // (3) service a pending demand from a buffer (combinational sources).
+        //     Use post-(2) buffer contents where a fill just landed this cycle.
+        if (dpend) begin
+            // current-line contents after any fill this cycle
+            reg [255:0] cl; reg [21:0] cl_tag; reg cl_v;
+            reg [255:0] pl; reg [21:0] pl_tag; reg pl_v;
+            cl = (cresp.ack && !cq_is_pf) ? cresp.rdata : lbuf;
+            cl_tag = (cresp.ack && !cq_is_pf) ? cq_line : lbuf_tag;
+            cl_v = (cresp.ack && !cq_is_pf) ? 1'b1 : lbuf_v;
+            pl = (cresp.ack && cq_is_pf) ? cresp.rdata : pf;
+            pl_tag = (cresp.ack && cq_is_pf) ? cq_line : pf_tag;
+            pl_v = (cresp.ack && cq_is_pf) ? 1'b1 : pf_v;
+
+            if (cl_v && cl_tag == dline) begin
+                rword <= cl[32*dsel +: 32]; rword_v <= 1'b1; dpend <= 1'b0;
+            end else if (pl_v && pl_tag == dline) begin
+                // promote prefetched line -> current
+                lbuf <= pl; lbuf_tag <= pl_tag; lbuf_v <= 1'b1; pf_v <= 1'b0;
+                rword <= pl[32*dsel +: 32]; rword_v <= 1'b1; dpend <= 1'b0;
+            end else if (!cq_busy && !(cresp.ack)) begin
+                // real miss (and the port is free): demand-request the line
+                creq_req_r <= 1'b1; creq_laddr_r <= {5'b0, dline};
+                cq_busy <= 1'b1; cq_is_pf <= 1'b0; cq_line <= dline;
+            end
+        end
+        // (4) opportunistic next-line prefetch when the port is idle and there is
+        //     no pending demand that will need the port this cycle.
+        else if (!cq_busy && !cresp.ack && lbuf_v
+                 && !(pf_v && pf_tag == lbuf_tag + 22'd1)) begin
+            creq_req_r <= 1'b1; creq_laddr_r <= {5'b0, (lbuf_tag + 22'd1)};
+            cq_busy <= 1'b1; cq_is_pf <= 1'b1; cq_line <= lbuf_tag + 22'd1;
+        end
+
+        if (reset) begin
+            creq_req_r<=0; lbuf_v<=0; pf_v<=0; cq_busy<=0; dpend<=0;
+        end
     end
 
     // ---- geometry (latched at start) ----

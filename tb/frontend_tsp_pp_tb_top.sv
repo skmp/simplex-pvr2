@@ -272,12 +272,20 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     localparam A_IDLE=0, A_RA=2, A_STATE=3, A_OL_WAIT=4, A_ENTRY=5,
                A_PRIM=6, A_OL_ACK=10,
                A_RA_ACK=11, A_RA_ACK_NEXT=12, A_DONE=13;
+    // 3-stage ISP pipeline: fetch(N+2) || setup(N+1) || raster(N).
+    // fetch sub-FSM (iterator -> fh_* handoff; single accept state)
+    localparam FE_IDLE=0;
+    reg fe_st;
     // setup sub-FSM
     localparam SU_IDLE=0, SU_RUN=1;
     reg su_st;
     // raster sub-FSM
     localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;
     reg [1:0] rs_st;
+    // 1-deep FETCH handoff (fetch -> setup)
+    reg        fh_valid;
+    reg [31:0] fh_x1,fh_y1,fh_z1, fh_x2,fh_y2,fh_z2, fh_x3,fh_y3,fh_z3;
+    reg [31:0] fh_isp, fh_tag;
     // 1-deep pending-planes handoff (setup -> raster)
     reg        pend_valid, prim_seen;
     reg [31:0] pend_dx12,pend_dx23,pend_dx31,pend_dx41;
@@ -396,7 +404,8 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             ras_inflight<=0; tri_count<=0; cull_count<=0; tri_seen<=0;
             isp_finished<=0; isp_fin<=0; isp_no_more<=0;
-            su_st<=SU_IDLE; rs_st<=RS_IDLE; pend_valid<=0; prim_seen<=0;
+            fe_st<=FE_IDLE; su_st<=SU_IDLE; rs_st<=RS_IDLE;
+            fh_valid<=0; pend_valid<=0; prim_seen<=0;
         end else begin
             ra_start<=0; ol_start<=0; it_start<=0; isp_start<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
@@ -469,7 +478,8 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
             end
             // per-triangle work runs in the two parallel sub-FSMs below; the entry
             // completes when the iterator reported prim_done AND both are idle.
-            A_PRIM: if (prim_seen && su_st==SU_IDLE && rs_st==RS_IDLE && !pend_valid) begin
+            A_PRIM: if (prim_seen && fe_st==FE_IDLE && su_st==SU_IDLE && rs_st==RS_IDLE
+                        && !fh_valid && !pend_valid) begin
                 ol_ack.entry_done<=1'b1; st_a<=A_OL_ACK;
             end
             A_OL_ACK: st_a<=A_OL_WAIT;
@@ -482,22 +492,32 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
             default: st_a<=A_IDLE;
             endcase
 
-            // ============ parallel SETUP / RASTER sub-FSMs (A_PRIM) ============
+            // ======= parallel FETCH / SETUP / RASTER sub-FSMs (A_PRIM) =======
             if (st_a == A_PRIM) begin
                 // iterator finished producing this entry's triangles
                 if (it_trio.prim_done) prim_seen <= 1'b1;
 
-                // ---- setup: pull triangle -> isp_setup_min -> pend_* ----
+                // ---- FETCH: iterator -> fh_* handoff ----
+                if (fe_st==FE_IDLE && it_trio.triangle_ready && !fh_valid && !it_ack.triangle_done) begin
+                    fh_isp <= it_trio.isp; fh_tag <= it_trio.tag;
+                    fh_x1<=it_trio.v0.x; fh_y1<=it_trio.v0.y; fh_z1<=it_trio.v0.z;
+                    fh_x2<=it_trio.v1.x; fh_y2<=it_trio.v1.y; fh_z2<=it_trio.v1.z;
+                    fh_x3<=it_trio.v2.x; fh_y3<=it_trio.v2.y; fh_z3<=it_trio.v2.z;
+                    it_ack.triangle_done <= 1'b1;      // advance iterator to next tri
+                    fh_valid <= 1'b1; tri_seen <= tri_seen + 1;
+                end
+
+                // ---- SETUP: fh_* -> isp_setup_min -> pend_* ----
                 case (su_st)
-                SU_IDLE: if (it_trio.triangle_ready && !pend_valid && !it_ack.triangle_done) begin
-                    isp_word_su <= it_trio.isp; su_tag <= it_trio.tag;
-                    t_x1<=it_trio.v0.x; t_y1<=it_trio.v0.y; t_z1<=it_trio.v0.z;
-                    t_x2<=it_trio.v1.x; t_y2<=it_trio.v1.y; t_z2<=it_trio.v1.z;
-                    t_x3<=it_trio.v2.x; t_y3<=it_trio.v2.y; t_z3<=it_trio.v2.z;
-                    isp_start <= 1'b1; su_st <= SU_RUN; tri_seen <= tri_seen + 1;
+                SU_IDLE: if (fh_valid && !pend_valid) begin
+                    isp_word_su <= fh_isp; su_tag <= fh_tag;
+                    t_x1<=fh_x1; t_y1<=fh_y1; t_z1<=fh_z1;
+                    t_x2<=fh_x2; t_y2<=fh_y2; t_z2<=fh_z2;
+                    t_x3<=fh_x3; t_y3<=fh_y3; t_z3<=fh_z3;
+                    fh_valid <= 1'b0;
+                    isp_start <= 1'b1; su_st <= SU_RUN;
                 end
                 SU_RUN: if (isp_done) begin
-                    it_ack.triangle_done <= 1'b1;      // advance iterator to next tri
                     if (isp_cull) cull_count <= cull_count + 1;
                     else begin
                         pend_dx12<=w_dx12;pend_dx23<=w_dx23;pend_dx31<=w_dx31;pend_dx41<=w_dx41;
