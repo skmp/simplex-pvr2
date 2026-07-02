@@ -48,12 +48,13 @@ module tex_fetch_pp import tsp_pkg::*; (
     wire strdsel=tcw_r_f[25], scan=tcw_r_f[26];
     wire [2:0] pixfmt=tcw_r_f[29:27];
     wire vq=tcw_r_f[30];
+    wire mipmapped=tcw_r_f[31];
     wire [5:0] palsel=tcw_r_f[26:21];
 
     // address gen (combinational, off the latched request)
     wire [28:0] ta_byte; wire [5:0] ta_fbpp; wire [19:0] ta_off;
     tex_addr u_ta (
-        .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.pixfmt(pixfmt),
+        .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.mipmapped(mipmapped),.pixfmt(pixfmt),
         .texu(texu),.texv(texv),.text_ctrl(tc_r),.u(u_r),.v(v_r),
         .byte_addr(ta_byte),.fbpp(ta_fbpp),.offset(ta_off));
 

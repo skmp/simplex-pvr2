@@ -69,7 +69,9 @@ static std::vector<GoldEntry> golden_walk(uint32_t base_words){
                 uint32_t poff=e&0x1FFFFF, skip=(e>>21)&7, shadow=(e>>24)&1, prims=(e>>25)&0xF;
                 bool quad=(type==0b101);
                 out.push_back({quad?2:1, poff,skip,shadow,0,prims+1});
-            } else break;
+            }
+            // unhandled type: SKIP (1 word) and continue, matching refsw + RTL.
+            // (Only end_of_list terminates the list.)
         }
     }
     return out;

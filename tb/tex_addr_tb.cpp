@@ -20,8 +20,11 @@ static uint32_t ref_fbpp(int pixfmt,int vq){
 static uint32_t ref_stride(int texu,int strdsel,int scan,int text_ctrl){
     if(strdsel && scan) return (text_ctrl&31)*32; else return (8u<<texu);
 }
+// refsw MipPoint table (refsw_tile.cpp:493)
+static const uint32_t MipPoint[11] = {
+    0x3, 0x1*4,0x2*4,0x6*4,0x16*4,0x56*4,0x156*4,0x556*4,0x1556*4,0x5556*4,0x15556*4 };
 // returns byte_addr, and out params fbpp/offset
-static uint32_t ref_addr(uint32_t tcw_addr,int vq,int scan,int strdsel,int pixfmt,
+static uint32_t ref_addr(uint32_t tcw_addr,int vq,int scan,int strdsel,int mip,int pixfmt,
                          int texu,int texv,int text_ctrl,int u,int v,
                          uint32_t*of_out,uint32_t*fbpp_out){
     int is_pal = (pixfmt==5||pixfmt==6);
@@ -29,10 +32,14 @@ static uint32_t ref_addr(uint32_t tcw_addr,int vq,int scan,int strdsel,int pixfm
     int strd_e = strdsel && !is_pal;
     uint32_t fbpp = ref_fbpp(pixfmt,vq);
     uint32_t stride = ref_stride(texu,strd_e,scan_e,text_ctrl);
+    // mip base offset at MipLevel 0 = MipPoint[3+TexU]
+    uint32_t mip_off = mip ? MipPoint[3+texu] : 0;
     uint32_t off;
     int twiddled = vq || !scan_e;
-    if(twiddled) off = twiddle(u,v,8u<<texu,8u<<texv);
+    // refsw: mipmapped twiddle is square (TexU x TexU); else TexU x TexV
+    if(twiddled) off = mip ? twiddle(u,v,8u<<texu,8u<<texu) : twiddle(u,v,8u<<texu,8u<<texv);
     else         off = u + stride*v;
+    off += mip_off;
     uint32_t base = (tcw_addr<<3) + (vq?2048:0);
     uint32_t byte = base + off*fbpp/16;
     *of_out=off; *fbpp_out=fbpp;
@@ -51,18 +58,21 @@ int main(int c,char**v){
         uint32_t tcw_addr=rnd()&0x1FFFFF;
         int vq = (pixfmt<=3)?(rnd()&1):0;   // VQ only meaningful for 16bpp/yuv-ish
         int scan=rnd()&1, strdsel=rnd()&1;
+        int mip=rnd()&1;                    // exercise mipmapped on/off
         int texu=rnd()%8, texv=rnd()%8;
+        if(mip) texv=texu;                  // mip textures are square (TexU==TexV)
         int text_ctrl=rnd()&31;
         int u=rnd()&((8<<texu)-1), vv=rnd()&((8<<texv)-1);
         d->tcw_addr=tcw_addr; d->vq=vq; d->scan=scan; d->stride_sel=strdsel;
+        d->mipmapped=mip;
         d->pixfmt=pixfmt; d->texu=texu; d->texv=texv; d->text_ctrl=text_ctrl;
         d->u=u; d->v=vv; d->eval();
-        uint32_t rof,rfbpp; uint32_t rbyte=ref_addr(tcw_addr,vq,scan,strdsel,pixfmt,texu,texv,text_ctrl,u,vv,&rof,&rfbpp);
+        uint32_t rof,rfbpp; uint32_t rbyte=ref_addr(tcw_addr,vq,scan,strdsel,mip,pixfmt,texu,texv,text_ctrl,u,vv,&rof,&rfbpp);
         total++;
         if((uint32_t)d->byte_addr!=rbyte || (uint32_t)d->fbpp!=rfbpp || (uint32_t)d->offset!=(rof&0xFFFFF)){
             fails++;
-            if(fails<12) printf("  fmt%d vq%d scan%d strd%d tu%d tv%d u%d v%d: byte %x/%x fbpp %d/%d off %x/%x\n",
-              pixfmt,vq,scan,strdsel,texu,texv,u,vv,(uint32_t)d->byte_addr,rbyte,(int)d->fbpp,rfbpp,(uint32_t)d->offset,rof&0xFFFFF);
+            if(fails<12) printf("  fmt%d vq%d scan%d strd%d mip%d tu%d tv%d u%d v%d: byte %x/%x fbpp %d/%d off %x/%x\n",
+              pixfmt,vq,scan,strdsel,mip,texu,texv,u,vv,(uint32_t)d->byte_addr,rbyte,(int)d->fbpp,rfbpp,(uint32_t)d->offset,rof&0xFFFFF);
         }
       }
     }

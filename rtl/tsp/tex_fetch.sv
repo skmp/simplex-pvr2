@@ -35,12 +35,13 @@ module tex_fetch import tsp_pkg::*; (
     wire strdsel=tcw[25], scan=tcw[26];
     wire [2:0] pixfmt=tcw[29:27];
     wire vq=tcw[30];
+    wire mipmapped=tcw[31];
     wire [5:0] palsel=tcw[26:21];
 
     // address gen (combinational)
     wire [28:0] ta_byte; wire [5:0] ta_fbpp; wire [19:0] ta_off;
     tex_addr u_ta (
-        .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.pixfmt(pixfmt),
+        .tcw_addr(tcw_addr),.vq(vq),.scan(scan),.stride_sel(strdsel),.mipmapped(mipmapped),.pixfmt(pixfmt),
         .texu(texu),.texv(texv),.text_ctrl(text_ctrl),.u(u),.v(v),
         .byte_addr(ta_byte),.fbpp(ta_fbpp),.offset(ta_off));
 

@@ -103,7 +103,12 @@ module object_list_parser import tsp_pkg::*; (
                             shadow:ent[24], mask:6'd0, count:{1'b0,ent[28:25]}+5'd1 };
                         st <= S_PRESENT;
                     end
-                    default: st<=S_DONE;               // unhandled type
+                    // unhandled type (e.g. modifier-volume/sprite entries): SKIP
+                    // it and continue the list, matching refsw RenderObjectList
+                    // (its default prints a warning + breaks; only end_of_list
+                    // stops). Terminating here would drop all following entries
+                    // (e.g. doa2's environment after an inline unhandled entry).
+                    default: st<=S_RDENT;
                     endcase
                 end
             end

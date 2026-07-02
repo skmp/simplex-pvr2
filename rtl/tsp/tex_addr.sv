@@ -19,6 +19,7 @@ module tex_addr (
     input         vq,           // TCW.VQ_Comp
     input         scan,         // TCW.ScanOrder
     input         stride_sel,   // TCW.StrideSel
+    input         mipmapped,    // TCW.MipMapped
     input  [2:0]  pixfmt,       // TCW.PixelFmt
     input  [2:0]  texu,         // TSP.TexU
     input  [2:0]  texv,         // TSP.TexV
@@ -67,9 +68,32 @@ module tex_addr (
         end
     end
 
+    // mipmap base-level offset (refsw TexOffsetGen, MipLevel 0):
+    //   mip_offset = MipPoint[3 + TexU]  (texels to skip the mip pyramid).
+    // MipPoint[3..10] for TexU 0..7 (from refsw_tile.cpp:493). Added to the
+    // texel offset before the *fbpp/16 byte conversion, when TCW.MipMapped.
+    reg [19:0] mip_off;
+    always @(*) begin
+        case (texu)
+            3'd0: mip_off = 20'h00018;   // MipPoint[3]
+            3'd1: mip_off = 20'h00058;   // MipPoint[4]
+            3'd2: mip_off = 20'h00158;   // MipPoint[5]
+            3'd3: mip_off = 20'h00558;   // MipPoint[6]
+            3'd4: mip_off = 20'h01558;   // MipPoint[7]
+            3'd5: mip_off = 20'h05558;   // MipPoint[8]
+            3'd6: mip_off = 20'h15558;   // MipPoint[9]
+            default: mip_off = 20'h55558;// MipPoint[10] (texu=7)
+        endcase
+    end
+    wire [23:0] mip_add = mipmapped ? {4'd0, mip_off} : 24'd0;
+
     wire        twiddled = vq | ~scan_e;
     wire [19:0] lin_off  = u + stride * v;
-    assign offset = twiddled ? tw[19:0] : lin_off;
+    // FULL-WIDTH texel offset (24b): twiddle/linear + mip base. For tu7 mipmapped
+    // the mip base (0x55558) + twiddle can exceed 20 bits, so byte_addr must use
+    // this full value (the 20-bit `offset` port only feeds low-bit lane select).
+    wire [23:0] off_full = {4'd0, (twiddled ? tw[19:0] : lin_off)} + mip_add;
+    assign offset = off_full[19:0];
 
     // base address (bytes)
     wire [28:0] base = ({8'd0, tcw_addr} << 3) + (vq ? 29'd2048 : 29'd0); // 256*4*2
@@ -78,6 +102,6 @@ module tex_addr (
     // emu_vram index. Consumers derive the 64-bit word (byte_addr>>3) and the
     // byte-within-word (byte_addr[2:0]) - the latter is needed to pick the VQ
     // index byte / sub-word lane, so it must NOT be masked away here.
-    wire [40:0] byte_off = (offset * fbpp) >> 4;   // = offset*fbpp/16
+    wire [40:0] byte_off = (off_full * fbpp) >> 4;   // = offset*fbpp/16
     assign byte_addr = base + byte_off[28:0];
 endmodule
