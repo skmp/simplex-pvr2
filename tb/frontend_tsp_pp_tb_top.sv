@@ -43,90 +43,88 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     // -------------------- 8 MB behavioral VRAM --------------------
     (* verilator public_flat_rw *) reg [63:0] vram [0:1048575];
 
-    // DDR read stub factory - simple 1-beat model (used by ra + ts)
-    `define DDRPORT(NM) \
-        ddr_rd_req_t NM``_dreq; ddr_rd_resp_t NM``_dresp; \
-        reg [63:0] NM``_do; reg NM``_dv; \
-        assign NM``_dresp.busy=1'b0; assign NM``_dresp.dout=NM``_do; assign NM``_dresp.dready=NM``_dv; \
-        always @(posedge clk) begin NM``_dv<=0; if(NM``_dreq.rd) begin NM``_do<=vram[NM``_dreq.addr[19:0]]; NM``_dv<=1; end end
-
-    `DDRPORT(ra)
-
-    // TSP param port - BURST + latency model (single 64-bit channel), like ol/pr.
-    ddr_rd_req_t  ts_dreq; ddr_rd_resp_t ts_dresp;
-    reg ts_busy_d; reg [19:0] ts_word; reg [7:0] ts_beats, ts_lat;
-    reg [63:0] ts_do; reg ts_dv;
-    assign ts_dresp.busy=ts_busy_d; assign ts_dresp.dout=ts_do; assign ts_dresp.dready=ts_dv;
-    always @(posedge clk) begin
-        ts_dv <= 1'b0;
-        if (reset) ts_busy_d <= 1'b0;
-        else if (!ts_busy_d) begin
-            if (ts_dreq.rd) begin ts_busy_d<=1'b1; ts_word<=ts_dreq.addr[19:0];
-                ts_beats<=ts_dreq.burst; ts_lat<=8'd8; end
-        end else if (ts_lat != 0) ts_lat <= ts_lat - 8'd1;
-        else begin
-            ts_do<=vram[ts_word]; ts_dv<=1'b1; ts_word<=ts_word+20'd1;
-            if (ts_beats <= 8'd1) ts_busy_d <= 1'b0;
-            ts_beats <= ts_beats - 8'd1;
-        end
-    end
-
-    // objlist + param ports - BURST + latency model (each a single 64-bit channel):
-    // a read is accepted for RD_LAT dead cycles, then `burst` consecutive beats
-    // stream out one/cycle from incrementing addresses. The OL parser and ISP
-    // iterator read DDR DIRECTLY through these (no line cache).
+    // ==================== SINGLE SHARED DDR CHANNEL ====================
+    // Real hardware has ONE 64-bit DDR read channel. All six clients - region
+    // array (ra), object list (ol), ISP param/vertex (pr), TSP param (ts), and
+    // the two 4-port texture caches (tc data, vq codebook) - are arbitrated onto
+    // ONE behavioral burst+latency reader (fixed priority, one read in flight).
+    // A client sees busy = channel busy OR a higher-priority client requesting.
+    // This makes the cycle counts reflect true single-channel DDR contention
+    // (the previous per-port stubs faked N parallel reads/cycle, impossible on
+    // one channel). Priority order (highest first): tc, vq, ts, pr, ol, ra -
+    // shade-path critical clients win, geometry fills between.
     localparam integer RD_LAT = 8;
-    // objlist port
-    ddr_rd_req_t  ol_dreq; ddr_rd_resp_t ol_dresp;
-    reg ol_busy_d; reg [19:0] ol_word; reg [7:0] ol_beats, ol_lat;
-    reg [63:0] ol_do; reg ol_dv;
-    assign ol_dresp.busy=ol_busy_d; assign ol_dresp.dout=ol_do; assign ol_dresp.dready=ol_dv;
-    always @(posedge clk) begin
-        ol_dv <= 1'b0;
-        if (reset) ol_busy_d <= 1'b0;
-        else if (!ol_busy_d) begin
-            if (ol_dreq.rd) begin ol_busy_d<=1'b1; ol_word<=ol_dreq.addr[19:0];
-                ol_beats<=ol_dreq.burst; ol_lat<=RD_LAT[7:0]; end
-        end else if (ol_lat != 0) ol_lat <= ol_lat - 8'd1;
-        else begin
-            ol_do<=vram[ol_word]; ol_dv<=1'b1; ol_word<=ol_word+20'd1;
-            if (ol_beats <= 8'd1) ol_busy_d <= 1'b0;
-            ol_beats <= ol_beats - 8'd1;
-        end
-    end
-    // param port
-    ddr_rd_req_t  pr_dreq; ddr_rd_resp_t pr_dresp;
-    reg pr_busy; reg [19:0] pr_word; reg [7:0] pr_beats, pr_lat;
-    reg [63:0] pr_do; reg pr_dv;
-    assign pr_dresp.busy=pr_busy; assign pr_dresp.dout=pr_do; assign pr_dresp.dready=pr_dv;
-    always @(posedge clk) begin
-        pr_dv <= 1'b0;
-        if (reset) pr_busy <= 1'b0;
-        else if (!pr_busy) begin
-            if (pr_dreq.rd) begin pr_busy<=1'b1; pr_word<=pr_dreq.addr[19:0];
-                pr_beats<=pr_dreq.burst; pr_lat<=RD_LAT[7:0]; end
-        end else if (pr_lat != 0) pr_lat <= pr_lat - 8'd1;
-        else begin
-            pr_do<=vram[pr_word]; pr_dv<=1'b1; pr_word<=pr_word+20'd1;
-            if (pr_beats <= 8'd1) pr_busy <= 1'b0;
-            pr_beats <= pr_beats - 8'd1;
-        end
-    end
-
-    // texture DDR ports (4 corners x {data,VQ} = 8)
     genvar gi_tex;
-    ddr_rd_req_t  tex_dreq [0:7];
-    ddr_rd_resp_t tex_dresp [0:7];
-    generate
-      for (gi_tex = 0; gi_tex < 8; gi_tex = gi_tex + 1) begin : texddr
-        reg [63:0] do_r; reg dv_r;
-        assign tex_dresp[gi_tex].busy=1'b0;
-        assign tex_dresp[gi_tex].dout=do_r; assign tex_dresp[gi_tex].dready=dv_r;
-        always @(posedge clk) begin
-            dv_r<=0; if (tex_dreq[gi_tex].rd) begin do_r<=vram[tex_dreq[gi_tex].addr[19:0]]; dv_r<=1; end
+    ddr_rd_req_t  ra_dreq, ol_dreq, pr_dreq, ts_dreq;
+    ddr_rd_resp_t ra_dresp, ol_dresp, pr_dresp, ts_dresp;
+    ddr_rd_req_t  tex_dreq [0:1];      // [0]=tc data, [1]=vq codebook
+    ddr_rd_resp_t tex_dresp [0:1];
+
+    // Per-client PENDING latch: a client's 1-cycle rd pulse is captured into
+    // pend[i] and its address/burst held, so a request is NEVER lost while the
+    // channel is busy with someone else (the clients pulse rd for one cycle;
+    // without latching, a pulse during a busy cycle would vanish -> deadlock).
+    // 0=tc 1=vq 2=ts 3=pr 4=ol 5=ra (priority high->low).
+    reg  [5:0]  pend;
+    reg  [28:0] pa [0:5]; reg [7:0] pb [0:5];
+    wire [5:0]  rd_pulse = { ra_dreq.rd, ol_dreq.rd, pr_dreq.rd, ts_dreq.rd,
+                             tex_dreq[1].rd, tex_dreq[0].rd };
+    // combinational addr/burst per client (captured when a pulse arrives)
+    wire [28:0] ca [0:5]; wire [7:0] cbv [0:5];
+    assign ca[0]=tex_dreq[0].addr; assign cbv[0]=tex_dreq[0].burst;
+    assign ca[1]=tex_dreq[1].addr; assign cbv[1]=tex_dreq[1].burst;
+    assign ca[2]=ts_dreq.addr;     assign cbv[2]=ts_dreq.burst;
+    assign ca[3]=pr_dreq.addr;     assign cbv[3]=pr_dreq.burst;
+    assign ca[4]=ol_dreq.addr;     assign cbv[4]=ol_dreq.burst;
+    assign ca[5]=ra_dreq.addr;     assign cbv[5]=ra_dreq.burst;
+
+    wire       any_pend = |pend;
+    wire [2:0] d_win = pend[0] ? 3'd0 : pend[1] ? 3'd1 : pend[2] ? 3'd2 :
+                       pend[3] ? 3'd3 : pend[4] ? 3'd4 : 3'd5;
+
+    reg        d_busy; reg [2:0] d_owner;
+    reg [19:0] d_word; reg [7:0] d_beats, d_lat;
+    reg [63:0] d_do; reg d_dv;
+    integer di;
+    always @(posedge clk) begin
+        d_dv <= 1'b0;
+        if (reset) begin d_busy <= 1'b0; pend <= 6'd0; end
+        else begin
+            // capture new request pulses into the pending latches
+            for (di=0; di<6; di=di+1) begin
+                if (rd_pulse[di]) begin pend[di] <= 1'b1; pa[di] <= ca[di]; pb[di] <= cbv[di]; end
+            end
+            if (!d_busy) begin
+                if (any_pend) begin
+                    d_busy<=1'b1; d_owner<=d_win; d_word<=pa[d_win][19:0];
+                    d_beats<=pb[d_win]; d_lat<=RD_LAT[7:0];
+                    pend[d_win] <= (rd_pulse[d_win]);  // clear grant (unless re-pulsed same cyc)
+                end
+            end else if (d_lat != 0) d_lat <= d_lat - 8'd1;
+            else begin
+                d_do<=vram[d_word]; d_dv<=1'b1; d_word<=d_word+20'd1;
+                if (d_beats <= 8'd1) d_busy <= 1'b0;
+                d_beats <= d_beats - 8'd1;
+            end
         end
-      end
-    endgenerate
+    end
+    // A client is "busy" (cannot issue a new read) whenever the channel is busy
+    // OR it already has a pending request in flight. Since requests are latched,
+    // clients need only avoid issuing while busy - no same-cycle priority race.
+    assign tex_dresp[0].busy = d_busy || pend[0];
+    assign tex_dresp[1].busy = d_busy || pend[1];
+    assign ts_dresp.busy     = d_busy || pend[2];
+    assign pr_dresp.busy     = d_busy || pend[3];
+    assign ol_dresp.busy     = d_busy || pend[4];
+    assign ra_dresp.busy     = d_busy || pend[5];
+    assign tex_dresp[0].dout=d_do; assign tex_dresp[1].dout=d_do;
+    assign ts_dresp.dout=d_do; assign pr_dresp.dout=d_do; assign ol_dresp.dout=d_do; assign ra_dresp.dout=d_do;
+    assign tex_dresp[0].dready = d_dv && (d_owner==3'd0);
+    assign tex_dresp[1].dready = d_dv && (d_owner==3'd1);
+    assign ts_dresp.dready     = d_dv && (d_owner==3'd2);
+    assign pr_dresp.dready     = d_dv && (d_owner==3'd3);
+    assign ol_dresp.dready     = d_dv && (d_owner==3'd4);
+    assign ra_dresp.dready     = d_dv && (d_owner==3'd5);
 
     // -------------------- caches --------------------
     // Region parser keeps its 256-bit line cache; the OL parser, ISP iterator,
@@ -135,16 +133,16 @@ module frontend_tsp_pp_tb_top import tsp_pkg::*; (
     cache_resp256_t ra_cresp;
     data_cache256 u_ra_c (.clk(clk),.reset(reset),.creq(ra_creq),.cresp(ra_cresp),.dreq(ra_dreq),.dresp(ra_dresp));
 
+    // The 4 corner fetchers share ONE 4-read-port data cache + ONE 4-read-port VQ
+    // cache (2x dual-port M10K each, full copy), replacing the 8 per-corner
+    // tex_cache instances. Simultaneous same-line misses are deduped to one DDR
+    // read; distinct-line misses serialize (the pipe stalls while any corner busy).
     cache_req_t   pp_tc_req [0:3], pp_vq_req [0:3];
     cache_resp_t  pp_tc_resp[0:3], pp_vq_resp[0:3];
-    generate
-      for (gi_tex = 0; gi_tex < 4; gi_tex = gi_tex + 1) begin : texcache
-        tex_cache u_tc (.clk(clk),.reset(reset),.creq(pp_tc_req[gi_tex]),.cresp(pp_tc_resp[gi_tex]),
-            .dreq(tex_dreq[2*gi_tex]),.dresp(tex_dresp[2*gi_tex]));
-        tex_cache u_vq (.clk(clk),.reset(reset),.creq(pp_vq_req[gi_tex]),.cresp(pp_vq_resp[gi_tex]),
-            .dreq(tex_dreq[2*gi_tex+1]),.dresp(tex_dresp[2*gi_tex+1]));
-      end
-    endgenerate
+    tex_cache_4p u_tc4 (.clk(clk),.reset(reset),.creq(pp_tc_req),.cresp(pp_tc_resp),
+        .dreq(tex_dreq[0]),.dresp(tex_dresp[0]));
+    tex_cache_4p u_vq4 (.clk(clk),.reset(reset),.creq(pp_vq_req),.cresp(pp_vq_resp),
+        .dreq(tex_dreq[1]),.dresp(tex_dresp[1]));
 
     // -------------------- parsers --------------------
     reg          ra_start;
