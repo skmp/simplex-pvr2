@@ -176,45 +176,81 @@ module peel_core import tsp_pkg::*; (
         .trio(it_trio),.ack(it_ack),.dreq(pr_dreq),.dresp(pr_dresp));
 
     // -------------------- depth/tag tile + color buffer + framebuffer --------------------
-    // NOTE (improvement #3 - M10K banking of the tile buffers): DEFERRED / left as
-    // registers, intentionally, to preserve bit-exact peel semantics. Unlike
-    // isp_core (single {depth,tag} buffer, one clean 2-stage chunk R/W), peel_core's
-    // tile buffers cannot ALL be banked into tile_ram without a pipeline rewrite that
-    // risks the verified layer-peel behaviour:
-    //   * dt_depth/dt_tag/dt_valid/dt_depth2/dt_tag2 - the peel depth compare
-    //     (isp_depth_cmp_lp) reads FIVE of these COMBINATIONALLY per lane and writes
-    //     FOUR same-cycle (see the dcmp generate + the ras_out_valid consumer). A
-    //     tile_ram (registered read) forces a 2-stage stage-A/stage-B pipeline like
-    //     isp_core's, PLUS: (a) carry b_peeling/b_peel_which into stage B, (b) move
-    //     the `more_to_draw` accumulate (currently combinational off ras_more_lp)
-    //     into stage B, (c) add `!b_valid` to consumer_idle AND RS_DRAIN (mirroring
-    //     isp_core) so PeelBuffers/CLEAR/SetTagToMax/next-triangle never race the
-    //     trailing write, (d) rewrite CLEAR / SetTagToMax / PeelBuffers as sequential
-    //     128-chunk walks over the RAM ports - PeelBuffers being a pipelined
-    //     read(A)->write(B)+clear(A) RMW, and (e) re-time the SH_PIX single-pixel
-    //     reads (dt_tag[shp]/dt_depth[shp]/dt_valid[shp]) which today use dt_valid
-    //     combinationally to decide the per-pass skip. Each of those is a separate
-    //     bit-exactness hazard in the peel loop.
-    //   * col_buf - the blend reads col_buf[pp_out_id] COMBINATIONALLY as `dst` and
-    //     the shade consumer writes the SAME id the SAME cycle (read-modify-write
-    //     through tsp_blend). tile_ram's registered read-first port cannot serve a
-    //     combinational same-cycle dst; banking requires reworking tsp_shade_pp's
-    //     tail into a registered RMW with per-pixel RAW-hazard handling. NOT bankable
-    //     bit-exact here.
-    //   * dt_pt - 1 bit x 1024 (negligible), and the blend reads dt_pt[pp_out_id]
-    //     COMBINATIONALLY for the PT alpha-test; banking it buys no M10K and costs
-    //     bit-exactness. Kept as a reg.
+    // IMPROVEMENT #3 (APPLIED) - M10K banking of the tile buffers. The five peel
+    // depth/tag buffers (dt_depth/dt_depth2/dt_tag/dt_tag2/dt_valid) are packed into
+    // ONE 129-bit x 8-bank simple-dual-port tile_ram (u_peel); col_buf into a single
+    // 1024x32 M10K (u_col). Bank = x[2:0], addr = {y[4:0], x[4:3]} (7-bit, 128
+    // entries/bank), so a whole 8-lane raster chunk is one address across 8 banks -
+    // exactly the isp_core scheme. The registered read forces the peel depth compare
+    // and the blend RMW into 2-stage stage-A/stage-B pipelines (see the raster
+    // consumer and the CB blend stage), and CLEAR / PeelBuffers into sequential
+    // 128-chunk RAM walks. Barriers already serialize the raster / shade / bulk
+    // phases, so the single read+write port of each RAM is never contended across
+    // phases. dt_pt stays a REGISTER array (1 bit x 1024, negligible M10K, read
+    // combinationally by the blend alpha test - banking it would need a 2nd peel-RAM
+    // read port for the shade producer/consumer split, for no M10K gain).
+    //
     // The 4-way streamed setup + 8-deep plane FIFO (#1), the prefetch iterator +
-    // it_pf_busy barrier (#2), and the 1px/cycle combinational FLUSH (#4) ARE applied.
+    // it_pf_busy barrier (#2), and the 1px/cycle combinational FLUSH (#4) are also
+    // applied.
     localparam integer TILE_W = 32, TILE_H = 32;
-    reg [31:0] dt_depth [0:TILE_W*TILE_H-1];   // invW depth (depthBufferA / zb)
-    reg [31:0] dt_tag   [0:TILE_W*TILE_H-1];   // CoreTag   (tagBufferA   / pb)
-    // ---- layer-peeling extra buffers (refsw2 depthBufferB / tagBufferB / tagStatus.valid) ----
-    reg [31:0] dt_depth2[0:TILE_W*TILE_H-1];   // reference invW  (depthBufferB / zb2)
-    reg [31:0] dt_tag2  [0:TILE_W*TILE_H-1];   // last-rendered   (tagBufferB   / pb2)
-    reg        dt_valid [0:TILE_W*TILE_H-1];   // staged-this-pass (tagStatus.valid)
-    reg        dt_pt    [0:TILE_W*TILE_H-1];   // winning peel fragment came from PT list
-    reg [31:0] col_buf  [0:TILE_W*TILE_H-1];   // shaded ARGB per tile pixel
+    localparam integer NB = RAS_LANES;         // 8 banks (one per raster lane)
+
+    // ---- peel RAM: {valid, tag2[31:0], tag[31:0], depth2[31:0], depth[31:0]} / lane ----
+    // packed word field offsets (per lane, LSB-first):
+    localparam integer PW_DEPTH  = 0;          // [31:0]  depthBufferA (zb)
+    localparam integer PW_DEPTH2 = 32;         // [31:0]  depthBufferB (zb2, reference)
+    localparam integer PW_TAG    = 64;         // [31:0]  tagBufferA   (pb)
+    localparam integer PW_TAG2   = 96;         // [31:0]  tagBufferB   (pb2)
+    localparam integer PW_VALID  = 128;        // [0]     tagStatus.valid
+    localparam integer PEEL_W = 129;           // bits per lane
+
+    reg  [NB-1:0]         pr_we;
+    reg  [7*NB-1:0]       pr_waddr;            // stage-B / bulk write address
+    reg  [7*NB-1:0]       pr_raddr;            // stage-A / bulk / shade read address
+    reg  [PEEL_W*NB-1:0]  pr_wdata;
+    wire [PEEL_W*NB-1:0]  pr_rdata;
+    tile_ram #(.WIDTH(PEEL_W), .NBANKS(NB)) u_peel (
+        .clk(clk), .we(pr_we), .waddr(pr_waddr), .wdata(pr_wdata),
+        .raddr(pr_raddr), .rdata(pr_rdata)
+    );
+
+    // pack a 7-bit bank address {y[4:0], x[4:3]} onto all 8 banks (same addr/bank)
+    function automatic [7*NB-1:0] pr_pack_addr(input [4:0] y, input [4:0] xchunk);
+        integer b;
+        begin
+            pr_pack_addr = '0;
+            for (b = 0; b < NB; b = b + 1)
+                pr_pack_addr[7*b +: 7] = {y, xchunk[4:3]};
+        end
+    endfunction
+    // per-lane field extractors from a packed chunk word
+    function automatic [31:0] pr_depth (input [PEEL_W*NB-1:0] w, input integer b);
+        pr_depth  = w[PEEL_W*b + PW_DEPTH  +: 32]; endfunction
+    function automatic [31:0] pr_depth2(input [PEEL_W*NB-1:0] w, input integer b);
+        pr_depth2 = w[PEEL_W*b + PW_DEPTH2 +: 32]; endfunction
+    function automatic [31:0] pr_tag   (input [PEEL_W*NB-1:0] w, input integer b);
+        pr_tag    = w[PEEL_W*b + PW_TAG    +: 32]; endfunction
+    function automatic [31:0] pr_tag2  (input [PEEL_W*NB-1:0] w, input integer b);
+        pr_tag2   = w[PEEL_W*b + PW_TAG2   +: 32]; endfunction
+    function automatic       pr_valid  (input [PEEL_W*NB-1:0] w, input integer b);
+        pr_valid  = w[PEEL_W*b + PW_VALID]; endfunction
+
+    // dt_pt kept as a register array (see note above)
+    reg        dt_pt [0:TILE_W*TILE_H-1];      // winning peel fragment came from PT list
+
+    // ---- color RAM: single-bank 1024x32 (low load - only TSP blend + FLUSH) ----
+    reg          cr_we;
+    reg  [9:0]   cr_waddr, cr_raddr;
+    reg  [31:0]  cr_wdata;
+    wire [31:0]  cr_rdata;
+    (* ramstyle = "M10K, no_rw_check" *) reg [31:0] col_ram [0:TILE_W*TILE_H-1];
+    reg  [31:0]  cr_rdata_r;
+    always @(posedge clk) begin
+        if (cr_we) col_ram[cr_waddr] <= cr_wdata;
+        cr_rdata_r <= col_ram[cr_raddr];        // registered read (read-first)
+    end
+    assign cr_rdata = cr_rdata_r;
 
     localparam [31:0] FLT_MAX = 32'h7F7FFFFF;  // refsw PeelBuffers depth clear value
 
@@ -317,7 +353,26 @@ module peel_core import tsp_pkg::*; (
     // the active region state is PT or TR (PT treated as TR for now).
     reg        peeling;
 
-    // per-lane compare at the RESULT chunk coords (streamed).
+    // ---- raster consumer stage-A -> stage-B pipeline (M10K registered read) ----
+    // Stage A (on ras_out_valid): present the peel-RAM READ for the resolved chunk
+    // and latch the raster result fields. Stage B (next cycle, b_valid): pr_rdata =
+    // that chunk's OLD packed {depth,depth2,tag,tag2,valid}; the dcmp/dcmp_lp run
+    // COMBINATIONALLY off pr_rdata (exactly the values the old combinational path
+    // read from dt_*[] one cycle earlier), then the write port writes back.
+    reg                    b_valid;
+    reg [RAS_LANES-1:0]    b_inside;
+    reg [32*RAS_LANES-1:0] b_invw;
+    reg [4:0]              b_ox, b_oy;
+    reg [31:0]             b_tag;
+    reg [2:0]              b_mode;
+    reg                    b_zwdis;
+    reg                    b_peeling;   // carry the peel/opaque select into stage B
+    reg                    b_which;     // peel_which snapshot (PT list => dt_pt=1)
+    function [31:0] b_invw_lane(input integer lane);
+        b_invw_lane = b_invw[32*lane +: 32];
+    endfunction
+
+    // per-lane compare on the STAGE-B chunk (pr_rdata), using the latched b_* fields.
     //  - opaque path: isp_depth_cmp (DepthMode) -> ras_pass_op
     //  - peel   path: isp_depth_cmp_lp          -> ras_pass_lp + ras_more_lp
     wire [RAS_LANES-1:0] ras_pass_op, ras_pass_lp, ras_more_lp;
@@ -325,23 +380,22 @@ module peel_core import tsp_pkg::*; (
     generate
         for (gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
             isp_depth_cmp u_cmp (
-                .mode(depth_mode),
-                .nw  (ras_invw_flat[32*gd +: 32]),
-                .ob  (dt_depth[{ras_oy, ras_ox + 5'(gd)}]),
+                .mode(b_mode),
+                .nw  (b_invw[32*gd +: 32]),
+                .ob  (pr_depth(pr_rdata, gd)),
                 .pass(ras_pass_op[gd]));
             isp_depth_cmp_lp u_cmp_lp (
-                .nw   (ras_invw_flat[32*gd +: 32]),
-                .tag  (tri_tag),
-                .zb   (dt_depth [{ras_oy, ras_ox + 5'(gd)}]),
-                .zb2  (dt_depth2[{ras_oy, ras_ox + 5'(gd)}]),
-                .pb   (dt_tag   [{ras_oy, ras_ox + 5'(gd)}]),
-                .pb2  (dt_tag2  [{ras_oy, ras_ox + 5'(gd)}]),
-                .valid(dt_valid [{ras_oy, ras_ox + 5'(gd)}]),
+                .nw   (b_invw[32*gd +: 32]),
+                .tag  (b_tag),
+                .zb   (pr_depth (pr_rdata, gd)),
+                .zb2  (pr_depth2(pr_rdata, gd)),
+                .pb   (pr_tag   (pr_rdata, gd)),
+                .pb2  (pr_tag2  (pr_rdata, gd)),
+                .valid(pr_valid (pr_rdata, gd)),
                 .pass (ras_pass_lp[gd]),
                 .more (ras_more_lp[gd]));
         end
     endgenerate
-    wire [RAS_LANES-1:0] ras_pass = peeling ? ras_pass_lp : ras_pass_op;
 
     // ==================================================================
     // TSP plane cache: 64 entries, keyed by the FULL CoreTag word.
@@ -512,28 +566,31 @@ module peel_core import tsp_pkg::*; (
         .tc_req(pp_tc_req),.tc_resp(pp_tc_resp),.vq_req(pp_vq_req),.vq_resp(pp_vq_resp));
 
     // -------- blend unit: the very end of the TSP pipeline (refsw BlendingUnit) --------
-    // Combinational, driven by the pipeline output: src = shaded color, dst = the
-    // pixel's current accumulation-buffer color (col_buf[pp_out_id]; unique per
-    // pass so it equals the value at present-time). SrcInstr/DstInstr come from the
-    // pixel's own TSP word (pp_out_tsp). PT alpha-test is off (PT treated as TR).
-    // TSP.SrcInstr = tsp[31:29], TSP.DstInstr = tsp[28:26] (see tsp_pkg tsp_t).
-    wire [2:0]   pp_src_instr = pp_out_tsp[31:29];
-    wire [2:0]   pp_dst_instr = pp_out_tsp[28:26];
-    // PT punch-through alpha test: enabled only while shading a PT region. A texel
-    // with alpha < PT_ALPHA_REF becomes a hole (alpha->0, no contribution) so the
-    // back-to-front PT peel + blend produces the correct cutout (refsw BlendingUnit
-    // pp_AlphaTest). TR regions never alpha-test here.
-    // alpha-test only during peel passes, and only for pixels whose winning fragment
-    // came from the PT list (dt_pt). PT: alpha<ref -> hole, else fully opaque.
-    wire         pp_blend_at_en = peeling && dt_pt[pp_out_id];
+    // The color buffer is now an M10K (col_ram, registered read), so the blend RMW
+    // is a 2-stage pipeline (like the raster depth compare):
+    //   stage CA (on pp_out_valid && !pp_stall): latch cb_* and present the col-RAM
+    //     READ of cb_id; cb_valid<=1.
+    //   stage CB (next cycle, cb_valid): cr_rdata = OLD col_buf[cb_id] = the dst;
+    //     tsp_blend runs COMBINATIONALLY off it, then col-RAM[cb_id] <- blend_out.
+    // Because the shade sub-phase presents pixels in ASCENDING shp order and the pipe
+    // is in-order, out ids never repeat within a sub-phase -> CA id N and CB id N-1
+    // are always distinct, so no same-address RMW hazard. SH_DRAIN additionally
+    // waits !cb_valid before returning so the trailing blend lands before the next
+    // phase (peel pass / FLUSH) touches col_ram.
+    reg          cb_valid;
+    reg  [9:0]   cb_id;
+    reg  [31:0]  cb_argb, cb_tsp;
+    reg          cb_at_en;    // alpha-test enable snapshot (peeling && dt_pt[id])
+    wire [2:0]   cb_src_instr = cb_tsp[31:29];
+    wire [2:0]   cb_dst_instr = cb_tsp[28:26];
     wire [31:0]  pp_blend_out;
     wire         pp_blend_at;
     tsp_blend u_blend (
-        .src       (pp_out_argb),
-        .dst       (col_buf[pp_out_id]),
-        .src_instr (pp_src_instr),
-        .dst_instr (pp_dst_instr),
-        .alpha_test(pp_blend_at_en),
+        .src       (cb_argb),
+        .dst       (cr_rdata),          // registered read: OLD col_buf[cb_id]
+        .src_instr (cb_src_instr),
+        .dst_instr (cb_dst_instr),
+        .alpha_test(cb_at_en),
         .alpha_ref (regs.pt_alpha_ref[7:0]),
         .out       (pp_blend_out),
         .at_pass   (pp_blend_at));
@@ -558,7 +615,13 @@ module peel_core import tsp_pkg::*; (
                // unified PT+TL peel loop: init pb2, PeelBuffers, run, check
                S_PEEL_INIT=28, S_PEEL_BUF=29, S_PEEL_CHK=30,
                // shared shade sub-phase entry + OP-done return + FLUSH writeout
-               S_SHADE_START=31, S_OP_DONE=32, S_FLUSH_WR=33;
+               S_SHADE_START=31, S_OP_DONE=32, S_FLUSH_WR=33,
+               // M10K bulk-op walks over the peel RAM ports (128 chunk addrs each):
+               S_CLEAR_WR=34,              // CLEAR: write {bg_depth, bg_tag} chunks
+               S_PEEL_BUF_RUN=35,          // PeelBuffers RMW walk (read A -> write B)
+               // shade producer: 1-cycle peel-RAM read latency for pixel shp
+               SH_RD=36,
+               S_FLUSH_RD=37;              // FLUSH: prime col-RAM read of pixel fw_i
     reg [5:0] st;
 
     // consumer sub-FSM (setup is now the streamed pipeline u_isp -> pq FIFO)
@@ -572,6 +635,14 @@ module peel_core import tsp_pkg::*; (
     reg        peel_which;        // 0 = rasterizing PT list, 1 = TL list (this pass)
     reg [7:0]  peel_pass;         // pass counter (safety bound)
     localparam integer PEEL_MAX_PASS = 64;
+
+    // ---- M10K bulk-op walk counters (128 chunk addresses = whole 32x32 tile) ----
+    reg [6:0]  cl_i;              // CLEAR chunk-address counter 0..127
+    reg [6:0]  pb_i;             // PeelBuffers chunk-address counter 0..127
+    reg [6:0]  pb_rd;            // PeelBuffers read-ahead chunk (1 ahead of pb_i)
+    reg        pb_pipe;         // PeelBuffers RMW pipe primed (stage-B has valid rdata)
+    reg        first_peel;      // this tile's FIRST PeelBuffers (folds refsw SetTagToMax:
+                                //   pb2 <- 0xFFFFFFFF instead of copying tagA)
 
     // ---- single shared shade sub-phase (ONE tsp_shade_pp pipeline) ----
     // Invoked as a subroutine after OP and after each peel pass. The TSP pipeline
@@ -639,8 +710,13 @@ module peel_core import tsp_pkg::*; (
     // could open the barrier while triangles were still pending -> next state's
     // CLEAR/PeelBuffers/FLUSH would corrupt live tile data. The peel loop re-runs
     // the OL list per pass; the barrier waits for it_pf_busy to clear each pass.
+    // include !b_valid: the depth-cmp write-back (stage B) is one cycle behind
+    // ras_out_valid, so the last chunk's write to the peel RAM may still be in flight
+    // when rs_st returns to RS_IDLE. CLEAR/PeelBuffers must not walk the RAM until it
+    // lands (isp_core fix).
     wire consumer_idle = eq_empty && !it_pf_busy
-                       && !su_busy && (rs_st==RS_IDLE) && pq_empty;
+                       && !su_busy && (rs_st==RS_IDLE) && pq_empty
+                       && !b_valid;
 
     // shade pass pixel accounting: producer index shp, consumer count sh_out_n
     integer sh_out_n;
@@ -660,18 +736,126 @@ module peel_core import tsp_pkg::*; (
     // fbw_req is presented + accepted the SAME cycle so a blocking controller works
     // (busy holds; we advance fw_i only when the pixel is consumed). The screen
     // pixel for the linear tile index fw_i (0..1023): x=fw_i[4:0], y=fw_i[9:5].
+    // fbw_req.argb comes from the col RAM's REGISTERED read (cr_rdata): the combi
+    // read-port block below presents cr_raddr=fw_i whenever we HOLD the pixel, so
+    // cr_rdata == col_ram[fw_i]. On entry S_FLUSH_RD primes the read for pixel 0.
     wire [10:0] fw_px = {5'd0, cur_tx}*11'd32 + {6'd0, fw_i[4:0]};
     wire [10:0] fw_py = {5'd0, cur_ty}*11'd32 + {6'd0, fw_i[9:5]};
     wire        fw_onscreen = (fw_px < 11'd640) && (fw_py < 11'd480);
     always @(*) begin
         fbw_req.we      = (st==S_FLUSH_WR) && fw_onscreen;
         fbw_req.pix_idx = fw_py*20'd640 + {9'd0, fw_px};
-        fbw_req.argb    = col_buf[fw_i];
+        fbw_req.argb    = cr_rdata;
     end
     // a pixel is consumed this cycle when: on-screen and the sink accepted it, OR
     // off-screen (nothing to write -> skip immediately).
     wire fw_pix_consumed = (st==S_FLUSH_WR) &&
                            ( (fw_onscreen && !fbw_resp.busy) || !fw_onscreen );
+
+    // ============ COMBINATIONAL peel-RAM control (address valid THIS cycle) ============
+    // Presenting addresses combinationally makes the RAM's registered read give
+    // exactly 1-cycle latency, so the stage-B consumer (next cycle) sees THIS
+    // address's old data. Ports are shared across phases but the region barriers
+    // serialize raster / shade / bulk, so only one driver is ever active.
+    //
+    //   READ  port: raster stage A (ras_out_valid) | shade producer (SH_PIX) |
+    //               PeelBuffers read-ahead (pb_rd).
+    //   WRITE port: raster stage B (b_valid) | CLEAR (cl_i) | PeelBuffers (pb_i).
+    integer cw;
+    always @(*) begin
+        pr_we    = '0;
+        pr_waddr = '0;
+        pr_raddr = '0;
+        pr_wdata = '0;
+
+        // ---- READ port ----
+        if (ras_out_valid)                       // stage A: chunk being resolved
+            pr_raddr = pr_pack_addr(ras_oy, ras_ox);
+        else if (st == SH_PIX)                   // shade producer: pixel shp
+            pr_raddr = {NB{ {shp[9:5], shp[4:3]} }};
+        else if (st == S_PEEL_BUF_RUN)           // PeelBuffers: read-ahead chunk
+            pr_raddr = {NB{pb_rd}};
+
+        // ---- WRITE port ----
+        if (st == S_CLEAR_WR) begin              // CLEAR: {bg depth, bg tag} all banks
+            pr_we    = {NB{1'b1}};
+            pr_waddr = {NB{cl_i}};
+            for (cw = 0; cw < NB; cw = cw + 1) begin
+                pr_wdata[PEEL_W*cw + PW_DEPTH  +: 32] = regs.isp_backgnd_d;
+                pr_wdata[PEEL_W*cw + PW_TAG    +: 32] = regs.isp_backgnd_t;
+                // depth2/tag2/valid are don't-care for OP; PeelBuffers sets them.
+            end
+        end else if (st == S_PEEL_BUF_RUN && pb_pipe) begin
+            // PeelBuffers(FLT_MAX,0) transform of the read-back chunk (pr_rdata):
+            //   depth2 <- depth ; tag2 <- tag (or 0xFFFFFFFF on the tile's FIRST
+            //   PeelBuffers, folding refsw SetTagToMax) ; depth <- FLT_MAX ;
+            //   valid <- 0. (dt_pt is a reg, cleared in the FSM.)
+            pr_we    = {NB{1'b1}};
+            pr_waddr = {NB{pb_i}};
+            for (cw = 0; cw < NB; cw = cw + 1) begin
+                pr_wdata[PEEL_W*cw + PW_DEPTH  +: 32] = FLT_MAX;
+                pr_wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = pr_depth(pr_rdata, cw);
+                pr_wdata[PEEL_W*cw + PW_TAG    +: 32] = pr_tag  (pr_rdata, cw);
+                pr_wdata[PEEL_W*cw + PW_TAG2   +: 32] =
+                    first_peel ? 32'hFFFFFFFF : pr_tag(pr_rdata, cw);
+                pr_wdata[PEEL_W*cw + PW_VALID]        = 1'b0;
+            end
+        end else if (b_valid) begin              // stage B: depth-cmp write-back
+            pr_waddr = pr_pack_addr(b_oy, b_ox);
+            for (cw = 0; cw < NB; cw = cw + 1) begin
+                if (b_inside[cw]) begin
+                    if (b_peeling) begin
+                        // layer-peel accept: zb<-invW, pb<-tag, valid<-1.
+                        if (ras_pass_lp[cw]) begin
+                            pr_we[cw] = 1'b1;
+                            pr_wdata[PEEL_W*cw + PW_DEPTH  +: 32] = b_invw_lane(cw);
+                            pr_wdata[PEEL_W*cw + PW_TAG    +: 32] = b_tag;
+                            pr_wdata[PEEL_W*cw + PW_VALID]        = 1'b1;
+                            // preserve depth2/tag2 (reference for this pass)
+                            pr_wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = pr_depth2(pr_rdata, cw);
+                            pr_wdata[PEEL_W*cw + PW_TAG2   +: 32] = pr_tag2  (pr_rdata, cw);
+                        end
+                    end else begin
+                        // opaque accept: DepthMode pass -> tag<-tag, depth<-invW
+                        // (unless ZWriteDis). preserve the rest.
+                        if (ras_pass_op[cw]) begin
+                            pr_we[cw] = 1'b1;
+                            pr_wdata[PEEL_W*cw + PW_DEPTH  +: 32] =
+                                b_zwdis ? pr_depth(pr_rdata, cw) : b_invw_lane(cw);
+                            pr_wdata[PEEL_W*cw + PW_TAG    +: 32] = b_tag;
+                            pr_wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = pr_depth2(pr_rdata, cw);
+                            pr_wdata[PEEL_W*cw + PW_TAG2   +: 32] = pr_tag2  (pr_rdata, cw);
+                            pr_wdata[PEEL_W*cw + PW_VALID]        = pr_valid (pr_rdata, cw);
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    // ============ COMBINATIONAL color-RAM control ============
+    //   READ  port: blend stage CA (cb read of out_id) | FLUSH read (fw_i).
+    //   WRITE port: blend stage CB (cb_valid -> col_ram[cb_id] <- blend_out).
+    // Barriers serialize shade vs FLUSH, so the read port is uncontended.
+    always @(*) begin
+        cr_we    = 1'b0;
+        cr_waddr = 10'd0;
+        cr_wdata = 32'd0;
+        cr_raddr = 10'd0;
+
+        // ---- READ port ----
+        if (pp_out_valid && !pp_stall)           // stage CA: pre-read dst for out_id
+            cr_raddr = pp_out_id;
+        else if (st == S_FLUSH_RD || st == S_FLUSH_WR)
+            cr_raddr = fw_i;                     // FLUSH: hold pixel address
+
+        // ---- WRITE port ----
+        if (cb_valid) begin                      // stage CB: blended pixel write-back
+            cr_we    = 1'b1;
+            cr_waddr = cb_id;
+            cr_wdata = pp_blend_out;
+        end
+    end
 
     always @(posedge clk) begin
         if (reset) begin
@@ -686,6 +870,8 @@ module peel_core import tsp_pkg::*; (
             eq_head<=0; eq_tail<=0; eq_count<=0;
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
+            b_valid<=1'b0; cb_valid<=1'b0;
+            cl_i<=7'd0; pb_i<=7'd0; pb_rd<=7'd0; pb_pipe<=1'b0; first_peel<=1'b0;
             for (i = 0; i < PC_N; i = i + 1) pc_valid[i] = 1'b0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0;
@@ -694,41 +880,55 @@ module peel_core import tsp_pkg::*; (
             eq_push = 1'b0;
             // fbw_req is driven COMBINATIONALLY (see the FLUSH write block below).
 
-            // -------- streamed rasterizer CONSUMER (runs every cycle) --------
+            // ============ streamed rasterizer CONSUMER: stage A -> stage B ============
+            // Stage A (ras_out_valid): the combinational peel-RAM read of chunk
+            // {ras_oy,ras_ox} is already presented; latch the result fields for the
+            // compare next cycle. Stage B (b_valid): the combinational RAM block runs
+            // the depth compare off pr_rdata and writes the passing lanes back to the
+            // peel RAM. Here in stage B we also write the dt_pt REG (kept out of the
+            // RAM) and accumulate more_to_draw (moved off the old combinational path).
+            b_valid <= 1'b0;
             if (ras_out_valid) begin
+                b_valid  <= 1'b1;
+                b_inside <= ras_inside;
+                b_invw   <= ras_invw_flat;
+                b_ox     <= ras_ox;
+                b_oy     <= ras_oy;
+                b_tag    <= tri_tag;
+                b_mode   <= depth_mode;
+                b_zwdis  <= zwrite_dis;
+                b_peeling<= peeling;
+                b_which  <= peel_which;
+            end
+            if (b_valid && b_peeling) begin
                 for (l = 0; l < RAS_LANES; l = l + 1) begin
                     /* verilator lint_off WIDTH */
-                    if (ras_inside[l]) begin
-                        if (peeling) begin
-                            // layer-peel accept: zb<-invW, pb<-tag, valid<-1 (refsw
-                            // AUTOSORT always writes zb on accept, ZWriteDis N/A).
-                            // dt_pt marks whether the winning fragment came from the
-                            // PT list (peel_which==0) so the shade alpha-tests it.
-                            if (ras_pass_lp[l]) begin
-                                dt_depth[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = ras_invw(l);
-                                dt_tag  [{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = tri_tag;
-                                dt_valid[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = 1'b1;
-                                dt_pt   [{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = (peel_which==1'b0);
-                            end
-                            if (ras_more_lp[l]) more_to_draw <= 1'b1;
-                        end else begin
-                            if (ras_pass_op[l]) begin
-                                if (!zwrite_dis)
-                                    dt_depth[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = ras_invw(l);
-                                dt_tag[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = tri_tag;
-                            end
-                        end
+                    if (b_inside[l]) begin
+                        // dt_pt: winning fragment came from PT list (b_which==0).
+                        if (ras_pass_lp[l])
+                            dt_pt[{27'd0,b_oy}*TILE_W + {27'd0,b_ox} + l] = (b_which==1'b0);
+                        // MoreToDraw: another peel pass needed (refsw do..while).
+                        if (ras_more_lp[l]) more_to_draw <= 1'b1;
                     end
                     /* verilator lint_on WIDTH */
                 end
             end
             ras_inflight <= ras_inflight + (ras_in_valid ? 1 : 0) - (ras_out_valid ? 1 : 0);
 
-            // -------- shade pipeline CONSUMER (runs every cycle) --------
-            // a fresh result is present when out_valid && !stall (out_valid holds
-            // through a stall since the whole pipe is frozen).
+            // ============ shade pipeline CONSUMER: blend stage CA -> CB ============
+            // A fresh result is present when out_valid && !stall (out_valid holds
+            // through a stall since the whole pipe is frozen). Stage CA latches the
+            // pixel + snapshots the alpha-test enable (peeling && dt_pt[id], dt_pt is
+            // a reg), presents the col-RAM read of out_id (combi block), and counts it
+            // as drained. Stage CB (cb_valid): cr_rdata = OLD col_buf[id] = dst, the
+            // blend runs combinationally, and the combi block writes col_ram[id].
+            cb_valid <= 1'b0;
             if (pp_out_valid && !pp_stall) begin
-                col_buf[pp_out_id] = pp_blend_out;   // blended (SrcInstr/DstInstr)
+                cb_valid <= 1'b1;
+                cb_id    <= pp_out_id;
+                cb_argb  <= pp_out_argb;
+                cb_tsp   <= pp_out_tsp;
+                cb_at_en <= peeling && dt_pt[pp_out_id];   // PT alpha-test enable
                 sh_out_n <= sh_out_n + 1;
             end
 
@@ -749,19 +949,16 @@ module peel_core import tsp_pkg::*; (
                 t_ybase <= i2f({10'd0, cur_ty} * 16'd32);
                 case (ra_out.state)
                 // CLEAR touches the whole tile buffer: BARRIER first (consumer of
-                // the previous state must be fully done).
+                // the previous state must be fully done). The M10K CLEAR is a 128-
+                // chunk write walk (S_CLEAR_WR) instead of a single-cycle for-loop.
                 RSTATE_CLEAR: if (consumer_idle && fq_empty) begin
                     // as tile_engine_top TILE_CLEAR: {bg depth, bg CoreTag}. Every
                     // pixel's tag = background tag and is "valid" for OP shading
                     // (refsw ClearBuffers sets tagStatus.valid=true), so the OP
                     // shade fills col_buf with the background color.
-                    for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
-                        dt_depth[i] = regs.isp_backgnd_d;
-                        dt_tag[i]   = regs.isp_backgnd_t;
-                    end
                     op_shaded <= 1'b0;   // OP shade not yet run for this tile
                     has_pt <= 1'b0; has_tr <= 1'b0;   // PT/TL lists for this tile: none yet
-                    ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
+                    cl_i <= 7'd0; st <= S_CLEAR_WR;
                 end
                 // OPAQUE: single pass, plain DepthMode compare (no peeling).
                 RSTATE_OP: begin
@@ -799,11 +996,18 @@ module peel_core import tsp_pkg::*; (
                             st <= S_PEEL_INIT;
                         end
                     end else begin
-                        fw_i <= 10'd0; st <= S_FLUSH_WR;
+                        fw_i <= 10'd0; st <= S_FLUSH_RD;   // prime col-RAM read of px 0
                     end
                 end
                 default: begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
                 endcase
+            end
+
+            // CLEAR write walk: the combi block writes background {depth,tag} to all
+            // 8 banks at address cl_i each cycle; here we just walk cl_i 0..127.
+            S_CLEAR_WR: begin
+                if (cl_i == 7'd127) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
+                else cl_i <= cl_i + 7'd1;
             end
 
             // S_OL_RUN: PRODUCER - push each OL entry into the entry FIFO (eq) and
@@ -863,49 +1067,59 @@ module peel_core import tsp_pkg::*; (
             // which PeelBuffers copies to the reference zb2. Note: this discards the
             // OP tags in dt_tag, but the OP shade already ran (col_buf holds it), so
             // dt_tag is only used as the peel pending tag from here on.
+            // refsw SetTagToMax() is FOLDED into the first PeelBuffers of this tile
+            // (see S_PEEL_BUF_RUN + the combi block): instead of a separate walk
+            // writing dt_tag=0xFFFFFFFF then copying A->B, the first PeelBuffers
+            // writes tag2 <- 0xFFFFFFFF directly (first_peel), while still copying
+            // depth2 <- depth (the OP depth reference). Net pass-1 state is identical:
+            // pb2 = 0xFFFFFFFF, zb2 = OP depth.
             S_PEEL_INIT: begin
-                peeling   <= 1'b1;   // (pre-peel OP shade may have cleared it)
-                peel_pass <= 8'd0;   // reset the pass counter for THIS tile's peel
-                // refsw SetTagToMax(): tagBufferA(dt_tag) = 0xFFFFFFFF so pass-1 pb2
-                // (=copy of A) is 0xFFFFFFFF, not the OP tags. dt_depth still holds
-                // the OP depth -> pass-1 reference (copied in S_PEEL_BUF).
-                for (i = 0; i < TILE_W*TILE_H; i = i + 1)
-                    dt_tag[i] = 32'hFFFFFFFF;
+                peeling    <= 1'b1;  // (pre-peel OP shade may have cleared it)
+                peel_pass  <= 8'd0;  // reset the pass counter for THIS tile's peel
+                first_peel <= 1'b1;  // fold SetTagToMax into the first PeelBuffers
                 st <= S_PEEL_BUF;
             end
 
-            // PeelBuffers(FLT_MAX, 0): copy depthA->depthB and tagA->tagB (the
-            // reference for this pass), then clear depthA to FLT_MAX and clear the
-            // per-pixel valid bit. Then re-issue the TR/PT object list for a pass.
-            // PeelBuffers(FLT_MAX, 0): reference <- (pass 1: opaque snapshot; later:
-            // live), clear depthA to FLT_MAX + clear valid. Then rasterize BOTH the
-            // PT list and the TL list into the same buffers this pass (PT first), so
-            // PT and TL fragments sort together back-to-front.
-            // PeelBuffers(FLT_MAX,0): reference (zb2) <- live dt_depth, then clear
-            // dt_depth to FLT_MAX. On pass 1 dt_depth holds the OP/opaque result
-            // (the peel runs at FLUSH, after OP, and nothing clobbers dt_depth in
-            // between); later passes it holds the previous pass's closest layer. So
+            // PeelBuffers(FLT_MAX, 0): per pixel depth2<-depth, tag2<-tag (or
+            // 0xFFFFFFFF on pass 1 via first_peel), depth<-FLT_MAX, valid<-0. As an
+            // M10K RMW this is a read(A chunk N)->write(B transformed chunk N-1) walk
+            // over 128 chunk addresses (S_PEEL_BUF_RUN). dt_pt is a reg: cleared here
+            // in one cycle (else a stale PT flag fires the alpha test on TR pixels).
+            // On pass 1 dt_depth holds the OP result (nothing clobbers it between OP
+            // and the peel); later passes it holds the previous pass's closest layer;
             // copying live dt_depth every pass is correct - no snapshot needed.
             S_PEEL_BUF: begin
-                for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
-                    dt_depth2[i] = dt_depth[i];
-                    dt_tag2[i]   = dt_tag[i];
-                    dt_depth[i]  = FLT_MAX;
-                    dt_valid[i]  = 1'b0;
-                    dt_pt[i]     = 1'b0;   // clear per pass (else stale PT flag fires
-                                           // the alpha test on TR pixels)
-                end
+                for (i = 0; i < TILE_W*TILE_H; i = i + 1)
+                    dt_pt[i] = 1'b0;
                 more_to_draw <= 1'b0;
-                peel_pass <= peel_pass + 8'd1;
-                // start with the PT list if present, else the TL list.
-                if (has_pt) begin
-                    peel_which <= 1'b0;                 // rasterizing PT list
-                    ol_list_ptr <= pt_ptr_l; ol_start <= 1'b1;
+                pb_rd   <= 7'd0;     // read-ahead chunk
+                pb_i    <= 7'd0;     // write chunk (1 behind read once primed)
+                pb_pipe <= 1'b0;     // stage-B not yet primed
+                st <= S_PEEL_BUF_RUN;
+            end
+
+            // PeelBuffers RMW walk: the combi block presents the READ of chunk pb_rd
+            // and (when pb_pipe) WRITES the transformed chunk pb_i (= previous pb_rd,
+            // whose data is now in pr_rdata). Advance read, delay write by one, finish
+            // after the last chunk (127) has been written back.
+            S_PEEL_BUF_RUN: begin
+                pb_pipe <= 1'b1;
+                pb_i    <= pb_rd;
+                if (pb_pipe && pb_i == 7'd127) begin
+                    // whole tile transformed -> issue the object list for this pass.
+                    first_peel <= 1'b0;
+                    peel_pass  <= peel_pass + 8'd1;
+                    // start with the PT list if present, else the TL list.
+                    if (has_pt) begin
+                        peel_which <= 1'b0;                 // rasterizing PT list
+                        ol_list_ptr <= pt_ptr_l; ol_start <= 1'b1;
+                    end else begin
+                        peel_which <= 1'b1;                 // TL list
+                        ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
+                    end
                     st <= S_OL_RUN;
-                end else begin
-                    peel_which <= 1'b1;                 // TL list
-                    ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
-                    st <= S_OL_RUN;
+                end else if (pb_rd != 7'd127) begin
+                    pb_rd <= pb_rd + 7'd1;
                 end
             end
 
@@ -916,21 +1130,28 @@ module peel_core import tsp_pkg::*; (
                     st <= S_PEEL_BUF;
                 end else begin
                     peeling <= 1'b0;
-                    fw_i <= 10'd0; st <= S_FLUSH_WR;
+                    fw_i <= 10'd0; st <= S_FLUSH_RD;   // prime col-RAM read of px 0
                 end
             end
 
-            // FLUSH writeout: STREAM the accumulation buffer (col_buf) to the
-            // framebuffer at ONE PIXEL PER CYCLE. fbw_req is driven COMBINATIONALLY
-            // (see the fb-write block above) from fw_i; here we only ADVANCE fw_i,
-            // and only when the pixel is consumed (fw_pix_consumed): on-screen pixel
-            // accepted (we && !busy) OR an off-screen pixel (skipped). A busy on-
-            // screen pixel HOLDS fw_i so the combinational fbw_req keeps presenting
-            // it -> works with a real controller that blocks.
+            // FLUSH read: prime the col-RAM read of pixel fw_i (combi block presents
+            // cr_raddr=fw_i); cr_rdata is valid next cycle in S_FLUSH_WR.
+            S_FLUSH_RD: st <= S_FLUSH_WR;
+
+            // FLUSH writeout: STREAM the accumulation buffer (col_ram) to the
+            // framebuffer at ONE PIXEL PER CYCLE. fbw_req.argb comes from cr_rdata
+            // (the registered read of fw_i, held stable while fw_i holds); here we
+            // only ADVANCE fw_i, and only when the pixel is consumed (fw_pix_consumed):
+            // on-screen pixel accepted (we && !busy) OR an off-screen pixel (skipped).
+            // A busy on-screen pixel HOLDS fw_i so the combinational fbw_req keeps
+            // presenting it -> works with a real controller that blocks. When fw_i
+            // advances, the combi read of the NEW fw_i is presented THIS cycle, so
+            // cr_rdata is ready next cycle: stay in S_FLUSH_WR (the just-consumed
+            // pixel is done; the next pixel's data lands before we re-present it).
             S_FLUSH_WR: begin
                 if (fw_pix_consumed) begin
                     if (fw_i == 10'd1023) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
-                    else fw_i <= fw_i + 10'd1;
+                    else begin fw_i <= fw_i + 10'd1; st <= S_FLUSH_RD; end
                 end
             end
 
@@ -946,16 +1167,23 @@ module peel_core import tsp_pkg::*; (
 
             // PRODUCER: resolve pixel shp's planes (plane cache; miss = fetch +
             // tsp_setup) then present it to the pipelined shader. The CONSUMER
-            // (top of the always block) writes results into col_buf by id. In PEEL
-            // mode, pixels not staged this pass (dt_valid==0) are skipped.
-            SH_PIX: begin
-                if (shade_mode && !dt_valid[shp]) begin
+            // (blend stages CA/CB) writes results into col_ram by id. In PEEL mode,
+            // pixels not staged this pass (dt_valid==0) are skipped.
+            //
+            // The peel buffers are now M10K (registered read): SH_PIX only PRESENTS
+            // the read of pixel shp's chunk (combi block, pr_raddr for st==SH_PIX);
+            // SH_RD (next cycle) samples pr_rdata lane shp[2:0] for valid/tag/depth.
+            // shp does not change between SH_PIX and SH_RD, so shp[2:0] is stable.
+            SH_PIX: st <= SH_RD;
+
+            SH_RD: begin
+                if (shade_mode && !pr_valid(pr_rdata, shp[2:0])) begin
                     // skip: nothing staged for this pixel this pass
                     if (shp == 10'd1023) st <= SH_DRAIN;
-                    else shp <= shp + 10'd1;
+                    else begin shp <= shp + 10'd1; st <= SH_PIX; end
                 end else begin
-                    sh_tag  <= dt_tag[shp];
-                    sh_invw <= dt_depth[shp];
+                    sh_tag     <= pr_tag  (pr_rdata, shp[2:0]);
+                    sh_invw    <= pr_depth(pr_rdata, shp[2:0]);
                     sh_pending <= sh_pending + 1;
                     st <= SH_LOOK;
                 end
@@ -1116,8 +1344,11 @@ module peel_core import tsp_pkg::*; (
             end
 
             // all presented pixels drained: return to the caller (shade_ret).
-            // The framebuffer writeout happens later at RSTATE_FLUSH.
-            SH_DRAIN: if (sh_out_n >= sh_pending) begin
+            // sh_out_n counts blend stage-CA events; also wait !cb_valid so the
+            // trailing stage-CB col_ram write lands before the next phase (peel pass
+            // reads col via the blend dst, or FLUSH reads col_ram). The framebuffer
+            // writeout happens later at RSTATE_FLUSH.
+            SH_DRAIN: if (sh_out_n >= sh_pending && !cb_valid) begin
                 st <= shade_ret;
             end
 
@@ -1228,7 +1459,11 @@ module peel_core import tsp_pkg::*; (
                     ras_x <= ras_x + 5'(RAS_LANES);
                 end
             end
-            RS_DRAIN: if (ras_inflight==0 && !ras_in_valid && !ras_out_valid) rs_st<=RS_IDLE;
+            // also wait for the depth-cmp write-back (stage B, b_valid) to land, else
+            // the NEXT triangle's stage-A read races this triangle's last stage-B
+            // write to the same peel-RAM word (RAW -> stale depth -> corruption).
+            RS_DRAIN: if (ras_inflight==0 && !ras_in_valid && !ras_out_valid
+                          && !b_valid) rs_st<=RS_IDLE;
             endcase
 
             // ---- FIFO count maintenance (single update; push/pop may coincide) ----
