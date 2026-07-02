@@ -275,8 +275,9 @@ module peel_core import tsp_pkg::*; (
     //  - opaque path: isp_depth_cmp (DepthMode) -> ras_pass_op
     //  - peel   path: isp_depth_cmp_lp          -> ras_pass_lp + ras_more_lp
     wire [RAS_LANES-1:0] ras_pass_op, ras_pass_lp, ras_more_lp;
+    genvar gd;   // declared out-of-line (Quartus Standard rejects inline for-genvar)
     generate
-        for (genvar gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
+        for (gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
             isp_depth_cmp u_cmp (
                 .mode(depth_mode),
                 .nw  (ras_invw_flat[32*gd +: 32]),

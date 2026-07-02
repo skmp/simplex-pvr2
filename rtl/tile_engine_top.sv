@@ -425,8 +425,9 @@ module tile_engine_top import tsp_pkg::*; #(
     // opaque DepthMode compare per rasterizer lane: does the lane's new invW
     // pass against the stored depth in its bank? (isp_depth_cmp, refsw modes)
     wire [RAS_LANES-1:0] ras_pass;
+    genvar gd;   // declared out-of-line (Quartus Standard rejects inline for-genvar)
     generate
-        for (genvar gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
+        for (gd = 0; gd < RAS_LANES; gd = gd + 1) begin : dcmp
             isp_depth_cmp u_cmp (
                 .mode(depth_mode),
                 .nw  (ras_invw_flat[32*gd +: 32]),
