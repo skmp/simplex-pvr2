@@ -30,30 +30,36 @@ module tex_uv2texel (
     // (1.m << (e-127+shift+8)) >> ... i.e. place the leading 1 at bit
     // (e-127+shift+8). We form a wide value and shift.
     // shift_u = 11+texu, shift_v = 11+texv. Max e-127+shift+8 ~ up to ~30.
-    function [26:0] to_fixed(input [31:0] f, input [4:0] shift);
+    // float -> SIGNED Q19.8 fixed. Negatives are preserved (two's complement):
+    // refsw computes `int ui = u*sizeU*256` and then `ui>>8` (arith) + ClampFlip,
+    // so negative UVs WRAP correctly (they don't clamp to 0). Zeroing negatives
+    // here breaks wrap-mode textures (e.g. daytona road with V ~ -6..-8).
+    function signed [26:0] to_fixed(input [31:0] f, input [4:0] shift);
         reg [7:0] e; reg signed [9:0] p; reg [23:0] sig; reg [55:0] wide;
+        reg signed [26:0] mag;
         begin
-            if (f[31] || f[30:23]==8'd0) to_fixed = 27'd0;      // neg/zero -> 0
+            if (f[30:23]==8'd0) to_fixed = 27'sd0;              // zero/denormal -> 0
             else begin
                 e   = f[30:23];
                 sig = {1'b1, f[22:0]};                          // 1.m (24b, .23)
-                // ui = u * sizeU * 256 = u * 2^(11+TexU) = shift. The *256 is the
-                // 8 fraction bits, already inside `shift`. So:
-                //   ui = sig * 2^(e-127-23+shift)
+                //   |ui| = sig * 2^(e-127-23+shift)
                 p = $signed({2'b0,e}) - 10'sd127 - 10'sd23 + $signed({5'b0,shift});
                 wide = {32'd0, sig};
                 if (p >= 0) wide = wide << p[5:0];
                 else        wide = wide >> (-p);
-                to_fixed = wide[26:0];       // ui = texel<<8 (Q19.8)
+                mag = wide[26:0];              // |ui| in Q19.8
+                to_fixed = f[31] ? -mag : mag; // apply sign (two's complement)
             end
         end
     endfunction
 
-    wire [26:0] ui = to_fixed(u, {2'b0,texu} + 5'd11);
-    wire [26:0] vi = to_fixed(v, {2'b0,texv} + 5'd11);
+    wire signed [26:0] ui = to_fixed(u, {2'b0,texu} + 5'd11);
+    wire signed [26:0] vi = to_fixed(v, {2'b0,texv} + 5'd11);
 
-    wire [18:0] uint = ui[26:8];         // ui>>8
-    wire [18:0] vint = vi[26:8];
+    // arithmetic >>8 (floors toward -inf, matching refsw int shift); the low 8
+    // bits are the (positive) fraction even for negative ui, as refsw's `ui&255`.
+    wire signed [18:0] uint = ui >>> 8;
+    wire signed [18:0] vint = vi >>> 8;
     assign ufrac = ui[7:0];
     assign vfrac = vi[7:0];
 
@@ -78,10 +84,10 @@ module tex_uv2texel (
         end
     endfunction
 
-    wire signed [20:0] u0 = {2'b0, uint};
-    wire signed [20:0] u1 = {2'b0, uint} + 21'sd1;
-    wire signed [20:0] v0 = {2'b0, vint};
-    wire signed [20:0] v1 = {2'b0, vint} + 21'sd1;
+    wire signed [20:0] u0 = 21'(signed'(uint));      // sign-extend
+    wire signed [20:0] u1 = 21'(signed'(uint)) + 21'sd1;
+    wire signed [20:0] v0 = 21'(signed'(vint));
+    wire signed [20:0] v1 = 21'(signed'(vint)) + 21'sd1;
 
     assign c00u = clampflip(clampu,flipu,u1,sizeU); assign c00v = clampflip(clampv,flipv,v1,sizeV);
     assign c01u = clampflip(clampu,flipu,u0,sizeU); assign c01v = clampflip(clampv,flipv,v1,sizeV);

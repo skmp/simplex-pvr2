@@ -21,15 +21,17 @@ int main(int c,char**v){
     Verilated::commandArgs(c,v);
     auto*d=new Vtex_uv2texel;
     int fails=0,total=0;
-    // all 16 clamp/flip combos, 64 random (u,v,texu,texv) each
+    // all 16 clamp/flip combos, 96 random (u,v,texu,texv) each - INCLUDING
+    // negative and large UVs (wrap/flip must handle negatives: e.g. daytona road
+    // has V ~ -6..-8; the float->fixed step must NOT clamp negatives to 0).
     for(int mode=0;mode<16;mode++){
       int clampu=(mode>>0)&1, clampv=(mode>>1)&1, flipu=(mode>>2)&1, flipv=(mode>>3)&1;
-      for(int i=0;i<64;i++){
+      for(int i=0;i<96;i++){
         int texu=rnd()%8, texv=rnd()%8;
         int sizeU=8<<texu, sizeV=8<<texv;
-        // random u,v in [0,~2) so coords land in and slightly beyond range
-        float fu = (float)(rnd()%2048)/1024.0f;   // 0..~2
-        float fv = (float)(rnd()%2048)/1024.0f;
+        // u,v in [-16, +16): spans negatives, sub-1, and many wrap periods.
+        float fu = (float)((int)(rnd()%32768) - 16384)/1024.0f;  // -16..~16
+        float fv = (float)((int)(rnd()%32768) - 16384)/1024.0f;
         d->u=f2b(fu); d->v=f2b(fv); d->texu=texu; d->texv=texv;
         d->clampu=clampu; d->clampv=clampv; d->flipu=flipu; d->flipv=flipv; d->eval();
 
