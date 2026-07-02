@@ -163,6 +163,12 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
     reg [31:0] dt_depth2[0:TILE_W*TILE_H-1];   // reference invW  (depthBufferB / zb2)
     reg [31:0] dt_tag2  [0:TILE_W*TILE_H-1];   // last-rendered   (tagBufferB   / pb2)
     reg        dt_valid [0:TILE_W*TILE_H-1];   // staged-this-pass (tagStatus.valid)
+    reg        dt_pt    [0:TILE_W*TILE_H-1];   // winning peel fragment came from PT list
+    // Opaque-depth snapshot: refsw2 keeps depthBufferA (the OP/background depth)
+    // intact between peel regions; each peel region's PASS-1 reference (zb2) is that
+    // depth, NOT the FLT_MAX a previous peel region left behind. We snapshot it once
+    // the OP result is known and copy it into zb2 on peel pass 1.
+    reg [31:0] dt_depth_op[0:TILE_W*TILE_H-1];
     reg [31:0] col_buf  [0:TILE_W*TILE_H-1];   // shaded ARGB per tile pixel
 
     localparam [31:0] FLT_MAX = 32'h7F7FFFFF;  // refsw PeelBuffers depth clear value
@@ -406,6 +412,13 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
     // TSP.SrcInstr = tsp[31:29], TSP.DstInstr = tsp[28:26] (see tsp_pkg tsp_t).
     wire [2:0]   pp_src_instr = pp_out_tsp[31:29];
     wire [2:0]   pp_dst_instr = pp_out_tsp[28:26];
+    // PT punch-through alpha test: enabled only while shading a PT region. A texel
+    // with alpha < PT_ALPHA_REF becomes a hole (alpha->0, no contribution) so the
+    // back-to-front PT peel + blend produces the correct cutout (refsw BlendingUnit
+    // pp_AlphaTest). TR regions never alpha-test here.
+    // alpha-test only during peel passes, and only for pixels whose winning fragment
+    // came from the PT list (dt_pt). PT: alpha<ref -> hole, else fully opaque.
+    wire         pp_blend_at_en = peeling && dt_pt[pp_out_id];
     wire [31:0]  pp_blend_out;
     wire         pp_blend_at;
     tsp_blend u_blend (
@@ -413,8 +426,8 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
         .dst       (col_buf[pp_out_id]),
         .src_instr (pp_src_instr),
         .dst_instr (pp_dst_instr),
-        .alpha_test(1'b0),
-        .alpha_ref (8'd0),
+        .alpha_test(pp_blend_at_en),
+        .alpha_ref (regs.pt_alpha_ref[7:0]),
         .out       (pp_blend_out),
         .at_pass   (pp_blend_at));
 
@@ -435,20 +448,23 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
                FH_ISP=18, FH_ISPW=19, FH_TSPW=20, FH_TCWW=21,
                FV_RD=22, FV_W=23,
                TSP_RUN=24, SH_PRESENT=25, SH_DRAIN=26, SH_OUT=27,
-               // layer-peel pass loop (PT/TR): init pb2, PeelBuffers, run, check
+               // unified PT+TL peel loop: init pb2, PeelBuffers, run, check
                S_PEEL_INIT=28, S_PEEL_BUF=29, S_PEEL_CHK=30,
-               // shared shade sub-phase entry + OP-done return
-               S_SHADE_START=31, S_OP_DONE=32;
+               // shared shade sub-phase entry + OP-done return + FLUSH writeout
+               S_SHADE_START=31, S_OP_DONE=32, S_FLUSH_WR=33;
     reg [5:0] st;
 
     // consumer sub-FSMs
     localparam SU_IDLE=0, SU_RUN=1;              reg su_st;
     localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;  reg [1:0] rs_st;
 
-    // ---- layer-peel pass loop (TB-FSM driven; refsw do..while(GetMoreToDraw)) ----
+    // ---- unified PT+TL layer-peel pass loop (TB-FSM; refsw do..while(MoreToDraw)) ----
     reg        more_to_draw;      // set by the raster consumer during a peel pass
     reg        op_shaded;         // OP shade (background/opaque -> col_buf) done this tile
-    reg [31:0] peel_list_ptr;     // held TR/PT list pointer, re-issued each pass
+    reg        op_snapped;        // opaque-depth snapshot taken this tile (dt_depth_op)
+    reg [31:0] pt_ptr_l, tr_ptr_l;// latched PT / TL list pointers for this tile
+    reg        has_pt,  has_tr;   // this tile has a PT / TL list
+    reg        peel_which;        // 0 = rasterizing PT list, 1 = TL list (this pass)
     reg [7:0]  peel_pass;         // pass counter (safety bound)
     localparam integer PEEL_MAX_PASS = 64;
 
@@ -526,6 +542,7 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
             fq_head<=0; fq_tail<=0; fq_count<=0;
             eq_head<=0; eq_tail<=0; eq_count<=0; it_cst<=IT_IDLE;
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
+            op_snapped<=1'b0; has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
             for (i = 0; i < PC_N; i = i + 1) pc_valid[i] = 1'b0;
         end else begin
             done<=0; ra_start<=0; ol_start<=0; it_start<=0;
@@ -541,10 +558,13 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
                         if (peeling) begin
                             // layer-peel accept: zb<-invW, pb<-tag, valid<-1 (refsw
                             // AUTOSORT always writes zb on accept, ZWriteDis N/A).
+                            // dt_pt marks whether the winning fragment came from the
+                            // PT list (peel_which==0) so the shade alpha-tests it.
                             if (ras_pass_lp[l]) begin
                                 dt_depth[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = ras_invw(l);
                                 dt_tag  [{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = tri_tag;
                                 dt_valid[{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = 1'b1;
+                                dt_pt   [{27'd0,ras_oy}*TILE_W + {27'd0,ras_ox} + l] = (peel_which==1'b0);
                             end
                             if (ras_more_lp[l]) more_to_draw <= 1'b1;
                         end else begin
@@ -596,6 +616,8 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
                         dt_tag[i]   = regs.isp_backgnd_t;
                     end
                     op_shaded <= 1'b0;   // OP shade not yet run for this tile
+                    op_snapped <= 1'b0;  // opaque-depth snapshot invalid until first peel
+                    has_pt <= 1'b0; has_tr <= 1'b0;   // PT/TL lists for this tile: none yet
                     ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
                 end
                 // OPAQUE: single pass, plain DepthMode compare (no peeling).
@@ -605,38 +627,37 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
                     ol_start <= 1'b1;
                     st <= S_OL_RUN;
                 end
-                // PT / TR: layer-peeling. PT is treated as TR for now. Enter the
-                // multi-pass peel loop (BARRIER first: consumer idle, FIFOs empty).
-                // If the OP shade hasn't run for this tile (e.g. translucent-only
-                // tile), run it first so col_buf holds the background/opaque image
-                // that the translucent layers blend over (refsw always calls
-                // RenderParamTags<OPAQUE> before the peel loop).
-                RSTATE_PT, RSTATE_TR: if (consumer_idle && fq_empty) begin
-                    peel_list_ptr <= ra_out.list_ptr;
-                    peel_pass     <= 8'd0;
-                    if (!op_shaded) begin
-                        peeling    <= 1'b0;          // OP-style shade (all pixels)
-                        shade_mode <= 1'b0;
-                        op_shaded  <= 1'b1;
-                        shade_ret  <= S_PEEL_INIT;   // then enter the peel loop
-                        st <= S_SHADE_START;
-                    end else begin
-                        peeling <= 1'b1;
-                        st <= S_PEEL_INIT;
-                    end
-                end
-                // FLUSH: shading already happened after OP and each peel pass into
-                // col_buf (the accumulation buffer). Just copy col_buf -> fb.
-                RSTATE_FLUSH: if (consumer_idle && fq_empty) begin
-                    for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
-                        /* verilator lint_off WIDTH */
-                        px = {26'd0, cur_tx}*32 + (i % TILE_W);
-                        py = {26'd0, cur_ty}*32 + (i / TILE_W);
-                        /* verilator lint_on WIDTH */
-                        if (px < 640 && py < 480)
-                            fb[py*640 + px] = col_buf[i];
-                    end
+                // PT / TR: just LATCH the list pointer + present flag and ack. The
+                // UNIFIED peel (both lists together, back-to-front) runs at FLUSH so
+                // PT fragments (opaque-or-hole via alpha test) correctly occlude TL
+                // fragments behind them within the same peel passes.
+                RSTATE_PT: begin
+                    pt_ptr_l  <= ra_out.list_ptr; has_pt <= 1'b1;
                     ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
+                end
+                RSTATE_TR: begin
+                    tr_ptr_l  <= ra_out.list_ptr; has_tr <= 1'b1;
+                    ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
+                end
+                // FLUSH: (1) if any PT/TL geometry, run the unified peel now (blends
+                // into col_buf); (2) then copy col_buf -> fb.
+                RSTATE_FLUSH: if (consumer_idle && fq_empty) begin
+                    if (has_pt || has_tr) begin
+                        // ensure the OP/background shade ran so col_buf is the base
+                        // image the peel layers blend over.
+                        if (!op_shaded) begin
+                            peeling    <= 1'b0;
+                            shade_mode <= 1'b0;
+                            op_shaded  <= 1'b1;
+                            shade_ret  <= S_PEEL_INIT;
+                            st <= S_SHADE_START;
+                        end else begin
+                            peeling <= 1'b1;
+                            st <= S_PEEL_INIT;
+                        end
+                    end else begin
+                        st <= S_FLUSH_WR;
+                    end
                 end
                 default: begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
                 endcase
@@ -671,9 +692,17 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
             //  - peel: run the peel shade sub-phase, then decide whether to peel again.
             S_DRAIN: if (fq_empty && consumer_idle) begin
                 if (peeling) begin
-                    shade_mode <= 1'b1;          // PEEL: shade only valid pixels
-                    shade_ret  <= S_PEEL_CHK;
-                    st <= S_SHADE_START;
+                    // Unified peel: after the PT list, rasterize the TL list into the
+                    // same buffers (if present) BEFORE shading, so both sort together.
+                    if (peel_which==1'b0 && has_tr) begin
+                        peel_which <= 1'b1;
+                        ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
+                        st <= S_OL_RUN;
+                    end else begin
+                        shade_mode <= 1'b1;      // PEEL: shade only valid pixels
+                        shade_ret  <= S_PEEL_CHK;
+                        st <= S_SHADE_START;
+                    end
                 end else begin
                     shade_mode <= 1'b0;          // OP: shade every pixel
                     shade_ret  <= S_OP_DONE;
@@ -693,6 +722,15 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
             // dt_tag is only used as the peel pending tag from here on.
             S_PEEL_INIT: begin
                 peeling <= 1'b1;   // (pre-peel OP shade may have cleared it)
+                // Snapshot the opaque/background depth ONCE per tile, on the first
+                // peel region. Later peel regions on the same tile must reuse THIS
+                // snapshot as their pass-1 reference (dt_depth has been clobbered to
+                // FLT_MAX by the prior region's peel).
+                if (!op_snapped) begin
+                    for (i = 0; i < TILE_W*TILE_H; i = i + 1)
+                        dt_depth_op[i] = dt_depth[i];
+                    op_snapped <= 1'b1;
+                end
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1)
                     dt_tag[i] = 32'hFFFFFFFF;
                 st <= S_PEEL_BUF;
@@ -701,31 +739,54 @@ module frontend_tsp_lp_tb_top import tsp_pkg::*; (
             // PeelBuffers(FLT_MAX, 0): copy depthA->depthB and tagA->tagB (the
             // reference for this pass), then clear depthA to FLT_MAX and clear the
             // per-pixel valid bit. Then re-issue the TR/PT object list for a pass.
+            // PeelBuffers(FLT_MAX, 0): reference <- (pass 1: opaque snapshot; later:
+            // live), clear depthA to FLT_MAX + clear valid. Then rasterize BOTH the
+            // PT list and the TL list into the same buffers this pass (PT first), so
+            // PT and TL fragments sort together back-to-front.
             S_PEEL_BUF: begin
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
-                    dt_depth2[i] = dt_depth[i];
+                    dt_depth2[i] = (peel_pass==8'd0) ? dt_depth_op[i] : dt_depth[i];
                     dt_tag2[i]   = dt_tag[i];
                     dt_depth[i]  = FLT_MAX;
                     dt_valid[i]  = 1'b0;
                 end
                 more_to_draw <= 1'b0;
-                ol_list_ptr <= peel_list_ptr;
-                ol_start <= 1'b1;
                 peel_pass <= peel_pass + 8'd1;
-                st <= S_OL_RUN;
+                // start with the PT list if present, else the TL list.
+                if (has_pt) begin
+                    peel_which <= 1'b0;                 // rasterizing PT list
+                    ol_list_ptr <= pt_ptr_l; ol_start <= 1'b1;
+                    st <= S_OL_RUN;
+                end else begin
+                    peel_which <= 1'b1;                 // TL list
+                    ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
+                    st <= S_OL_RUN;
+                end
             end
 
-            // After a pass's peel-shade drained: if any fragment was deferred
-            // (more_to_draw) and we're under the safety bound, peel again; else
-            // finish this region.
+            // After a pass's peel-shade drained: another peel pass if a fragment was
+            // deferred (more_to_draw) and under the bound; else write out.
             S_PEEL_CHK: begin
                 if (more_to_draw && peel_pass < PEEL_MAX_PASS[7:0]) begin
                     st <= S_PEEL_BUF;
                 end else begin
                     peeling <= 1'b0;
-                    ra_ack.list_done <= 1'b1;
-                    st <= S_RA_ACK;
+                    st <= S_FLUSH_WR;
                 end
+            end
+
+            // FLUSH writeout: copy the accumulation buffer (col_buf) to the 640x480
+            // framebuffer, then ack the FLUSH region.
+            S_FLUSH_WR: begin
+                for (i = 0; i < TILE_W*TILE_H; i = i + 1) begin
+                    /* verilator lint_off WIDTH */
+                    px = {26'd0, cur_tx}*32 + (i % TILE_W);
+                    py = {26'd0, cur_ty}*32 + (i / TILE_W);
+                    /* verilator lint_on WIDTH */
+                    if (px < 640 && py < 480)
+                        fb[py*640 + px] = col_buf[i];
+                end
+                ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
             end
 
             // ---------------- shade sub-phase (shared, ONE tsp pipeline) ----------
