@@ -151,6 +151,13 @@ module isp_setup_min (
 
     wire body = (phase == 2'd0);     // run the scheduled body this clock?
 
+    // early-cull: cull depends only on tri_area's sign + CullMode (isp_word).
+    // Evaluated at c6 (tri_area stable from c5) to short-circuit setup.
+    wire [1:0] ec_cm    = isp_word[28:27];
+    wire       ec_wrong = (ec_cm[0]==1'b0 && fneg(tri_area)) ||
+                          (ec_cm[0]==1'b1 && fpos(tri_area));
+    wire       early_cull = (ec_cm >= 2'd2) && ec_wrong;
+
     always @(posedge clk) begin
         if (reset) begin st<=LOAD; done<=0; rc_req<=0; cyc<=0; phase<=0; end
         else begin
@@ -210,13 +217,22 @@ module isp_setup_min (
                     L2(fneg32(d_X2X1),d_Z3Z1,lc_q,0); // Ba=Ba0-(X2-X1)*(z3-z1)
                     L3(Y2,ONE,YB,1);            // YT2
                 end
-                // c6: store Aa/Ba/YT2; sgn; issue XL3/YT3
+                // c6: store Aa/Ba/YT2; sgn; issue XL3/YT3.
+                // EARLY CULL: the cull decision needs only tri_area's sign (stable
+                // from c5) + CullMode. If this triangle is culled, skip the entire
+                // remaining edge/plane/reciprocal computation (c7..c13, ~28 clocks)
+                // and jump straight to done with cull=1.
                 6: begin
-                    Aa<=lb_q; Ba<=lc_q; YT2<=ld_q;
-                    sgn_neg <= fpos(tri_area);
-                    sgn     <= fpos(tri_area) ? NEG1 : ONE;
-                    L0(X3,ONE,XB,1);            // XL3
-                    L1(Y3,ONE,YB,1);            // YT3
+                    if (early_cull) begin
+                        cull <= 1'b1;
+                        st   <= FIN;
+                    end else begin
+                        Aa<=lb_q; Ba<=lc_q; YT2<=ld_q;
+                        sgn_neg <= fpos(tri_area);
+                        sgn     <= fpos(tri_area) ? NEG1 : ONE;
+                        L0(X3,ONE,XB,1);            // XL3
+                        L1(Y3,ONE,YB,1);            // YT3
+                    end
                 end
                 // c7: WAIT for reciprocal (rc_ack). When ready: store inv, issue
                 //     ddx=-Aa*inv, ddy=-Ba*inv, and the first edge diffs.
