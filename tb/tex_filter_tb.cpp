@@ -5,13 +5,20 @@
 #include <cstdint>
 
 static int ch(uint32_t c,int i){return (c>>(8*i))&0xFF;}
-static int u8_256(int v){return v+(v>>7);}
+static int sat8(int r){return r<0?0:(r>255?255:r);}
+// delta-form lerp, matches tex_filter:  p + ((q-p)*w) >> 8  (w raw 0..255).
+// signed >>8 is arithmetic (toward -inf), same as the RTL >>>8.
+static int lerp8(int p,int q,int w){ int d=q-p; return sat8(p + ((d*w) >> 8)); }
 static uint32_t g_filter(int fm,bool ita,int ufrac,int vfrac,uint32_t t00,uint32_t t01,uint32_t t10,uint32_t t11){
     uint32_t out;
     if(fm==0){ out=t11; }
     else {
-        int ub=u8_256(ufrac), vb=vfrac, nub=256-ub, nvb=256-vb; int r[4];
-        for(int i=0;i<4;i++) r[i]=(ch(t00,i)*ub*vb + ch(t01,i)*nub*vb + ch(t10,i)*ub*nvb + ch(t11,i)*nub*nvb)/65536;
+        int r[4];
+        for(int i=0;i<4;i++){
+            int a=lerp8(ch(t00,i),ch(t01,i),ufrac);   // v+1 row along u: p=t00,q=t01
+            int b=lerp8(ch(t10,i),ch(t11,i),ufrac);   // v+0 row along u: p=t10,q=t11
+            r[i]=lerp8(b,a,vfrac);                    // along v: p=b,q=a
+        }
         out=(r[3]<<24)|(r[2]<<16)|(r[1]<<8)|r[0];
     }
     if(ita) out=(out&0x00FFFFFF)|0xFF000000;
@@ -32,9 +39,8 @@ int main(int c,char**v){
         d->t00=t00;d->t01=t01;d->t10=t10;d->t11=t11;d->eval();
         uint32_t g=g_filter(fm,ita,uf,vf,t00,t01,t10,t11); total++;
         uint32_t hw=d->textel;
-        // both bit-exact now: bilinear uses SOP separable lerps written as the
-        // flat form (p*(256-w)+q*w)>>8, identical to refsw's weighted sum.
-        int tol = fm ? 1 : 0;
+        // bit-exact: golden uses the same delta-form lerp as the RTL.
+        int tol = 0;
         bool ok=true;
         for(int cci=0;cci<4;cci++){
             int dh=(int)((hw>>(8*cci))&0xFF)-(int)((g>>(8*cci))&0xFF);
