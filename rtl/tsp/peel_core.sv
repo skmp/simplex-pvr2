@@ -197,6 +197,12 @@ module peel_core import tsp_pkg::*; (
     // it_pf_busy barrier (#2), and the 1px/cycle combinational FLUSH (#4) are also
     // applied.
     localparam integer TILE_W = 32, TILE_H = 32;
+    // Raster/tile-buffer lane count. The tile buffer is banked LANES-wide; the
+    // per-bank chunk address is CHUNK_AW bits and the CLEAR/PeelBuffers walk runs
+    // over NCHUNK chunks. (LANES=8 -> 7-bit addr, 128 chunks; 4 -> 8-bit, 256.)
+    localparam integer RAS_LANES = 4;
+    localparam integer NCHUNK   = (TILE_W/RAS_LANES) * TILE_H;   // chunks/tile
+    localparam integer CHUNK_AW = $clog2(NCHUNK);                // per-bank addr width
     localparam [31:0] FLT_MAX = 32'h7F7FFFFF;  // refsw PeelBuffers depth clear value
 
     // dt_pt kept as a register array (see note above)
@@ -205,11 +211,11 @@ module peel_core import tsp_pkg::*; (
     // ---- peel tile buffer control (typed ports; driven by the raster/shade/FSM) ----
     reg                    pb_ra_valid;         // (=ras_out_valid: stage-A read)
     reg                    pb_clr_valid;        // CLEAR walk write
-    reg  [6:0]             pb_clr_addr;
+    reg  [CHUNK_AW-1:0]    pb_clr_addr;
     reg                    pb_bufrd_valid;      // PeelBuffers read-ahead
-    reg  [6:0]             pb_bufrd_addr;
+    reg  [CHUNK_AW-1:0]    pb_bufrd_addr;
     reg                    pb_bufwr_valid;      // PeelBuffers delayed write
-    reg  [6:0]             pb_bufwr_addr;
+    reg  [CHUNK_AW-1:0]    pb_bufwr_addr;
     reg                    pb_shrd_valid;       // shade single-pixel read
     reg  [9:0]             pb_shrd_id;
     wire                   sh_valid_o;          // <- staged bit  (1-cyc after shrd)
@@ -287,7 +293,6 @@ module peel_core import tsp_pkg::*; (
     // -------------------- ISP rasterize (as tile_engine_top) --------------------
     // 8 depth lanes/clock, matching the real FPGA (32 lanes is DSP-heavy). Sim
     // models the same 8 lanes so cycle counts reflect hardware.
-    localparam integer RAS_LANES = 8;
     reg  [4:0]  ras_y, ras_x;
     reg  [4:0]  rbx0, rbx1, rby1;   // active bbox sweep bounds (chunk-aligned x)
     // combinational: issue a chunk every raster-sweep cycle, in phase with ras_x/y
@@ -621,10 +626,10 @@ module peel_core import tsp_pkg::*; (
     reg [7:0]  peel_pass;         // pass counter (safety bound)
     localparam integer PEEL_MAX_PASS = 64;
 
-    // ---- M10K bulk-op walk counters (128 chunk addresses = whole 32x32 tile) ----
-    reg [6:0]  cl_i;              // CLEAR chunk-address counter 0..127
-    reg [6:0]  pb_i;             // PeelBuffers chunk-address counter 0..127
-    reg [6:0]  pb_rd;            // PeelBuffers read-ahead chunk (1 ahead of pb_i)
+    // ---- M10K bulk-op walk counters (NCHUNK addresses = whole 32x32 tile) ----
+    reg [CHUNK_AW-1:0]  cl_i;     // CLEAR chunk-address counter 0..NCHUNK-1
+    reg [CHUNK_AW-1:0]  pb_i;     // PeelBuffers chunk-address counter 0..NCHUNK-1
+    reg [CHUNK_AW-1:0]  pb_rd;    // PeelBuffers read-ahead chunk (1 ahead of pb_i)
     reg        pb_pipe;         // PeelBuffers RMW pipe primed (stage-B has valid rdata)
     reg        first_peel;      // this tile's FIRST PeelBuffers (folds refsw SetTagToMax:
                                 //   pb2 <- 0xFFFFFFFF instead of copying tagA)
@@ -714,7 +719,7 @@ module peel_core import tsp_pkg::*; (
     // shade pass pixel accounting: producer index shp, consumer count sh_out_n
     integer sh_out_n;
     // streamed rasterizer: chunks in flight (issued but not yet consumed)
-    localparam integer NCHUNK = (TILE_W/RAS_LANES) * TILE_H;
+    // (NCHUNK defined at top of module)
     integer ras_inflight;
 
     // vertex field ids for FV_RD/FV_W
@@ -789,7 +794,7 @@ module peel_core import tsp_pkg::*; (
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
             b_valid<=1'b0; cb_valid<=1'b0;
-            cl_i<=7'd0; pb_i<=7'd0; pb_rd<=7'd0; pb_pipe<=1'b0; first_peel<=1'b0;
+            cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
             pc_inval<=1'b0; pc_wr_req<=1'b0;
             // (plane cache valid bits are cleared by u_pc's own reset; pc_lu_req is
             //  combinational, driven from st==SH_LOOK)
@@ -879,7 +884,7 @@ module peel_core import tsp_pkg::*; (
                     // shade fills col_buf with the background color.
                     op_shaded <= 1'b0;   // OP shade not yet run for this tile
                     has_pt <= 1'b0; has_tr <= 1'b0;   // PT/TL lists for this tile: none yet
-                    cl_i <= 7'd0; st <= S_CLEAR_WR;
+                    cl_i <= '0; st <= S_CLEAR_WR;
                 end
                 // OPAQUE: single pass, plain DepthMode compare (no peeling).
                 RSTATE_OP: begin
@@ -925,10 +930,10 @@ module peel_core import tsp_pkg::*; (
             end
 
             // CLEAR write walk: the combi block writes background {depth,tag} to all
-            // 8 banks at address cl_i each cycle; here we just walk cl_i 0..127.
+            // banks at address cl_i each cycle; here we just walk cl_i 0..NCHUNK-1.
             S_CLEAR_WR: begin
-                if (cl_i == 7'd127) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
-                else cl_i <= cl_i + 7'd1;
+                if (cl_i == CHUNK_AW'(NCHUNK-1)) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
+                else cl_i <= cl_i + 1'b1;
             end
 
             // S_OL_RUN: PRODUCER - push each OL entry into the entry FIFO (eq) and
@@ -1013,8 +1018,8 @@ module peel_core import tsp_pkg::*; (
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1)
                     dt_pt[i] = 1'b0;
                 more_to_draw <= 1'b0;
-                pb_rd   <= 7'd0;     // read-ahead chunk
-                pb_i    <= 7'd0;     // write chunk (1 behind read once primed)
+                pb_rd   <= '0;       // read-ahead chunk
+                pb_i    <= '0;       // write chunk (1 behind read once primed)
                 pb_pipe <= 1'b0;     // stage-B not yet primed
                 st <= S_PEEL_BUF_RUN;
             end
@@ -1022,11 +1027,11 @@ module peel_core import tsp_pkg::*; (
             // PeelBuffers RMW walk: the combi block presents the READ of chunk pb_rd
             // and (when pb_pipe) WRITES the transformed chunk pb_i (= previous pb_rd,
             // whose data is now in pr_rdata). Advance read, delay write by one, finish
-            // after the last chunk (127) has been written back.
+            // after the last chunk (NCHUNK-1) has been written back.
             S_PEEL_BUF_RUN: begin
                 pb_pipe <= 1'b1;
                 pb_i    <= pb_rd;
-                if (pb_pipe && pb_i == 7'd127) begin
+                if (pb_pipe && pb_i == CHUNK_AW'(NCHUNK-1)) begin
                     // whole tile transformed -> issue the object list for this pass.
                     first_peel <= 1'b0;
                     peel_pass  <= peel_pass + 8'd1;
@@ -1039,8 +1044,8 @@ module peel_core import tsp_pkg::*; (
                         ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
                     end
                     st <= S_OL_RUN;
-                end else if (pb_rd != 7'd127) begin
-                    pb_rd <= pb_rd + 7'd1;
+                end else if (pb_rd != CHUNK_AW'(NCHUNK-1)) begin
+                    pb_rd <= pb_rd + 1'b1;
                 end
             end
 

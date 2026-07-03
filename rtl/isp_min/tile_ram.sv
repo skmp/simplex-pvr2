@@ -25,21 +25,21 @@ module tile_ram #(
     input                         clk,
     // WRITE port (lane i drives bank i)
     input      [NBANKS-1:0]       we,          // write-enable per bank
-    input      [7*NBANKS-1:0]     waddr,       // 7-bit write addr per bank (packed)
+    input      [$clog2(1024/NBANKS)*NBANKS-1:0] waddr,  // AW-bit write addr/bank
     input      [WIDTH*NBANKS-1:0] wdata,       // write data per bank (packed)
     // READ port (lane i drives bank i)
-    input      [7*NBANKS-1:0]     raddr,       // 7-bit read addr per bank (packed)
+    input      [$clog2(1024/NBANKS)*NBANKS-1:0] raddr,  // AW-bit read addr/bank
     output reg [WIDTH*NBANKS-1:0] rdata        // read data per bank (packed, 1-cyc)
 );
-    localparam integer DEPTH = 1024 / NBANKS;  // 128 for 8 banks
-    localparam integer AW    = 7;              // clog2(128)
+    localparam integer DEPTH = 1024 / NBANKS;  // 128 for 8 banks, 256 for 4
+    localparam integer AW    = $clog2(1024 / NBANKS);   // 7 for 8 banks, 8 for 4
 
     genvar b;
     generate
       for (b = 0; b < NBANKS; b = b + 1) begin : bank
         (* ramstyle = "M10K, no_rw_check" *) reg [WIDTH-1:0] mem [0:DEPTH-1];
-        wire [AW-1:0]    wa = waddr[7*b +: AW];
-        wire [AW-1:0]    ra = raddr[7*b +: AW];
+        wire [AW-1:0]    wa = waddr[AW*b +: AW];
+        wire [AW-1:0]    ra = raddr[AW*b +: AW];
         wire [WIDTH-1:0] wd = wdata[WIDTH*b +: WIDTH];
         always @(posedge clk) begin
             if (we[b]) mem[wa] <= wd;

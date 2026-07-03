@@ -4,8 +4,10 @@
 //
 // Storage: ONE simple-dual-port tile_ram (u_ram), WIDTH = 129 bits/lane packing
 // {valid, tag2[31:0], tag[31:0], depth2[31:0], depth[31:0]}, NBANKS = LANES banks.
-// Bank = x[2:0], addr = {y[4:0], x[4:3]} (7-bit, 128 entries/bank) - the isp_core
-// scheme, so a whole LANES-pixel raster chunk is one address across all banks.
+// Bank = x[BANK_BITS-1:0], addr = {y[4:0], x[4:BANK_BITS]} (AW bits, 1024/LANES
+// entries/bank) - a whole LANES-pixel raster chunk is one address across all
+// banks. For a 32x32 tile: LANES=8 -> 3 bank bits, 7-bit addr, 128/bank;
+// LANES=4 -> 2 bank bits, 8-bit addr, 256/bank.
 //
 // The RAM has exactly ONE read port and ONE write port. This module multiplexes
 // them across the render phases and OWNS the read/compare/write RMW so no external
@@ -62,18 +64,20 @@ module peel_tile_buffer import tsp_pkg::*; #(
 
     // ---- CLEAR: write {depth, tag} background to all banks at clr_addr ----
     input                       clr_valid,
-    input      [6:0]            clr_addr,
+    input      [10-$clog2(LANES)-1:0] clr_addr,
     input      [31:0]           clr_depth,
     input      [31:0]           clr_tag,
 
     // ---- PEELBUFFERS RMW walk (read-ahead / delayed write) ----
     input                       pb_rd_valid,
-    input      [6:0]            pb_rd_addr,
+    input      [10-$clog2(LANES)-1:0] pb_rd_addr,
     input                       pb_wr_valid,
-    input      [6:0]            pb_wr_addr,
+    input      [10-$clog2(LANES)-1:0] pb_wr_addr,
     input                       pb_first     // fold SetTagToMax: tag2 <- 0xFFFFFFFF
 );
     localparam integer NB     = LANES;
+    localparam integer BANK_BITS = $clog2(LANES);       // 3 for 8, 2 for 4
+    localparam integer AW        = 10 - BANK_BITS;       // per-bank addr width (7 / 8)
     localparam integer PW_DEPTH  = 0;    // [31:0]  depthBufferA (zb)
     localparam integer PW_DEPTH2 = 32;   // [31:0]  depthBufferB (zb2, reference)
     localparam integer PW_TAG    = 64;   // [31:0]  tagBufferA   (pb)
@@ -84,8 +88,8 @@ module peel_tile_buffer import tsp_pkg::*; #(
 
     // -------------------- the block RAM --------------------
     reg  [NB-1:0]         we;
-    reg  [7*NB-1:0]       waddr;
-    reg  [7*NB-1:0]       raddr;
+    reg  [AW*NB-1:0]      waddr;
+    reg  [AW*NB-1:0]      raddr;
     reg  [PEEL_W*NB-1:0]  wdata;
     wire [PEEL_W*NB-1:0]  rdata;
     tile_ram #(.WIDTH(PEEL_W), .NBANKS(NB)) u_ram (
@@ -93,12 +97,14 @@ module peel_tile_buffer import tsp_pkg::*; #(
         .raddr(raddr), .rdata(rdata)
     );
 
-    // pack a 7-bit bank address {y[4:0], x[4:3]} onto all NB banks (same addr/bank)
-    function automatic [7*NB-1:0] pack_addr(input [4:0] y, input [4:0] xchunk);
+    // pack an AW-bit bank address {y[4:0], x[4:BANK_BITS]} onto all NB banks
+    // (same addr on every bank; the chunk spans one addr across all banks).
+    function automatic [AW*NB-1:0] pack_addr(input [4:0] y, input [4:0] xchunk);
         integer b;
         begin
             pack_addr = '0;
-            for (b = 0; b < NB; b = b + 1) pack_addr[7*b +: 7] = {y, xchunk[4:3]};
+            for (b = 0; b < NB; b = b + 1)
+                pack_addr[AW*b +: AW] = {y, xchunk[4:BANK_BITS]};
         end
     endfunction
     // per-lane field extractors from a packed chunk word
@@ -145,7 +151,7 @@ module peel_tile_buffer import tsp_pkg::*; #(
     always @(*) begin
         raddr = '0;
         if (ras_a_valid)      raddr = pack_addr(ras_a_y, ras_a_x);
-        else if (sh_rd_valid) raddr = {NB{ {sh_rd_id[9:5], sh_rd_id[4:3]} }};
+        else if (sh_rd_valid) raddr = {NB{ {sh_rd_id[9:5], sh_rd_id[4:BANK_BITS]} }};
         else if (pb_rd_valid) raddr = {NB{pb_rd_addr}};
     end
 
@@ -206,11 +212,11 @@ module peel_tile_buffer import tsp_pkg::*; #(
 
     // -------------------- SHADE single-pixel read output --------------------
     // 1-cycle latency: sh_rd_valid presented this cycle -> fields next cycle. The
-    // lane is sh_rd_id[2:0]; latch it so the extract tracks the presented pixel.
-    reg [2:0] sh_lane_r;
+    // lane is sh_rd_id[BANK_BITS-1:0]; latch it so the extract tracks the pixel.
+    reg [BANK_BITS-1:0] sh_lane_r;
     always @(posedge clk) begin
-        if (reset) sh_lane_r <= 3'd0;
-        else if (sh_rd_valid) sh_lane_r <= sh_rd_id[2:0];
+        if (reset) sh_lane_r <= '0;
+        else if (sh_rd_valid) sh_lane_r <= sh_rd_id[BANK_BITS-1:0];
     end
     always @(*) begin
         sh_valid = f_valid (rdata, sh_lane_r);
