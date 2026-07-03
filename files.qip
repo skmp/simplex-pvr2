@@ -68,9 +68,12 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_depth_cmp_lp.sv
 # Banked-M10K tile buffers for peel_core, each owning its RAM ports and enforcing
 # the access pattern via typed per-client ports. peel_tile_buffer packs the five
 # peel depth/tag buffers into a 129b x 8-bank tile_ram and owns the depth compare +
-# raster/shade/CLEAR/PeelBuffers RMW; color_tile_buffer is col_buf (1024x32) with
-# the blend RMW. Must precede peel_core (instantiated there).
+# raster/shade/CLEAR/PeelBuffers RMW (ISP-private); taginvw_tile_buffer is the split-
+# out {valid,tag,invW} slice TSP shade reads (ping-ponged per peel pass so raster N+1
+# overlaps shade N); color_tile_buffer is col_buf (1024x32) with the blend RMW
+# (ping-ponged per tile TSP<->video-out). Must precede peel_core (instantiated there).
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/peel_tile_buffer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/taginvw_tile_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/color_tile_buffer.sv
 # 64-entry TSP plane cache banked into M10K (wide payload word/entry; small tag +
 # valid mirrors stay in logic for the hit test + 1-cyc invalidate). Must precede
