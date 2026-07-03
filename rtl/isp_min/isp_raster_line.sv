@@ -115,6 +115,14 @@ module isp_raster_line #(
         dy12_3<=dy12_2;dy23_3<=dy23_2;dy31_3<=dy31_2;dy41_3<=dy41_2;ddx_3<=ddx_2;
     end
 
+    // s3 stage-align of the edge bases: these are line-base values (independent of
+    // x/lane), so ONE shared copy fans out to all LANES' s4a adders rather than a
+    // redundant per-lane register (was 5*32 FF x LANES; now 5*32 FF total).
+    reg [31:0] eb1_3,eb2_3,eb3_3,eb4_3,wbase_3;
+    always @(posedge clk) begin
+        eb1_3<=eb1;eb2_3<=eb2;eb3_3<=eb3;eb4_3<=eb4;wbase_3<=wbase;
+    end
+
     genvar gi;
     generate
       for (gi = 0; gi < LANES; gi = gi + 1) begin : px
@@ -127,10 +135,8 @@ module isp_raster_line #(
         fp_mul_i5 mdy41(.f(dy41_3),.k(x),.y(dy41x_c));
         fp_mul_i5 mddx (.f(ddx_3), .k(x),.y(ddxx_c));
         reg [31:0] dy12x,dy23x,dy31x,dy41x, ddxx;
-        reg [31:0] eb1_3,eb2_3,eb3_3,eb4_3,wbase_3;
         always @(posedge clk) begin
             dy12x<=dy12x_c;dy23x<=dy23x_c;dy31x<=dy31x_c;dy41x<=dy41x_c;ddxx<=ddxx_c;
-            eb1_3<=eb1;eb2_3<=eb2;eb3_3<=eb3;eb4_3<=eb4;wbase_3<=wbase;
         end
 
         // ---- s4a: Xhs/invW align ----
