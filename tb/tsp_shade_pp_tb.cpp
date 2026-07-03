@@ -75,8 +75,12 @@ static void run_batch(const char* name, const Cfg&g, std::vector<Pix>&pix){
         }
         tick();
         if(present) in_i++;   // the DUT consumed it this edge
-        // registered outputs reflect the edge just taken; dedup via seen[]
-        if(dut->pp_out_valid && !dut->pp_stall){
+        // registered outputs reflect the edge just taken; dedup via seen[].
+        // NOTE streaming DUT: out_valid is a clean 1-cycle pulse INDEPENDENT of stall
+        // (the back-end drains while the front may be stalled on a texture miss), so
+        // we consume it whenever high - NOT gated on !pp_stall (the old frozen-pipe
+        // contract). Gating on !stall would drop results that emerge during a miss.
+        if(dut->pp_out_valid){
             uint32_t id=dut->pp_out_id;
             if(id<pix.size() && !seen[id]){ got[id]=dut->pp_out_argb; seen[id]=1; out_n++; }
         }
@@ -149,6 +153,28 @@ int main(int argc,char**argv){
         auto p=mkpix(300);
         Cfg g=mkcfg(0x00000000, 0x00002040 /*bilinear + shadinstr*/, 1, 1 /*offset*/);
         run_batch("tex_bilin_offset", g, p);
+    }
+    // ---- VQ (tcw[30]=1): exercises the fetcher's two-phase tc->vq cache chain ----
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x40000000 /*VQ, pixfmt=0 1555*/, 0x00000000, 1, 0);
+        run_batch("tex_vq_point", g, p);
+    }
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x40000000, 0x00002000 /*bilinear*/, 1, 0);
+        run_batch("tex_vq_bilinear", g, p);
+    }
+    // ---- palette PAL8 (pixfmt=6) and PAL4 (pixfmt=5), non-VQ ----
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x30000000 /*pixfmt=6 PAL8*/, 0x00000000, 1, 0);
+        run_batch("tex_pal8", g, p);
+    }
+    {
+        auto p=mkpix(300);
+        Cfg g=mkcfg(0x28000000 /*pixfmt=5 PAL4*/, 0x00002000 /*bilinear*/, 1, 0);
+        run_batch("tex_pal4_bilin", g, p);
     }
 
     printf("tsp_shade_pp: %d/%d passed\n", total-fails, total);

@@ -856,7 +856,11 @@ module peel_core import tsp_pkg::*; (
         // (stage-B write is driven by the b_valid port directly on u_peel)
 
         // ---- color buffer ----
-        cb_ca_valid = pp_out_valid && !pp_stall;      // blend stage CA read (out_id)
+        // STREAMING shade pipe: pp_out_valid is a clean 1-cycle pulse INDEPENDENT of
+        // pp_stall (the back-end drains while the front may be stalled on a texture
+        // miss). Consume it whenever high - gating on !pp_stall would drop results that
+        // emerge during a miss (the old frozen-pipe contract no longer holds).
+        cb_ca_valid = pp_out_valid;                   // blend stage CA read (out_id)
         cb_ca_id    = pp_out_id;
         cb_fl_valid = (st == S_FLUSH_RD || st == S_FLUSH_WR);   // FLUSH read (fw_i)
         cb_fl_id    = fw_i;
@@ -986,7 +990,7 @@ module peel_core import tsp_pkg::*; (
             // as drained. Stage CB (cb_valid): cr_rdata = OLD col_buf[id] = dst, the
             // blend runs combinationally, and the combi block writes col_ram[id].
             cb_valid <= 1'b0;
-            if (pp_out_valid && !pp_stall) begin
+            if (pp_out_valid) begin                    // clean pulse; NOT gated on stall
                 cb_valid <= 1'b1;
                 cb_id    <= pp_out_id;
                 cb_argb  <= pp_out_argb;
