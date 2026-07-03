@@ -59,6 +59,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/f2u8.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_fetch_pp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_cache_4p.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_miplevel.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/delay_ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_shade_pp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_blend.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_depth_cmp.sv
