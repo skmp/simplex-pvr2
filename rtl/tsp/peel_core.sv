@@ -222,6 +222,7 @@ module peel_core import tsp_pkg::*; (
     wire [31:0]            sh_tag_o, sh_depth_o;
     wire [RAS_LANES-1:0]   b_pass_lp;           // per-lane peel accept (for dt_pt)
     wire [RAS_LANES-1:0]   b_more;              // per-lane MoreToDraw
+    wire [RAS_LANES-1:0]   b_we;                // per-lane stage-B accept (-> u_taginvw)
 
     // ---- color tile buffer control (typed ports) ----
     reg                    cb_ca_valid;         // blend stage CA read
@@ -354,10 +355,12 @@ module peel_core import tsp_pkg::*; (
         .ras_b_valid(b_valid), .b_inside(b_inside), .b_invw(b_invw),
         .b_y(b_oy), .b_x(b_ox), .b_tag(b_tag), .b_mode(b_mode),
         .b_zwdis(b_zwdis), .b_peeling(b_peeling),
-        .b_pass_lp(b_pass_lp), .b_more(b_more),
-        // shade single-pixel read
-        .sh_rd_valid(pb_shrd_valid), .sh_rd_id(pb_shrd_id),
-        .sh_valid(sh_valid_o), .sh_tag(sh_tag_o), .sh_depth(sh_depth_o),
+        .b_pass_lp(b_pass_lp), .b_more(b_more), .b_we(b_we),
+        // shade single-pixel read: MOVED to the split-out u_taginvw handoff buffer.
+        // u_peel stays ISP-private (depth compare + PeelBuffers only); its shade port
+        // is tied off.
+        .sh_rd_valid(1'b0), .sh_rd_id(10'd0),
+        .sh_valid(), .sh_tag(), .sh_depth(),
         // CLEAR
         .clr_valid(pb_clr_valid), .clr_addr(pb_clr_addr),
         .clr_depth(regs.isp_backgnd_d), .clr_tag(regs.isp_backgnd_t),
@@ -367,14 +370,90 @@ module peel_core import tsp_pkg::*; (
         .pb_first(first_peel)
     );
 
-    color_tile_buffer #(.DEPTH(TILE_W*TILE_H)) u_col (
-        .clk(clk), .reset(reset),
-        .bl_ca_valid(cb_ca_valid), .bl_ca_id(cb_ca_id),
-        .bl_cb_valid(cb_valid), .cb_id(cb_id), .cb_argb(cb_argb),
-        .cb_tsp(cb_tsp), .cb_at_en(cb_at_en), .alpha_ref(regs.pt_alpha_ref[7:0]),
-        .fl_rd_valid(cb_fl_valid), .fl_id(cb_fl_id),
-        .rd_argb(col_rd_argb)
-    );
+    // ---- PING-PONG ISP->TSP handoff buffer (u_taginvw): the {valid,tag,invW} slice
+    // TSP shade reads, split out of u_peel so it can be double-buffered. ISP stage-B
+    // writes a DUPLICATE of its u_peel accept into the PRODUCER half (tag_prod); TSP
+    // shade reads the CONSUMER half (tag_cons). With tag_prod==tag_cons this is exactly
+    // today's single-buffer behavior; advancing the toggles at tile handoff (Milestone
+    // 2) lets ISP rasterize tile N+1 into the other half while TSP shades tile N. ----
+    reg          tag_prod;               // half ISP raster writes (+ CLEAR)
+    reg          tag_cons;               // half TSP shade reads
+    wire         sh_valid_h [0:1];
+    wire [31:0]  sh_tag_h   [0:1], sh_depth_h [0:1];
+    genvar gti;
+    generate
+      for (gti = 0; gti < 2; gti = gti + 1) begin : gtibuf
+        wire ti_prod = (tag_prod == gti[0]);
+        wire ti_cons = (tag_cons == gti[0]);
+        taginvw_tile_buffer #(.LANES(RAS_LANES)) u_taginvw (
+            .clk(clk), .reset(reset),
+            // stage-B accept duplicate (producer half only)
+            .wr_valid(ti_prod && b_valid), .wr_we(b_we),
+            .wr_y(b_oy), .wr_x(b_ox), .wr_tag(b_tag), .wr_invw(b_invw),
+            // CLEAR (producer half only)
+            .clr_valid(ti_prod && pb_clr_valid), .clr_addr(pb_clr_addr),
+            .clr_depth(regs.isp_backgnd_d), .clr_tag(regs.isp_backgnd_t),
+            // PeelBuffers valid-clear walk (producer half; mirrors u_peel's pb write)
+            .pbc_valid(ti_prod && pb_bufwr_valid), .pbc_addr(pb_bufwr_addr),
+            // shade single-pixel read (consumer half only)
+            .sh_rd_valid(ti_cons && pb_shrd_valid), .sh_rd_id(pb_shrd_id),
+            .sh_valid(sh_valid_h[gti]), .sh_tag(sh_tag_h[gti]), .sh_depth(sh_depth_h[gti])
+        );
+      end
+    endgenerate
+    assign sh_valid_o = sh_valid_h[tag_cons];
+    assign sh_tag_o   = sh_tag_h  [tag_cons];
+    assign sh_depth_o = sh_depth_h[tag_cons];
+
+    // ---- PING-PONG color buffer (2 halves): TSP blend fills col_prod; the
+    // decoupled video-out (FLUSH) engine drains col_vo. A finished tile's color is
+    // HANDED OFF to VO by flipping col_prod, so ISP/TSP can shade the next tile's
+    // color into the other half while VO streams this one to the framebuffer.
+    // col_prod = TSP producer half; col_vo = VO consumer half (see the VO FSM). ----
+    reg          col_prod;               // which half TSP blends into
+    reg          col_vo;                 // which half VO reads out
+    wire [31:0]  col_rd_argb_h [0:1];    // per-half registered read
+    // blend (CA read / CB write) targets the producer half only; FLUSH read targets
+    // the VO half only. gcol picks per-instance whether it is prod or vo this cycle.
+    genvar gcol;
+    generate
+      for (gcol = 0; gcol < 2; gcol = gcol + 1) begin : gcolbuf
+        wire is_prod = (col_prod == gcol[0]);
+        wire is_vo   = (col_vo   == gcol[0]);
+        color_tile_buffer #(.DEPTH(TILE_W*TILE_H)) u_col (
+            .clk(clk), .reset(reset),
+            .bl_ca_valid(is_prod && cb_ca_valid), .bl_ca_id(cb_ca_id),
+            .bl_cb_valid(is_prod && cb_valid), .cb_id(cb_id), .cb_argb(cb_argb),
+            .cb_tsp(cb_tsp), .cb_at_en(cb_at_en), .alpha_ref(regs.pt_alpha_ref[7:0]),
+            .fl_rd_valid(is_vo && cb_fl_valid), .fl_id(cb_fl_id),
+            .rd_argb(col_rd_argb_h[gcol])
+        );
+      end
+    endgenerate
+    // blend dst read comes from the producer half; VO read from the VO half.
+    assign col_rd_argb    = col_rd_argb_h[col_prod];   // blend dst (CA)
+    wire [31:0] vo_rd_argb = col_rd_argb_h[col_vo];    // VO flush pixel
+
+    // ---- DECOUPLED VIDEO-OUT (FLUSH) engine + color-buffer credit handshake ----
+    // Each color half carries a 1-bit "full" credit col_full[h]: the TSP side sets it
+    // when it HANDS a finished tile's color to VO (posting the tile coords), the VO
+    // engine clears it when the flush completes. TSP can only start blending into
+    // col_prod when that half is FREE (!col_full[col_prod]); with 2 halves this lets
+    // ISP/TSP shade tile N+1 while VO streams tile N. vo_tx/vo_ty are the coords of
+    // the half VO is currently draining (latched per posted buffer).
+    reg  [1:0]  col_full;                 // per-half: holds a finished tile for VO
+    reg  [5:0]  col_tx [0:1];             // per-half posted tile x
+    reg  [5:0]  col_ty [0:1];             // per-half posted tile y
+    reg  [5:0]  vo_tx, vo_ty;             // coords of the half VO is draining
+    reg  [9:0]  vo_i;                     // VO writeout pixel 0..1023
+    localparam VO_IDLE=2'd0, VO_RD=2'd1, VO_WR=2'd2;
+    reg  [1:0]  vst;                      // video-out FSM state
+    // TSP posts a finished color buffer to VO: sets the credit, latches coords, flips
+    // the producer half. Driven as a 1-cycle intent from the main FSM (see FLUSH).
+    reg         col_post;                 // 1-cyc: hand col_prod to VO
+    reg         col_post_hp;              // which half is being posted
+    reg  [5:0]  col_post_tx, col_post_ty; // coords to post
+    reg         ra_done_l;                // latched region-array-done (pulse is 1-cyc)
 
     // ==================================================================
     // TSP plane cache: 64 entries, keyed by the FULL CoreTag word, banked into M10K
@@ -426,7 +505,6 @@ module peel_core import tsp_pkg::*; (
 
     // shade-pass state
     reg [9:0]  shp;           // next tile pixel 0..1023 to ISSUE into the stream
-    reg [9:0]  fw_i;          // framebuffer-writeout pixel 0..1023
     reg [31:0] sh_tag;        // the MISS pixel's CoreTag (drives the fetch + cache write)
     reg [31:0] sh_invw;       // the MISS pixel's depth-buffer invW (fed to the shader)
     reg [9:0]  sh_id;         // the MISS pixel's tile index (fed to the shader)
@@ -671,12 +749,11 @@ module peel_core import tsp_pkg::*; (
                TSP_RUN=24, SH_PRESENT=25, SH_DRAIN=26, SH_OUT=27,
                // unified PT+TL peel loop: init pb2, PeelBuffers, run, check
                S_PEEL_INIT=28, S_PEEL_BUF=29, S_PEEL_CHK=30,
-               // shared shade sub-phase entry + OP-done return + FLUSH writeout
-               S_SHADE_START=31, S_OP_DONE=32, S_FLUSH_WR=33,
+               // shared shade sub-phase entry + OP-done return + color POST-to-VO
+               S_SHADE_START=31, S_OP_DONE=32, S_POST=33,
                // M10K bulk-op walks over the peel RAM ports (128 chunk addrs each):
                S_CLEAR_WR=34,              // CLEAR: write {bg_depth, bg_tag} chunks
-               S_PEEL_BUF_RUN=35,          // PeelBuffers RMW walk (read A -> write B)
-               S_FLUSH_RD=37;              // FLUSH: prime col-RAM read of pixel fw_i
+               S_PEEL_BUF_RUN=35;          // PeelBuffers RMW walk (read A -> write B)
     reg [5:0] st;
 
     // consumer sub-FSM (setup is now the streamed pipeline u_isp -> pq FIFO)
@@ -895,24 +972,24 @@ module peel_core import tsp_pkg::*; (
     integer pc_su_busy;         // streamed ISP-setup busy (su_busy) any clock
 `endif
 
-    // ---- COMBINATIONAL framebuffer-write (FLUSH), valid/ready handshake ----
-    // fbw_req is presented + accepted the SAME cycle so a blocking controller works
-    // (busy holds; we advance fw_i only when the pixel is consumed). The screen
-    // pixel for the linear tile index fw_i (0..1023): x=fw_i[4:0], y=fw_i[9:5].
-    // fbw_req.argb comes from the col RAM's REGISTERED read (cr_rdata): the combi
-    // read-port block below presents cr_raddr=fw_i whenever we HOLD the pixel, so
-    // cr_rdata == col_ram[fw_i]. On entry S_FLUSH_RD primes the read for pixel 0.
-    wire [10:0] fw_px = {5'd0, cur_tx}*11'd32 + {6'd0, fw_i[4:0]};
-    wire [10:0] fw_py = {5'd0, cur_ty}*11'd32 + {6'd0, fw_i[9:5]};
+    // ---- COMBINATIONAL framebuffer-write (VIDEO-OUT / FLUSH), valid/ready ----
+    // Driven by the DECOUPLED video-out FSM (vst / vo_i / vo_tx / vo_ty), which runs
+    // CONCURRENTLY with ISP/TSP: it streams the VO half of the ping-pong color buffer
+    // (vo_rd_argb) to the framebuffer while ISP/TSP shade the next tile into the other
+    // half. fbw_req is presented + accepted the SAME cycle so a blocking controller
+    // works (busy holds; vo_i advances only when the pixel is consumed). The screen
+    // pixel for the linear tile index vo_i (0..1023): x=vo_i[4:0], y=vo_i[9:5].
+    wire [10:0] fw_px = {5'd0, vo_tx}*11'd32 + {6'd0, vo_i[4:0]};
+    wire [10:0] fw_py = {5'd0, vo_ty}*11'd32 + {6'd0, vo_i[9:5]};
     wire        fw_onscreen = (fw_px < 11'd640) && (fw_py < 11'd480);
     always @(*) begin
-        fbw_req.we      = (st==S_FLUSH_WR) && fw_onscreen;
+        fbw_req.we      = (vst==VO_WR) && fw_onscreen;
         fbw_req.pix_idx = fw_py*20'd640 + {9'd0, fw_px};
-        fbw_req.argb    = col_rd_argb;           // u_col registered read of fw_i
+        fbw_req.argb    = vo_rd_argb;             // VO-half registered read of vo_i
     end
     // a pixel is consumed this cycle when: on-screen and the sink accepted it, OR
     // off-screen (nothing to write -> skip immediately).
-    wire fw_pix_consumed = (st==S_FLUSH_WR) &&
+    wire fw_pix_consumed = (vst==VO_WR) &&
                            ( (fw_onscreen && !fbw_resp.busy) || !fw_onscreen );
 
 `ifndef SYNTHESIS
@@ -927,7 +1004,7 @@ module peel_core import tsp_pkg::*; (
         if (fbd_en) begin fbd_fd=$fopen(fbd_name,"w"); $fwrite(fbd_fd,"# x y argb (tile tx,ty fw_i)\n"); end
     end
     always @(posedge clk) if (!reset && fbd_en && fbw_req.we && fw_pix_consumed) begin
-        $fwrite(fbd_fd, "%0d %0d %08x %0d %0d %0d\n", fw_px, fw_py, col_rd_argb, cur_tx, cur_ty, fw_i);
+        $fwrite(fbd_fd, "%0d %0d %08x %0d %0d %0d\n", fw_px, fw_py, vo_rd_argb, vo_tx, vo_ty, vo_i);
         fbd_n = fbd_n + 1;
     end
     final if (fbd_en && fbd_fd!=0) begin $fflush(fbd_fd); $fclose(fbd_fd);
@@ -968,8 +1045,9 @@ module peel_core import tsp_pkg::*; (
         // emerge during a miss (the old frozen-pipe contract no longer holds).
         cb_ca_valid = pp_out_valid;                   // blend stage CA read (out_id)
         cb_ca_id    = pp_out_id;
-        cb_fl_valid = (st == S_FLUSH_RD || st == S_FLUSH_WR);   // FLUSH read (fw_i)
-        cb_fl_id    = fw_i;
+        // FLUSH read is driven by the DECOUPLED video-out FSM (vst), on the VO half.
+        cb_fl_valid = (vst == VO_RD || vst == VO_WR); // VO read (vo_i)
+        cb_fl_id    = vo_i;
 
         // ---- plane cache lookup (STREAMING) ----
         // On an advance cycle L1 looks up the pixel whose peel result is on sh_* now
@@ -1053,6 +1131,9 @@ module peel_core import tsp_pkg::*; (
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
             b_valid<=1'b0; cb_valid<=1'b0;
             cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
+            col_prod<=1'b0; col_post<=1'b0;   // color producer half + post intent
+            tag_prod<=1'b0; tag_cons<=1'b0;   // taginvw ping-pong (pinned = Milestone 1)
+            ra_done_l<=1'b0;                  // latched region-done
             pc_inval<=1'b0; pc_wr_req<=1'b0;
             // (plane cache valid bits are cleared by u_pc's own reset; pc_lu_req is
             //  combinational, driven by the streaming shade pipeline)
@@ -1060,9 +1141,12 @@ module peel_core import tsp_pkg::*; (
 `ifndef SYNTHESIS
             // -------- performance counters: charge THIS clock to its buckets --------
             // Only count while the core is doing tile work (not the top-level idle wait
-            // for a start). Approximate "active" as: not S_IDLE, or any engine busy.
-            if (st != S_IDLE || rs_st != RS_IDLE || su_busy) begin
+            // for a start). Approximate "active" as: not S_IDLE, or any engine busy
+            // (raster, setup, OR the decoupled video-out engine).
+            if (st != S_IDLE || rs_st != RS_IDLE || su_busy || vst != VO_IDLE) begin
                 pc_total <= pc_total + 1;
+                // decoupled VO engine busy (framebuffer writeout / scanout).
+                if (vst != VO_IDLE) pc_top_flush <= pc_top_flush + 1;
 
                 // ISP / raster engine (by rs_st)
                 case (rs_st)
@@ -1089,7 +1173,6 @@ module peel_core import tsp_pkg::*; (
                 // top-level phase view (whole-core)
                 if (st==S_CLEAR_WR)                               pc_top_clear   <= pc_top_clear   + 1;
                 else if (st==S_PEEL_BUF_RUN)                      pc_top_peelbuf <= pc_top_peelbuf + 1;
-                else if (st==S_FLUSH_RD||st==S_FLUSH_WR)          pc_top_flush   <= pc_top_flush   + 1;
                 else if (st==S_OL_RUN)                            pc_top_ol      <= pc_top_ol      + 1;
                 else if (st==S_DRAIN)                             pc_top_barrier <= pc_top_barrier + 1;
                 else if (st==SH_MPRES||
@@ -1107,7 +1190,8 @@ module peel_core import tsp_pkg::*; (
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             eq_push = 1'b0;
             pc_inval<=1'b0; pc_wr_req<=1'b0;  // 1-cyc strobes (pc_lu_req is combi)
-            // fbw_req is driven COMBINATIONALLY (see the FLUSH write block below).
+            col_post<=1'b0;                   // 1-cyc: color-buffer post-to-VO intent
+            // fbw_req is driven COMBINATIONALLY by the decoupled VO engine.
 
             // ============ streamed rasterizer CONSUMER: stage A -> stage B ============
             // Stage A (ras_out_valid): the combinational peel-RAM read of chunk
@@ -1165,7 +1249,20 @@ module peel_core import tsp_pkg::*; (
             S_IDLE: if (go) begin ra_start<=1; st<=S_RA; end
 
             S_RA: begin
-                if (ra_tiles_parsed) st<=S_DONE;
+                // region array fully walked, but the DECOUPLED video-out engine may
+                // still be draining the last posted tile(s) - wait for it to go idle
+                // and all color credits to clear before signalling done (else a TB that
+                // samples the framebuffer on `done` misses the trailing VO writes).
+                // ra_tiles_parsed is a 1-CYCLE PULSE, so LATCH it (ra_done_l) and hold
+                // in S_RA until VO drains - otherwise the pulse is lost while VO is busy
+                // and the FSM deadlocks in S_RA (the last-tile-writeout hang).
+                if (ra_tiles_parsed) ra_done_l <= 1'b1;
+                if (ra_done_l || ra_tiles_parsed) begin
+                    if (vst==VO_IDLE && col_full==2'b00) begin
+                        ra_done_l <= 1'b0;
+                        st<=S_DONE;
+                    end
+                end
                 else if (ra_out.list_ready) begin
                     cur_tx <= ra_out.tile_x; cur_ty <= ra_out.tile_y;
                     st<=S_STATE;
@@ -1225,7 +1322,7 @@ module peel_core import tsp_pkg::*; (
                             st <= S_PEEL_INIT;
                         end
                     end else begin
-                        fw_i <= 10'd0; st <= S_FLUSH_RD;   // prime col-RAM read of px 0
+                        st <= S_POST;   // hand this tile's color to the VO engine
                     end
                 end
                 default: begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
@@ -1359,29 +1456,26 @@ module peel_core import tsp_pkg::*; (
                     st <= S_PEEL_BUF;
                 end else begin
                     peeling <= 1'b0;
-                    fw_i <= 10'd0; st <= S_FLUSH_RD;   // prime col-RAM read of px 0
+                    st <= S_POST;   // hand this tile's color to the VO engine
                 end
             end
 
-            // FLUSH read: prime the col-RAM read of pixel fw_i (combi block presents
-            // cr_raddr=fw_i); cr_rdata is valid next cycle in S_FLUSH_WR.
-            S_FLUSH_RD: st <= S_FLUSH_WR;
-
-            // FLUSH writeout: STREAM the accumulation buffer (col_ram) to the
-            // framebuffer at ONE PIXEL PER CYCLE. fbw_req.argb comes from cr_rdata
-            // (the registered read of fw_i, held stable while fw_i holds); here we
-            // only ADVANCE fw_i, and only when the pixel is consumed (fw_pix_consumed):
-            // on-screen pixel accepted (we && !busy) OR an off-screen pixel (skipped).
-            // A busy on-screen pixel HOLDS fw_i so the combinational fbw_req keeps
-            // presenting it -> works with a real controller that blocks. When fw_i
-            // advances, the combi read of the NEW fw_i is presented THIS cycle, so
-            // cr_rdata is ready next cycle: stay in S_FLUSH_WR (the just-consumed
-            // pixel is done; the next pixel's data lands before we re-present it).
-            S_FLUSH_WR: begin
-                if (fw_pix_consumed) begin
-                    if (fw_i == 10'd1023) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
-                    else begin fw_i <= fw_i + 10'd1; st <= S_FLUSH_RD; end
-                end
+            // POST: hand this tile's finished color buffer (col_prod) to the DECOUPLED
+            // video-out engine and ack the region IMMEDIATELY, so ISP/TSP can start the
+            // next tile while VO streams this one to the framebuffer. We flip col_prod
+            // so the next tile blends into the OTHER half; that half must be FREE (VO
+            // has drained it) - else stall here. With 2 halves this is the pipeline
+            // depth: VO(tile N) overlaps ISP/TSP(tile N+1); tile N+2 waits for VO(N).
+            // col_post is a 1-cyc intent consumed by the VO always block (sole writer
+            // of col_full), which sets col_full[col_post_hp] + latches coords.
+            S_POST: if (!col_full[~col_prod]) begin
+                col_post    <= 1'b1;
+                col_post_hp <= col_prod;
+                col_post_tx <= cur_tx;
+                col_post_ty <= cur_ty;
+                col_prod    <= ~col_prod;      // next tile -> other half
+                ra_ack.list_done <= 1'b1;
+                st <= S_RA_ACK;
             end
 
             // ---------------- shade sub-phase (shared, ONE tsp pipeline) ----------
@@ -1742,6 +1836,48 @@ module peel_core import tsp_pkg::*; (
                 cur_ddy[tsp_pidx] = tsp_pddy;
                 cur_c[tsp_pidx]   = tsp_pc;
             end
+        end
+    end
+
+    // ==================== DECOUPLED VIDEO-OUT (FLUSH) ENGINE ====================
+    // Runs CONCURRENTLY with ISP/TSP. Owns the per-half color credit col_full and
+    // the VO consumption pointer col_vo. col_full[h] is SET here from the main FSM's
+    // 1-cycle col_post intent (single writer -> no multi-driver conflict) and CLEARED
+    // when the half's flush completes. VO drains halves in production order: it waits
+    // for col_full[col_vo], streams that half's 1024 pixels to fbw (1 px/cyc, holding
+    // on fbw_resp.busy), then clears the credit and advances col_vo. The combinational
+    // fbw_req / cb_fl_* drivers key off vst / vo_i / vo_tx / vo_ty (see above).
+    always @(posedge clk) begin
+        if (reset) begin
+            vst<=VO_IDLE; vo_i<=10'd0; col_vo<=1'b0; col_full<=2'b00;
+            vo_tx<=6'd0; vo_ty<=6'd0;
+        end else begin
+            // SET credit from the main FSM's post intent (main FSM flips col_prod).
+            if (col_post) begin
+                col_full[col_post_hp] <= 1'b1;
+                col_tx[col_post_hp]   <= col_post_tx;
+                col_ty[col_post_hp]   <= col_post_ty;
+            end
+
+            case (vst)
+            VO_IDLE: if (col_full[col_vo]) begin
+                // this half holds a finished tile: latch its coords, prime pixel 0.
+                vo_tx <= col_tx[col_vo]; vo_ty <= col_ty[col_vo];
+                vo_i  <= 10'd0;
+                vst   <= VO_RD;          // cb_fl_* presents the read of vo_i=0
+            end
+            VO_RD: vst <= VO_WR;         // registered read lands next cycle
+            VO_WR: if (fw_pix_consumed) begin
+                if (vo_i == 10'd1023) begin
+                    col_full[col_vo] <= 1'b0;                 // release the half
+                    col_vo <= ~col_vo;                       // next half in order
+                    vst    <= VO_IDLE;
+                end else begin
+                    vo_i <= vo_i + 10'd1; vst <= VO_RD;       // present next pixel read
+                end
+            end
+            default: vst <= VO_IDLE;
+            endcase
         end
     end
 endmodule
