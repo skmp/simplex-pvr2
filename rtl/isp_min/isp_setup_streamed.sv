@@ -85,11 +85,13 @@ module isp_setup_streamed (
     reg [31:0] C1a[0:NS-1],C2a[0:NS-1],C3a[0:NS-1];
     reg [31:0] ddxXL1[0:NS-1],ddyYT1[0:NS-1],zc0[0:NS-1];
     reg        tl1[0:NS-1],tl2[0:NS-1],tl3[0:NS-1];
-    // per-slot outputs accumulated during the schedule (copied out at retire)
-    reg [31:0] o_dx12[0:NS-1],o_dx23[0:NS-1],o_dx31[0:NS-1];
-    reg [31:0] o_dy12[0:NS-1],o_dy23[0:NS-1],o_dy31[0:NS-1];
+    // per-slot outputs accumulated during the schedule (copied out at retire).
+    // NOTE: dx12/23/31, dy12/23/31, ddx, ddy are NOT mirrored here - the working
+    // regs DX*/DY*/ddx/ddy are each written once (cyc 8/9), last read at cyc 10/11,
+    // and survive un-clobbered to retire (cyc 14), so retire reads them directly.
+    // That removed 8 dead mirror arrays (8 x NS x 32 = 1024 FF) at zero timing cost.
     reg [31:0] o_c1[0:NS-1],o_c2[0:NS-1],o_c3[0:NS-1];
-    reg [31:0] o_ddx[0:NS-1],o_ddy[0:NS-1],o_cinvw[0:NS-1];
+    reg [31:0] o_cinvw[0:NS-1];
     reg        o_sgnneg[0:NS-1], o_cull[0:NS-1];
 
     // ---------------- pipelined tile-local bbox (per slot) ----------------
@@ -332,7 +334,6 @@ module isp_setup_streamed (
                 end
                 8: begin
                     ddx[sl]<=qa; ddy[sl]<=qb; DX12[sl]<=qc; DX23[sl]<=qd;
-                    o_dx12[sl]<=qc; o_dx23[sl]<=qd;
                     L0(sgn[sl],d_X3X1[sl],ZERO,0);     // DX31
                     L1(sgn[sl],d_Y1Y2[sl],ZERO,0);     // DY12
                     L2(sgn[sl],d_Y2Y3[sl],ZERO,0);     // DY23
@@ -341,7 +342,6 @@ module isp_setup_streamed (
                 end
                 9: begin
                     DX31[sl]<=qa; DY12[sl]<=qb; DY23[sl]<=qc; DY31[sl]<=qd;
-                    o_dx31[sl]<=qa; o_dy12[sl]<=qb; o_dy23[sl]<=qc; o_dy31[sl]<=qd;
                     L0(qb,XL1[sl],ZERO,0);            // C1a = DY12*XL1
                     L1(qc,XL2[sl],ZERO,0);            // C2a = DY23*XL2
                     L2(qd,XL3[sl],ZERO,0);            // C3a = DY31*XL3
@@ -361,7 +361,6 @@ module isp_setup_streamed (
                 end
                 11: begin
                     ddyYT1[sl]<=qd;
-                    o_ddx[sl]<=ddx[sl]; o_ddy[sl]<=ddy[sl];
                     o_c1[sl]<= tl1[sl] ? qa : (qa - 32'd1);
                     o_c2[sl]<= tl2[sl] ? qb : (qb - 32'd1);
                     o_c3[sl]<= tl3[sl] ? qc : (qc - 32'd1);
@@ -390,10 +389,12 @@ module isp_setup_streamed (
                         out_isp   <= ISPW[sl];
                         sgn_neg   <= o_sgnneg[sl];
                         cull      <= o_cull[sl];
-                        dx12<=o_dx12[sl]; dx23<=o_dx23[sl]; dx31<=o_dx31[sl]; dx41<=ZERO;
-                        dy12<=o_dy12[sl]; dy23<=o_dy23[sl]; dy31<=o_dy31[sl]; dy41<=ZERO;
+                        // read the working regs directly (they survive un-clobbered
+                        // to retire); no separate o_* mirrors needed for these.
+                        dx12<=DX12[sl]; dx23<=DX23[sl]; dx31<=DX31[sl]; dx41<=ZERO;
+                        dy12<=DY12[sl]; dy23<=DY23[sl]; dy31<=DY31[sl]; dy41<=ZERO;
                         c1<=o_c1[sl]; c2<=o_c2[sl]; c3<=o_c3[sl]; c4<=ONE;
-                        ddx_invw<=o_ddx[sl]; ddy_invw<=o_ddy[sl]; c_invw<=o_cinvw[sl];
+                        ddx_invw<=ddx[sl]; ddy_invw<=ddy[sl]; c_invw<=o_cinvw[sl];
                         bx0<=o_bx0[sl]; bx1<=o_bx1[sl];
                         by0<=o_by0[sl]; by1<=o_by1[sl];
                         slot_busy[sl] <= 1'b0;
