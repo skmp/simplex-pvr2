@@ -376,8 +376,18 @@ module peel_core import tsp_pkg::*; (
     // shade reads the CONSUMER half (tag_cons). With tag_prod==tag_cons this is exactly
     // today's single-buffer behavior; advancing the toggles at tile handoff (Milestone
     // 2) lets ISP rasterize tile N+1 into the other half while TSP shades tile N. ----
-    reg          tag_prod;               // half ISP raster writes (+ CLEAR)
-    reg          tag_cons;               // half TSP shade reads
+    // TWO independent ping-pong indices:
+    //  * u_taginvw {tag,invW} is PER-PASS: htile = the half ISP rasters/CLEARs a shade-
+    //    input into (flips each raster pass); tsp_tag = the half TSP reads. Per-pass so
+    //    raster pass P+1 fills one half while TSP shades pass P from the other.
+    //  * u_col is PER-TILE and ping-pongs only TSP<->VO: tsp_col = the half TSP blends a
+    //    whole tile's passes into (flips only when TSP posts a finished tile), col_vo =
+    //    the half VO drains.
+    reg          htile;                  // ISP u_taginvw producer half (per pass)
+    reg          tsp_tag;                // TSP u_taginvw consumer half (per pass)
+    reg          tsp_col;               // TSP u_col blend half (per tile)
+    wire         tag_prod = htile;       // half ISP raster/CLEAR writes
+    wire         tag_cons = tsp_tag;     // half TSP shade reads
     wire         sh_valid_h [0:1];
     wire [31:0]  sh_tag_h   [0:1], sh_depth_h [0:1];
     genvar gti;
@@ -401,16 +411,16 @@ module peel_core import tsp_pkg::*; (
         );
       end
     endgenerate
-    assign sh_valid_o = sh_valid_h[tag_cons];
-    assign sh_tag_o   = sh_tag_h  [tag_cons];
-    assign sh_depth_o = sh_depth_h[tag_cons];
+    assign sh_valid_o = sh_valid_h[tsp_tag];
+    assign sh_tag_o   = sh_tag_h  [tsp_tag];
+    assign sh_depth_o = sh_depth_h[tsp_tag];
 
-    // ---- PING-PONG color buffer (2 halves): TSP blend fills col_prod; the
-    // decoupled video-out (FLUSH) engine drains col_vo. A finished tile's color is
-    // HANDED OFF to VO by flipping col_prod, so ISP/TSP can shade the next tile's
-    // color into the other half while VO streams this one to the framebuffer.
-    // col_prod = TSP producer half; col_vo = VO consumer half (see the VO FSM). ----
-    reg          col_prod;               // which half TSP blends into
+    // ---- PING-PONG color buffer (2 halves): TSP blend fills the half of the tile it
+    // is shading (col_prod = tsp_half); the decoupled video-out engine drains col_vo.
+    // A finished tile's color is posted to VO (by TSP, on a last-flagged shade), so
+    // ISP/TSP shade the next tile's color into the other half while VO streams this
+    // one to the framebuffer. ----
+    wire         col_prod = tsp_col;     // TSP blends a whole tile into this u_col half
     reg          col_vo;                 // which half VO reads out
     wire [31:0]  col_rd_argb_h [0:1];    // per-half registered read
     // blend (CA read / CB write) targets the producer half only; FLUSH read targets
@@ -740,17 +750,9 @@ module peel_core import tsp_pkg::*; (
                S_OL_RUN=4,                 // producer: OL entries -> entry FIFO
                S_RA_ACK=9, S_DONE=10,
                S_DRAIN=11,                 // barrier: wait consumer idle + FIFOs empty
-               // shade pass (FLUSH): the STREAMING shade producer (see SH_PRESENT).
-               // SH_MPRES presents a cache-MISS-resolved pixel (planes from cur_*)
-               // after the FH_*/FV_*/TSP_RUN fetch, then restarts the stream.
-               SH_MPRES=16,
-               FH_ISP=18, FH_ISPW=19, FH_TSPW=20, FH_TCWW=21,
-               FV_RD=22, FV_W=23,
-               TSP_RUN=24, SH_PRESENT=25, SH_DRAIN=26, SH_OUT=27,
                // unified PT+TL peel loop: init pb2, PeelBuffers, run, check
-               S_PEEL_INIT=28, S_PEEL_BUF=29, S_PEEL_CHK=30,
-               // shared shade sub-phase entry + OP-done return + color POST-to-VO
-               S_SHADE_START=31, S_OP_DONE=32, S_POST=33,
+               S_PEEL_INIT=28, S_PEEL_BUF=29,
+               S_OP_DONE=32,
                // M10K bulk-op walks over the peel RAM ports (128 chunk addrs each):
                S_CLEAR_WR=34,              // CLEAR: write {bg_depth, bg_tag} chunks
                S_PEEL_BUF_RUN=35;          // PeelBuffers RMW walk (read A -> write B)
@@ -786,13 +788,41 @@ module peel_core import tsp_pkg::*; (
     // shade_mode only selects WHICH pixels are shaded, not whether we blend:
     //   0 = OP  : shade every pixel of the tile
     //   1 = PEEL: shade only pixels staged this pass (dt_valid)
-    // shade_ret : FSM state to return to once the shade sub-phase drains.
-    reg        shade_mode;
-    reg [5:0]  shade_ret;
+    reg        shade_mode;   // latched by TSP from ti_mode[] at T_IDLE
     integer    sh_pending;   // pixels presented this shade sub-phase (PEEL skips some)
 
-    // ---- STREAMING shade producer control (combinational; see SH_PRESENT) ----
-    wire sh_streaming  = (st == SH_PRESENT);
+    // ---- CONCURRENT TSP shade FSM (tst) + ISP<->TSP handshake (Milestone 2) ----
+    // The shade sub-phase is now its own state machine (tst), stepped every cycle in
+    // the SAME always block as the ISP FSM (st) and the raster consumer (rs_st) - like
+    // rs_st, it runs CONCURRENTLY with st. This lets the ISP FSM rasterize tile N+1 (its
+    // CLEAR + OP/peel raster into the OTHER u_taginvw/u_col half) while the TSP FSM
+    // still shades tile N. Cross-FSM handshake (all regs written only in this one block,
+    // so no multi-driver):
+    // PER-HALF READY CREDIT (ping-pong producer/consumer, like ISP->TSP and TSP->VO):
+    //   ti_ready[h] : ISP has finished rastering a shade-input into u_taginvw half h;
+    //                 TSP may shade it. Set by ISP when a raster pass/OP completes,
+    //                 CLEARED by TSP when it finishes shading h. Per-half metadata:
+    //                 ti_mode (OP/PEEL), ti_last (final shade of the tile -> post color
+    //                 to VO on drain), ti_tx/ti_ty (tile coords for the post).
+    // ISP toggles htile per raster PASS (not just per tile): shade pass P reads half A
+    // while raster pass P+1 writes half B -> raster P+1 OVERLAPS shade P. ISP stalls
+    // before rastering into a half that is still ti_ready (TSP hasn't consumed it).
+    localparam T_IDLE=0, T_START=1, T_PRESENT=2, T_MPRES=3, T_DRAIN=4,
+               T_FH_ISP=5, T_FH_ISPW=6, T_FH_TSPW=7, T_FH_TCWW=8,
+               T_FV_RD=9, T_FV_W=10, T_TSP_RUN=11, T_POST=12;
+    reg [3:0]  tst;
+    reg  [1:0] ti_ready;      // per-half: rastered, awaiting shade
+    reg        ti_mode [0:1]; // per-half OP(0)/PEEL(1)
+    reg        ti_last [0:1]; // per-half: this is the tile's final shade -> post color
+    reg        ti_postonly[0:1]; // per-half: no shade, just post u_col to VO (OP-only
+                                 // tile's FLUSH: color already accumulated by the OP shade)
+    reg  [5:0] ti_tx [0:1], ti_ty [0:1];  // per-half tile coords (for the VO post)
+    reg        sh_busy;       // TSP: a shade is in flight (T_START..T_DRAIN)
+    reg        tsp_half;      // half TSP is shading (= tag_cons / blend col half)
+
+    // ---- STREAMING shade producer control (combinational; see T_PRESENT) ----
+    // Now keyed off the CONCURRENT TSP FSM (tst), not the ISP FSM (st).
+    wire sh_streaming  = (tst == T_PRESENT);
     // stage A carries a pixel that IS shaded this pass (PEEL skips !sh_valid_o pixels).
     // sh_valid_o is the peel result for ida (the read presented last cycle).
     wire sh_A_staged   = va && (shade_mode ? sh_valid_o : 1'b1);
@@ -802,10 +832,10 @@ module peel_core import tsp_pkg::*; (
     wire sh_miss        = sh_streaming && vb && !pc_hit;    // B is a plane-cache miss
     // advance the front unless a hit present is stalled or B is a miss (miss -> fetch).
     wire sh_adv         = sh_streaming && !sh_miss && !(sh_present_v && pp_stall);
-    // SH_MPRES: the miss-resolved pixel (idb) is being presented from cur_*; it is
-    // accepted when the shader isn't stalled. On accept we return to SH_PRESENT, so
+    // T_MPRES: the miss-resolved pixel (idb) is being presented from cur_*; it is
+    // accepted when the shader isn't stalled. On accept we return to T_PRESENT, so
     // this is the cycle to re-present ida's peel read (stage A survived the fetch).
-    wire sh_mpres_acc   = (st == SH_MPRES) && !pp_stall;
+    wire sh_mpres_acc   = (tst == T_MPRES) && !pp_stall;
 
     // ---- entry FIFO (object_list_parser -> iterator), depth 8 ----
     localparam integer EQ_N = 8;
@@ -970,6 +1000,19 @@ module peel_core import tsp_pkg::*; (
     // extra: texture-stall clocks regardless of state; setup(tsp) invocation clocks
     integer pc_tex_busy;        // pp_stall asserted (texture pipe busy) any clock
     integer pc_su_busy;         // streamed ISP-setup busy (su_busy) any clock
+    // ---- M2 overlap instrumentation: is ISP‖TSP actually happening? ----
+    // isp_work  = ISP FSM doing real tile work (not idle, not just waiting on shade).
+    // tsp_work  = TSP shade FSM busy (tst != T_IDLE).
+    // pc_overlap = BOTH in the same cycle (the win M2 is supposed to create).
+    // pc_isp_only/tsp_only = exactly one engine working. pc_shwait = ISP parked in
+    // S_SHADE_WAIT (blocked on a shade it can't run ahead of). pc_post_stall = ISP
+    // stalled in S_POST on the ping-pong credit (!sh_busy / target half not free).
+    integer pc_overlap;         // ISP work AND TSP work same cycle
+    integer pc_isp_only;        // ISP work, TSP idle
+    integer pc_tsp_only;        // TSP work, ISP not doing tile work
+    integer pc_shwait;          // ISP in S_SHADE_WAIT
+    integer pc_post_stall;      // ISP in S_POST but credit/!sh_busy not satisfied
+    integer pc_op_ff;           // OP-region shade fire-and-forgets (count of requests)
 `endif
 
     // ---- COMBINATIONAL framebuffer-write (VIDEO-OUT / FLUSH), valid/ready ----
@@ -1075,7 +1118,7 @@ module peel_core import tsp_pkg::*; (
     //                    present state until the shader accepts (!pp_stall).
     integer pj;
     always @(*) begin
-        if (st == SH_MPRES) begin
+        if (tst == T_MPRES) begin
             pp_in_valid = 1'b1;
             pp_in_id    = sh_id;
             pp_invw     = sh_invw;
@@ -1122,6 +1165,8 @@ module peel_core import tsp_pkg::*; (
             pc_top_clear<=0; pc_top_peelbuf<=0; pc_top_flush<=0; pc_top_ol<=0;
             pc_top_barrier<=0; pc_top_shade<=0; pc_top_other<=0;
             pc_tex_busy<=0; pc_su_busy<=0;
+            pc_overlap<=0; pc_isp_only<=0; pc_tsp_only<=0;
+            pc_shwait<=0; pc_post_stall<=0; pc_op_ff<=0;
 `endif
             rs_st<=RS_IDLE;
             pq_head<=0; pq_tail<=0; pq_count<=0;
@@ -1131,9 +1176,13 @@ module peel_core import tsp_pkg::*; (
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
             b_valid<=1'b0; cb_valid<=1'b0;
             cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
-            col_prod<=1'b0; col_post<=1'b0;   // color producer half + post intent
-            tag_prod<=1'b0; tag_cons<=1'b0;   // taginvw ping-pong (pinned = Milestone 1)
+            col_post<=1'b0;                   // color post-to-VO intent
             ra_done_l<=1'b0;                  // latched region-done
+            tst<=T_IDLE; sh_busy<=1'b0;                 // TSP shade FSM
+            ti_ready<=2'b00; tsp_tag<=1'b0; tsp_col<=1'b0;
+            ti_postonly[0]<=1'b0; ti_postonly[1]<=1'b0;
+            // htile = ISP u_taginvw producer half (per pass); tsp_tag/tsp_col above.
+            htile<=1'b0;
             pc_inval<=1'b0; pc_wr_req<=1'b0;
             // (plane cache valid bits are cleared by u_pc's own reset; pc_lu_req is
             //  combinational, driven by the streaming shade pipeline)
@@ -1143,7 +1192,8 @@ module peel_core import tsp_pkg::*; (
             // Only count while the core is doing tile work (not the top-level idle wait
             // for a start). Approximate "active" as: not S_IDLE, or any engine busy
             // (raster, setup, OR the decoupled video-out engine).
-            if (st != S_IDLE || rs_st != RS_IDLE || su_busy || vst != VO_IDLE) begin
+            if (st != S_IDLE || rs_st != RS_IDLE || su_busy || vst != VO_IDLE
+                             || tst != T_IDLE) begin
                 pc_total <= pc_total + 1;
                 // decoupled VO engine busy (framebuffer writeout / scanout).
                 if (vst != VO_IDLE) pc_top_flush <= pc_top_flush + 1;
@@ -1157,32 +1207,48 @@ module peel_core import tsp_pkg::*; (
                 endcase
 
                 // TSP / shade engine (by top FSM `st`, shade sub-phases only)
-                if (st == SH_PRESENT) begin
+                // TSP/shade engine now classified by the CONCURRENT tst FSM.
+                if (tst == T_PRESENT) begin
                     if      (sh_present_v && pp_stall) pc_sh_tex_stall <= pc_sh_tex_stall + 1;
                     else if (sh_present_acc)           pc_sh_present   <= pc_sh_present   + 1;
                     else                               pc_sh_look      <= pc_sh_look      + 1; // fill/lookup
-                end else if (st == SH_MPRES) begin
+                end else if (tst == T_MPRES) begin
                     if (pp_stall) pc_sh_tex_stall <= pc_sh_tex_stall + 1;
                     else          pc_sh_present    <= pc_sh_present    + 1;
-                end else if (st == TSP_RUN)                       pc_sh_setup_wait <= pc_sh_setup_wait + 1;
-                else if (st==FH_ISP||st==FH_ISPW||st==FH_TSPW||st==FH_TCWW||
-                         st==FV_RD||st==FV_W)                     pc_sh_fetch <= pc_sh_fetch + 1;
-                else if (st==SH_DRAIN)                            pc_sh_drain <= pc_sh_drain + 1;
+                end else if (tst == T_TSP_RUN)                    pc_sh_setup_wait <= pc_sh_setup_wait + 1;
+                else if (tst==T_FH_ISP||tst==T_FH_ISPW||tst==T_FH_TSPW||tst==T_FH_TCWW||
+                         tst==T_FV_RD||tst==T_FV_W)               pc_sh_fetch <= pc_sh_fetch + 1;
+                else if (tst==T_DRAIN)                            pc_sh_drain <= pc_sh_drain + 1;
                 else                                              pc_sh_none  <= pc_sh_none  + 1;
 
-                // top-level phase view (whole-core)
+                // top-level phase view (whole-core). SHADE now = tst busy (concurrent).
                 if (st==S_CLEAR_WR)                               pc_top_clear   <= pc_top_clear   + 1;
                 else if (st==S_PEEL_BUF_RUN)                      pc_top_peelbuf <= pc_top_peelbuf + 1;
                 else if (st==S_OL_RUN)                            pc_top_ol      <= pc_top_ol      + 1;
                 else if (st==S_DRAIN)                             pc_top_barrier <= pc_top_barrier + 1;
-                else if (st==SH_MPRES||
-                         st==SH_PRESENT||st==SH_DRAIN||st==TSP_RUN||
-                         st==FH_ISP||st==FH_ISPW||st==FH_TSPW||st==FH_TCWW||
-                         st==FV_RD||st==FV_W)                     pc_top_shade   <= pc_top_shade   + 1;
                 else                                              pc_top_other   <= pc_top_other   + 1;
+                if (tst != T_IDLE)                                pc_top_shade   <= pc_top_shade   + 1;
 
                 if (pp_stall) pc_tex_busy <= pc_tex_busy + 1;
                 if (su_busy)  pc_su_busy  <= pc_su_busy  + 1;
+
+                // ---- M2 overlap accounting ----
+                // ISP "doing tile work" = producing/consuming geometry or walking a
+                // buffer (raster consumer active, CLEAR/PeelBuffers walk, or OL walk).
+                begin : m2acct
+                    reg isp_work, tsp_work;
+                    isp_work = (rs_st != RS_IDLE) || su_busy ||
+                               (st==S_CLEAR_WR) || (st==S_PEEL_BUF_RUN) || (st==S_OL_RUN);
+                    tsp_work = (tst != T_IDLE);
+                    if (isp_work && tsp_work) pc_overlap  <= pc_overlap  + 1;
+                    else if (isp_work)        pc_isp_only <= pc_isp_only + 1;
+                    else if (tsp_work)        pc_tsp_only <= pc_tsp_only + 1;
+                    // ISP stalled waiting for TSP to free the u_taginvw half it needs
+                    // (ping-pong back-pressure: ISP N+1 finished before TSP N drained).
+                    if (st==S_PEEL_BUF && ti_ready[htile]) pc_shwait <= pc_shwait + 1;
+                    // TSP stalled waiting for VO to free the u_col half (T_POST).
+                    if (tst==T_POST && col_full[tsp_col])  pc_post_stall <= pc_post_stall + 1;
+                end
             end
 `endif
             done<=0; ra_start<=0; ol_start<=0;
@@ -1256,9 +1322,13 @@ module peel_core import tsp_pkg::*; (
                 // ra_tiles_parsed is a 1-CYCLE PULSE, so LATCH it (ra_done_l) and hold
                 // in S_RA until VO drains - otherwise the pulse is lost while VO is busy
                 // and the FSM deadlocks in S_RA (the last-tile-writeout hang).
+                // Frame done only once the WHOLE pipeline has drained: the concurrent
+                // TSP shade FSM idle with no pending u_taginvw halves, AND the video-out
+                // engine idle with no pending u_col halves.
                 if (ra_tiles_parsed) ra_done_l <= 1'b1;
                 if (ra_done_l || ra_tiles_parsed) begin
-                    if (vst==VO_IDLE && col_full==2'b00) begin
+                    if (tst==T_IDLE && ti_ready==2'b00 &&
+                        vst==VO_IDLE && col_full==2'b00) begin
                         ra_done_l <= 1'b0;
                         st<=S_DONE;
                     end
@@ -1277,7 +1347,9 @@ module peel_core import tsp_pkg::*; (
                 // CLEAR touches the whole tile buffer: BARRIER first (consumer of
                 // the previous state must be fully done). The M10K CLEAR is a 128-
                 // chunk write walk (S_CLEAR_WR) instead of a single-cycle for-loop.
-                RSTATE_CLEAR: if (consumer_idle && fq_empty) begin
+                // gate on !ti_ready[htile]: CLEAR writes u_taginvw[htile], which TSP may
+                // still be reading from an earlier pass (ping-pong back-pressure).
+                RSTATE_CLEAR: if (consumer_idle && fq_empty && !ti_ready[htile]) begin
                     // as tile_engine_top TILE_CLEAR: {bg depth, bg CoreTag}. Every
                     // pixel's tag = background tag and is "valid" for OP shading
                     // (refsw ClearBuffers sets tagStatus.valid=true), so the OP
@@ -1286,8 +1358,9 @@ module peel_core import tsp_pkg::*; (
                     has_pt <= 1'b0; has_tr <= 1'b0;   // PT/TL lists for this tile: none yet
                     cl_i <= '0; st <= S_CLEAR_WR;
                 end
-                // OPAQUE: single pass, plain DepthMode compare (no peeling).
-                RSTATE_OP: begin
+                // OPAQUE: single pass, plain DepthMode compare (no peeling). Gate on
+                // !ti_ready[htile] (raster writes u_taginvw[htile]).
+                RSTATE_OP: if (!ti_ready[htile]) begin
                     peeling  <= 1'b0;
                     ol_list_ptr <= ra_out.list_ptr;
                     ol_start <= 1'b1;
@@ -1309,20 +1382,30 @@ module peel_core import tsp_pkg::*; (
                 // into col_buf); (2) then copy col_buf -> fb.
                 RSTATE_FLUSH: if (consumer_idle && fq_empty) begin
                     if (has_pt || has_tr) begin
-                        // ensure the OP/background shade ran so col_buf is the base
-                        // image the peel layers blend over.
+                        // Peel tile. If no OP region ran, the background OP shade must
+                        // run first (peel passes blend over it). It's a normal shade
+                        // handoff into htile (not last); S_PEEL_INIT follows.
                         if (!op_shaded) begin
-                            peeling    <= 1'b0;
-                            shade_mode <= 1'b0;
-                            op_shaded  <= 1'b1;
-                            shade_ret  <= S_PEEL_INIT;
-                            st <= S_SHADE_START;
-                        end else begin
-                            peeling <= 1'b1;
-                            st <= S_PEEL_INIT;
+                            op_shaded <= 1'b1;
+                            ti_ready[htile] <= 1'b1;
+                            ti_mode [htile] <= 1'b0;             // OP background
+                            ti_last [htile] <= 1'b0;
+                            ti_postonly[htile] <= 1'b0;
+                            ti_tx[htile] <= cur_tx; ti_ty[htile] <= cur_ty;
+                            htile <= ~htile;
                         end
+                        peeling <= 1'b1;
+                        st <= S_PEEL_INIT;
                     end else begin
-                        st <= S_POST;   // hand this tile's color to the VO engine
+                        // OP-only tile: color already accumulated in u_col by the OP
+                        // shade. Issue a POST-ONLY handoff so TSP hands u_col to VO
+                        // (after the OP shade drains, in TSP's in-order queue).
+                        ti_ready[htile] <= 1'b1;
+                        ti_postonly[htile] <= 1'b1;
+                        ti_last [htile] <= 1'b1;
+                        ti_tx[htile] <= cur_tx; ti_ty[htile] <= cur_ty;
+                        htile <= ~htile;
+                        ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
                     end
                 end
                 default: begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
@@ -1366,24 +1449,50 @@ module peel_core import tsp_pkg::*; (
             S_DRAIN: if (fq_empty && consumer_idle) begin
                 if (peeling) begin
                     // Unified peel: after the PT list, rasterize the TL list into the
-                    // same buffers (if present) BEFORE shading, so both sort together.
+                    // same half (both lists build this pass's staged frags) BEFORE the
+                    // shade, so they sort together.
                     if (peel_which==1'b0 && has_tr) begin
                         peel_which <= 1'b1;
                         ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
                         st <= S_OL_RUN;
                     end else begin
-                        shade_mode <= 1'b1;      // PEEL: shade only valid pixels
-                        shade_ret  <= S_PEEL_CHK;
-                        st <= S_SHADE_START;
+                        // PEEL pass fully rastered into u_taginvw[htile]. HAND it to TSP
+                        // (set the ready credit) and RUN AHEAD: flip htile so the next
+                        // pass rasters into the OTHER half while TSP shades this one.
+                        // more_to_draw (set during this pass's raster) tells us if this
+                        // is the LAST pass -> ti_last so TSP posts the color to VO.
+                        ti_ready[htile] <= 1'b1;
+                        ti_mode [htile] <= 1'b1;                 // PEEL
+                        ti_last [htile] <= !more_to_draw;
+                        ti_tx   [htile] <= cur_tx; ti_ty[htile] <= cur_ty;
+                        htile <= ~htile;
+                        if (more_to_draw && peel_pass < PEEL_MAX_PASS[7:0])
+                            st <= S_PEEL_BUF;    // do another pass (PeelBuffers+raster)
+                        else begin
+                            // last pass: tile done producing. Ack region (FLUSH); TSP
+                            // will post the color when this final shade drains.
+                            peeling <= 1'b0;
+                            ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
+                        end
                     end
                 end else begin
-                    shade_mode <= 1'b0;          // OP: shade every pixel
-                    shade_ret  <= S_OP_DONE;
-                    st <= S_SHADE_START;
+                    // OP region fully rastered into u_taginvw[htile]. HAND to TSP and run
+                    // ahead. NOT last: the tile's FLUSH state (later) issues the final
+                    // post-only shade (ti_last) that hands color to VO.
+                    ti_ready[htile] <= 1'b1;
+                    ti_mode [htile] <= 1'b0;                     // OP
+                    ti_last [htile] <= 1'b0;
+                    ti_tx   [htile] <= cur_tx; ti_ty[htile] <= cur_ty;
+                    htile <= ~htile;
+`ifndef SYNTHESIS
+                    pc_op_ff <= pc_op_ff + 1;
+`endif
+                    st <= S_OP_DONE;
                 end
             end
 
-            // OP shade drained -> mark this tile OP-shaded, ack the OP region.
+            // OP shade HANDED to TSP (running concurrently) -> mark tile OP-shaded,
+            // ack the OP region. Do NOT wait for the shade to drain.
             S_OP_DONE: begin op_shaded <= 1'b1; ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
 
             // -------- layer-peel pass loop (refsw2 RM_TRANSLUCENT_AUTOSORT) --------
@@ -1403,7 +1512,7 @@ module peel_core import tsp_pkg::*; (
                 peeling    <= 1'b1;  // (pre-peel OP shade may have cleared it)
                 peel_pass  <= 8'd0;  // reset the pass counter for THIS tile's peel
                 first_peel <= 1'b1;  // fold SetTagToMax into the first PeelBuffers
-                st <= S_PEEL_BUF;
+                st <= S_PEEL_BUF;    // S_PEEL_BUF gates on !ti_ready[htile]
             end
 
             // PeelBuffers(FLT_MAX, 0): per pixel depth2<-depth, tag2<-tag (or
@@ -1414,7 +1523,11 @@ module peel_core import tsp_pkg::*; (
             // On pass 1 dt_depth holds the OP result (nothing clobbers it between OP
             // and the peel); later passes it holds the previous pass's closest layer;
             // copying live dt_depth every pass is correct - no snapshot needed.
-            S_PEEL_BUF: begin
+            // STALL before writing the new htile half until TSP has consumed it
+            // (!ti_ready[htile]): PeelBuffers' pbc walk clears this half's valid and the
+            // pass's raster fills it, so it must be free (ping-pong back-pressure - if
+            // ISP N+1 finished before TSP N, ISP waits here).
+            S_PEEL_BUF: if (!ti_ready[htile]) begin
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1)
                     dt_pt[i] = 1'b0;
                 more_to_draw <= 1'b0;
@@ -1449,220 +1562,9 @@ module peel_core import tsp_pkg::*; (
                 end
             end
 
-            // After a pass's peel-shade drained: another peel pass if a fragment was
-            // deferred (more_to_draw) and under the bound; else write out.
-            S_PEEL_CHK: begin
-                if (more_to_draw && peel_pass < PEEL_MAX_PASS[7:0]) begin
-                    st <= S_PEEL_BUF;
-                end else begin
-                    peeling <= 1'b0;
-                    st <= S_POST;   // hand this tile's color to the VO engine
-                end
-            end
-
-            // POST: hand this tile's finished color buffer (col_prod) to the DECOUPLED
-            // video-out engine and ack the region IMMEDIATELY, so ISP/TSP can start the
-            // next tile while VO streams this one to the framebuffer. We flip col_prod
-            // so the next tile blends into the OTHER half; that half must be FREE (VO
-            // has drained it) - else stall here. With 2 halves this is the pipeline
-            // depth: VO(tile N) overlaps ISP/TSP(tile N+1); tile N+2 waits for VO(N).
-            // col_post is a 1-cyc intent consumed by the VO always block (sole writer
-            // of col_full), which sets col_full[col_post_hp] + latches coords.
-            S_POST: if (!col_full[~col_prod]) begin
-                col_post    <= 1'b1;
-                col_post_hp <= col_prod;
-                col_post_tx <= cur_tx;
-                col_post_ty <= cur_ty;
-                col_prod    <= ~col_prod;      // next tile -> other half
-                ra_ack.list_done <= 1'b1;
-                st <= S_RA_ACK;
-            end
-
-            // ---------------- shade sub-phase (shared, ONE tsp pipeline) ----------
-            // Invalidate the tile-local plane cache, reset the pixel walk, and
-            // start streaming pixels. shade_mode selects which pixels; shade_ret is
-            // where we go when the pipe drains.
-            S_SHADE_START: begin
-                pc_inval <= 1'b1;             // clear the plane cache (1-cyc bulk)
-                shp <= 10'd0; sh_out_n <= 0; sh_pending <= 0;
-                // prime the streaming front: nothing in flight yet, all 1024 to issue.
-                va <= 1'b0; vb <= 1'b0; iss_more <= 1'b1;
-                st <= SH_PRESENT;
-            end
-
-            // ================= STREAMING shade PRODUCER (1 px/clk good case) =========
-            // Three overlapping stages feed tsp_shade_pp, gated together by sh_adv:
-            //   L0 issue   : present the peel-buffer read of shp (pb_shrd_* combi); shp++
-            //   L1 lookup  : peel result for ida on sh_* -> present the plane-cache read
-            //                of its tag (pc_lu_* combi); PEEL-skip !sh_valid_o pixels
-            //   L2 present : pc_hit/pc_o_* resolve idb -> drive tsp_shade_pp (pp mux)
-            // A cache MISS at L2 freezes the front (sh_adv=0) and branches to the fetch
-            // subroutine (FH_*/FV_*/TSP_RUN); on return SH_MPRES presents idb from cur_*.
-            // A texture-stall present holds the front in place (sh_adv=0) but re-issues
-            // both in-flight reads (see the request block) so sh_*/pc_* stay alive.
-            SH_PRESENT: begin
-                if (sh_adv) begin
-                    // ---- L2 present: a hit was accepted this cycle (sh_adv guarantees
-                    //      !(sh_present_v && pp_stall), so a valid hit IS taken). ----
-                    if (sh_present_v) hit_count <= hit_count + 1;
-
-                    // ---- L1 -> L2: stage A's resolved pixel enters stage B (its
-                    //      plane-cache read was presented THIS cycle -> pc_* next cyc).
-                    //      PEEL-skipped pixels (!sh_A_staged) drop as a bubble. ----
-                    if (sh_A_staged) begin
-                        vb    <= 1'b1;
-                        idb   <= ida;
-                        tagb  <= sh_tag_o;
-                        invwb <= sh_depth_o;
-                        sh_pending <= sh_pending + 1;
-                    end else begin
-                        vb <= 1'b0;
-                    end
-
-                    // ---- L0 -> L1: issue the next pixel's peel read (presented THIS
-                    //      cycle via pb_shrd_*), advance shp, retire iss_more at 1023. ----
-                    if (iss_more) begin
-                        va  <= 1'b1;
-                        ida <= shp;
-                        if (shp == 10'd1023) iss_more <= 1'b0;
-                        else                 shp <= shp + 10'd1;
-                    end else begin
-                        va <= 1'b0;
-                    end
-
-                    // ---- drain: front empty and nothing left to issue -> done. ----
-                    if (!iss_more && !va && !sh_A_staged) st <= SH_DRAIN;
-                end else if (sh_miss) begin
-                    // ---- L2 miss: freeze the front, latch idb's context, fetch. The
-                    //      slot fields derive from the `sh_tag` reg, but f_rec must use
-                    //      tagb NOW (sh_tag updates next cycle). ----
-                    miss_count <= miss_count + 1;
-                    sh_tag  <= tagb;                 // drives sh_po/sh_toff/... for fetch
-                    sh_invw <= invwb;                // idb's depth (fed to the shader)
-                    sh_id   <= idb;                  // idb's tile index (fed to the shader)
-                    f_rec   <= param_base + {4'd0, tagb[23:3], 2'b00};
-                    st <= FH_ISP;
-                end
-                // else: hit-present held on a texture stall -> hold (front re-issues).
-            end
-
-            // ---- param record fetch (refsw GetFpuEntry / decode_pvr_vertices) ----
-            FH_ISP:  begin f_addr<=f_rec; f_go<=1'b1; st<=FH_ISPW; end
-            FH_ISPW: if (f_word_v) begin
-                        cur_isp = f_word;
-                        f_addr<=f_rec+27'd4; f_go<=1'b1; st<=FH_TSPW;
-                    end
-            FH_TSPW: if (f_word_v) begin
-                        cur_tsp = f_word;
-                        f_addr<=f_rec+27'd8; f_go<=1'b1; st<=FH_TCWW;
-                    end
-            FH_TCWW: if (f_word_v) begin
-                        cur_tcw = f_word;
-                        // first vertex = tag_offset (in-order, refsw GetFpuEntry)
-                        f_vtx <= f_rec + (sh_two_vol ? 27'd20 : 27'd12)
-                                       + {22'd0, sh_toff} * sh_stride_b;
-                        fv_i  <= 2'd0;
-                        fv_fld<= FLD_X;
-                        // zero all fields (disabled planes/attrs read as 0)
-                        for (j = 0; j < 3; j = j + 1) begin
-                            fv_u[j]=32'd0; fv_v[j]=32'd0; fv_col[j]=32'd0; fv_ofs[j]=32'd0;
-                        end
-                        st <= FV_RD;
-                    end
-
-            // issue the read for the current field of the current vertex
-            FV_RD: begin
-                case (fv_fld)
-                FLD_X:    f_ptr = f_vtx;
-                FLD_Y:    f_ptr = f_vtx + 27'd4;
-                FLD_Z:    f_ptr = f_vtx + 27'd8;
-                FLD_UV16,
-                FLD_U:    f_ptr = f_vtx + 27'd12;
-                FLD_V:    f_ptr = f_vtx + 27'd16;
-                // col follows xyz+uv; ofs follows col
-                FLD_COL:  f_ptr = f_vtx + 27'd12
-                                + (f_texture ? (f_uv16 ? 27'd4 : 27'd8) : 27'd0);
-                default:  f_ptr = f_vtx + 27'd16
-                                + (f_texture ? (f_uv16 ? 27'd4 : 27'd8) : 27'd0); // FLD_OFS
-                endcase
-                f_addr <= f_ptr; f_go <= 1'b1; st <= FV_W;
-            end
-
-            FV_W: if (f_word_v) begin
-                case (fv_fld)
-                FLD_X: begin fv_x[fv_i] = f_word; fv_fld <= FLD_Y;  st <= FV_RD; end
-                FLD_Y: begin fv_y[fv_i] = f_word; fv_fld <= FLD_Z;  st <= FV_RD; end
-                FLD_Z: begin
-                    fv_z[fv_i] = f_word;
-                    if (f_texture) begin
-                        fv_fld <= f_uv16 ? FLD_UV16 : FLD_U; st <= FV_RD;
-                    end else begin fv_fld <= FLD_COL; st <= FV_RD; end
-                end
-                FLD_UV16: begin
-                    // DC 16-bit UV: each half is the top 16 bits of an f32
-                    fv_u[fv_i] = {f_word[31:16], 16'd0};
-                    fv_v[fv_i] = {f_word[15:0],  16'd0};
-                    fv_fld <= FLD_COL; st <= FV_RD;
-                end
-                FLD_U: begin fv_u[fv_i] = f_word; fv_fld <= FLD_V;   st <= FV_RD; end
-                FLD_V: begin fv_v[fv_i] = f_word; fv_fld <= FLD_COL; st <= FV_RD; end
-                FLD_COL: begin
-                    fv_col[fv_i] = f_word;
-                    if (f_offset) begin fv_fld <= FLD_OFS; st <= FV_RD; end
-                    else if (fv_i == 2'd2) begin
-                        // all 3 vertices in: zero the planes (disabled attrs
-                        // stay 0) and kick tsp_setup_min
-                        for (j = 0; j < 10; j = j + 1) begin
-                            cur_ddx[j]=32'd0; cur_ddy[j]=32'd0; cur_c[j]=32'd0;
-                        end
-                        tsp_start <= 1'b1; st <= TSP_RUN;
-                    end
-                    else begin fv_i <= fv_i + 2'd1; f_vtx <= f_vtx + sh_stride_b;
-                               fv_fld <= FLD_X; st <= FV_RD; end
-                end
-                default: begin // FLD_OFS
-                    fv_ofs[fv_i] = f_word;
-                    if (fv_i == 2'd2) begin
-                        for (j = 0; j < 10; j = j + 1) begin
-                            cur_ddx[j]=32'd0; cur_ddy[j]=32'd0; cur_c[j]=32'd0;
-                        end
-                        tsp_start <= 1'b1; st <= TSP_RUN;
-                    end
-                    else begin fv_i <= fv_i + 2'd1; f_vtx <= f_vtx + sh_stride_b;
-                               fv_fld <= FLD_X; st <= FV_RD; end
-                end
-                endcase
-            end
-
-            // wait for tsp_setup_min; planes stream into cur_* via the tsp_pvalid
-            // capture below. On done, commit the WHOLE cur_* bundle to the plane
-            // cache in one write (pc_wr_req; u_pc's write ports are wired to sh_tag +
-            // cur_*). cur_* is complete by tsp_done (setup emits all planes first).
-            TSP_RUN: if (tsp_done) begin
-                pc_wr_req <= 1'b1;            // commit the fetched entry to the cache
-                st <= SH_MPRES;
-            end
-
-            // MISS PRESENT: the plane cache was just filled for idb; present that pixel
-            // straight from cur_* (the pp-input mux drives pp_in_valid=1 while here).
-            // Hold until the shader accepts (!pp_stall), then RETURN to the stream.
-            // The request block re-presents ida's peel read on this accepting cycle
-            // (sh_mpres_acc), so stage A's sh_* is fresh when we re-enter SH_PRESENT.
-            // Stage B is now empty (idb consumed): vb<=0; stage A (va/ida) survived the
-            // fetch and resumes at L1 next cycle.
-            SH_MPRES: if (!pp_stall) begin
-                vb <= 1'b0;                  // idb consumed (miss already counted)
-                st <= SH_PRESENT;
-            end
-
-            // all presented pixels drained: return to the caller (shade_ret).
-            // sh_out_n counts blend stage-CA events; also wait !cb_valid so the
-            // trailing stage-CB col_ram write lands before the next phase (peel pass
-            // reads col via the blend dst, or FLUSH reads col_ram). The framebuffer
-            // writeout happens later at RSTATE_FLUSH.
-            SH_DRAIN: if (sh_out_n >= sh_pending && !cb_valid) begin
-                st <= shade_ret;
-            end
+            // (peel pass continuation + tile posting are now handled inline in S_DRAIN
+            // via ti_ready handoff to the concurrent TSP FSM; S_PEEL_CHK/S_POST/
+            // S_SHADE_WAIT are gone.)
 
             S_RA_ACK: st <= S_RA;
 
@@ -1694,10 +1596,201 @@ module peel_core import tsp_pkg::*; (
                 $display("  resources:   tex_busy=%0d (%0d%%)  isp_setup_busy=%0d (%0d%%)",
                     pc_tex_busy, (pc_tex_busy*100)/(pc_total?pc_total:1),
                     pc_su_busy, (pc_su_busy*100)/(pc_total?pc_total:1));
+                // ---- M2 ISP‖TSP overlap: the whole point of Milestone 2 ----
+                $display("  M2 OVERLAP:  BOTH(isp&tsp)=%0d (%0d%%)  isp_only=%0d (%0d%%)  tsp_only=%0d (%0d%%)",
+                    pc_overlap,  (pc_overlap*100)/(pc_total?pc_total:1),
+                    pc_isp_only, (pc_isp_only*100)/(pc_total?pc_total:1),
+                    pc_tsp_only, (pc_tsp_only*100)/(pc_total?pc_total:1));
+                $display("               ISP shade_wait=%0d (%0d%%)  post_stall=%0d (%0d%%)  OP_fire&forget=%0d",
+                    pc_shwait,     (pc_shwait*100)/(pc_total?pc_total:1),
+                    pc_post_stall, (pc_post_stall*100)/(pc_total?pc_total:1),
+                    pc_op_ff);
 `endif
                 done<=1'b1; st<=S_IDLE;
             end
             default: st<=S_IDLE;
+            endcase
+
+            // ================= CONCURRENT TSP SHADE FSM (tst) =================
+            // Extracted from the ISP FSM: runs every cycle alongside `st` and `rs_st`.
+            // Kicked by sh_req (from S_SHADE_WAIT), shades the consumer u_taginvw half
+            // into u_col[col_prod], pulses sh_done when the pipe drains. shade_mode
+            // selects OP (all pixels) vs PEEL (staged only). All the pp/pc/blend/fetch
+            // resources are shade-dedicated, so no contention with the ISP raster path.
+            case (tst)
+            // Pick the next READY u_taginvw half (in order via tsp_tag): a raster pass/OP
+            // ISP finished into u_taginvw[tsp_tag]. Latch its mode; shade it into the
+            // current tile's u_col half (tsp_col).
+            T_IDLE: if (ti_ready[tsp_tag]) begin
+                if (ti_postonly[tsp_tag]) begin
+                    // OP-only tile FLUSH: color already in u_col[tsp_col]; just post it.
+                    // (ti_last is implied for a post-only.) Free the half, go post.
+                    ti_ready[tsp_tag] <= 1'b0;
+                    tst <= T_POST;
+                end else begin
+                    pc_inval <= 1'b1;             // clear the plane cache (1-cyc bulk)
+                    shp <= 10'd0; sh_out_n <= 0; sh_pending <= 0;
+                    va <= 1'b0; vb <= 1'b0; iss_more <= 1'b1;
+                    sh_busy    <= 1'b1;
+                    shade_mode <= ti_mode[tsp_tag];
+                    tst <= T_PRESENT;
+                end
+            end
+
+            // ---- STREAMING shade PRODUCER (was SH_PRESENT) ----
+            T_PRESENT: begin
+                if (sh_adv) begin
+                    if (sh_present_v) hit_count <= hit_count + 1;
+                    if (sh_A_staged) begin
+                        vb    <= 1'b1;
+                        idb   <= ida;
+                        tagb  <= sh_tag_o;
+                        invwb <= sh_depth_o;
+                        sh_pending <= sh_pending + 1;
+                    end else begin
+                        vb <= 1'b0;
+                    end
+                    if (iss_more) begin
+                        va  <= 1'b1;
+                        ida <= shp;
+                        if (shp == 10'd1023) iss_more <= 1'b0;
+                        else                 shp <= shp + 10'd1;
+                    end else begin
+                        va <= 1'b0;
+                    end
+                    if (!iss_more && !va && !sh_A_staged) tst <= T_DRAIN;
+                end else if (sh_miss) begin
+                    miss_count <= miss_count + 1;
+                    sh_tag  <= tagb;
+                    sh_invw <= invwb;
+                    sh_id   <= idb;
+                    f_rec   <= param_base + {4'd0, tagb[23:3], 2'b00};
+                    tst <= T_FH_ISP;
+                end
+                // else: hit-present held on a texture stall -> hold (front re-issues).
+            end
+
+            // ---- param record fetch (was FH_*/FV_*) ----
+            T_FH_ISP:  begin f_addr<=f_rec; f_go<=1'b1; tst<=T_FH_ISPW; end
+            T_FH_ISPW: if (f_word_v) begin
+                        cur_isp = f_word;
+                        f_addr<=f_rec+27'd4; f_go<=1'b1; tst<=T_FH_TSPW;
+                    end
+            T_FH_TSPW: if (f_word_v) begin
+                        cur_tsp = f_word;
+                        f_addr<=f_rec+27'd8; f_go<=1'b1; tst<=T_FH_TCWW;
+                    end
+            T_FH_TCWW: if (f_word_v) begin
+                        cur_tcw = f_word;
+                        f_vtx <= f_rec + (sh_two_vol ? 27'd20 : 27'd12)
+                                       + {22'd0, sh_toff} * sh_stride_b;
+                        fv_i  <= 2'd0;
+                        fv_fld<= FLD_X;
+                        for (j = 0; j < 3; j = j + 1) begin
+                            fv_u[j]=32'd0; fv_v[j]=32'd0; fv_col[j]=32'd0; fv_ofs[j]=32'd0;
+                        end
+                        tst <= T_FV_RD;
+                    end
+
+            T_FV_RD: begin
+                case (fv_fld)
+                FLD_X:    f_ptr = f_vtx;
+                FLD_Y:    f_ptr = f_vtx + 27'd4;
+                FLD_Z:    f_ptr = f_vtx + 27'd8;
+                FLD_UV16,
+                FLD_U:    f_ptr = f_vtx + 27'd12;
+                FLD_V:    f_ptr = f_vtx + 27'd16;
+                FLD_COL:  f_ptr = f_vtx + 27'd12
+                                + (f_texture ? (f_uv16 ? 27'd4 : 27'd8) : 27'd0);
+                default:  f_ptr = f_vtx + 27'd16
+                                + (f_texture ? (f_uv16 ? 27'd4 : 27'd8) : 27'd0); // FLD_OFS
+                endcase
+                f_addr <= f_ptr; f_go <= 1'b1; tst <= T_FV_W;
+            end
+
+            T_FV_W: if (f_word_v) begin
+                case (fv_fld)
+                FLD_X: begin fv_x[fv_i] = f_word; fv_fld <= FLD_Y;  tst <= T_FV_RD; end
+                FLD_Y: begin fv_y[fv_i] = f_word; fv_fld <= FLD_Z;  tst <= T_FV_RD; end
+                FLD_Z: begin
+                    fv_z[fv_i] = f_word;
+                    if (f_texture) begin
+                        fv_fld <= f_uv16 ? FLD_UV16 : FLD_U; tst <= T_FV_RD;
+                    end else begin fv_fld <= FLD_COL; tst <= T_FV_RD; end
+                end
+                FLD_UV16: begin
+                    fv_u[fv_i] = {f_word[31:16], 16'd0};
+                    fv_v[fv_i] = {f_word[15:0],  16'd0};
+                    fv_fld <= FLD_COL; tst <= T_FV_RD;
+                end
+                FLD_U: begin fv_u[fv_i] = f_word; fv_fld <= FLD_V;   tst <= T_FV_RD; end
+                FLD_V: begin fv_v[fv_i] = f_word; fv_fld <= FLD_COL; tst <= T_FV_RD; end
+                FLD_COL: begin
+                    fv_col[fv_i] = f_word;
+                    if (f_offset) begin fv_fld <= FLD_OFS; tst <= T_FV_RD; end
+                    else if (fv_i == 2'd2) begin
+                        for (j = 0; j < 10; j = j + 1) begin
+                            cur_ddx[j]=32'd0; cur_ddy[j]=32'd0; cur_c[j]=32'd0;
+                        end
+                        tsp_start <= 1'b1; tst <= T_TSP_RUN;
+                    end
+                    else begin fv_i <= fv_i + 2'd1; f_vtx <= f_vtx + sh_stride_b;
+                               fv_fld <= FLD_X; tst <= T_FV_RD; end
+                end
+                default: begin // FLD_OFS
+                    fv_ofs[fv_i] = f_word;
+                    if (fv_i == 2'd2) begin
+                        for (j = 0; j < 10; j = j + 1) begin
+                            cur_ddx[j]=32'd0; cur_ddy[j]=32'd0; cur_c[j]=32'd0;
+                        end
+                        tsp_start <= 1'b1; tst <= T_TSP_RUN;
+                    end
+                    else begin fv_i <= fv_i + 2'd1; f_vtx <= f_vtx + sh_stride_b;
+                               fv_fld <= FLD_X; tst <= T_FV_RD; end
+                end
+                endcase
+            end
+
+            // wait for tsp_setup_min; commit cur_* to the plane cache (was TSP_RUN)
+            T_TSP_RUN: if (tsp_done) begin
+                pc_wr_req <= 1'b1;
+                tst <= T_MPRES;
+            end
+
+            // MISS PRESENT: present idb from cur_* (was SH_MPRES)
+            T_MPRES: if (!pp_stall) begin
+                vb <= 1'b0;
+                tst <= T_PRESENT;
+            end
+
+            // all presented pixels drained (was SH_DRAIN). Free this u_taginvw half's
+            // ready credit (ISP may reuse it) and advance tsp_tag to the next PASS half.
+            // If this was the tile's FINAL shade (ti_last), the whole tile's color is now
+            // accumulated in u_col[tsp_col] -> hand it to VO (T_POST).
+            T_DRAIN: if (sh_out_n >= sh_pending && !cb_valid) begin
+                sh_busy <= 1'b0;
+                ti_ready[tsp_tag] <= 1'b0;       // free the u_taginvw half for ISP
+                if (ti_last[tsp_tag]) tst <= T_POST;
+                else begin
+                    tsp_tag <= ~tsp_tag;         // next pass half
+                    tst <= T_IDLE;
+                end
+            end
+
+            // POST the finished tile's color (u_col[tsp_col]) to the VO engine via the
+            // u_col ping-pong credit: stall until VO has drained whatever it held for
+            // this half (!col_full[tsp_col]), then set the credit + coords, flip tsp_col
+            // (next tile blends the other u_col half), and advance tsp_tag.
+            T_POST: if (!col_full[tsp_col]) begin
+                col_post    <= 1'b1;
+                col_post_hp <= tsp_col;
+                col_post_tx <= ti_tx[tsp_tag];
+                col_post_ty <= ti_ty[tsp_tag];
+                tsp_col <= ~tsp_col;             // next tile -> other u_col half
+                tsp_tag <= ~tsp_tag;             // next pass half
+                tst <= T_IDLE;
+            end
+            default: tst <= T_IDLE;
             endcase
 
             // ======== ENTRY FIFO -> prefetching iterator -> tri FIFO ========
