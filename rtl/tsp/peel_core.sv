@@ -263,15 +263,17 @@ module peel_core import tsp_pkg::*; (
     //   su_busy      : any slot in flight (barrier).
     wire        su_in_valid, su_in_ready, su_out_valid, su_busy;
     wire [31:0] su_out_tag, su_out_isp;
-    assign su_in_valid = !fq_empty && (pq_count <= 5'd4);
+    // gate on fq_out_valid (the head entry is loaded in the output register), not
+    // just !fq_empty: the M10K read that fills fq_out lags a pushed entry by a cycle.
+    assign su_in_valid = fq_out_valid && (pq_count <= 5'd4);
 
     isp_setup_streamed u_isp (
         .clk(clk), .reset(reset),
         .in_valid(su_in_valid), .in_ready(su_in_ready),
-        .isp_word(fq_isp[fq_head[2:0]]), .in_tag(fq_tag[fq_head[2:0]]),
-        .x1(fq_x1[fq_head[2:0]]), .y1(fq_y1[fq_head[2:0]]), .z1(fq_z1[fq_head[2:0]]),
-        .x2(fq_x2[fq_head[2:0]]), .y2(fq_y2[fq_head[2:0]]), .z2(fq_z2[fq_head[2:0]]),
-        .x3(fq_x3[fq_head[2:0]]), .y3(fq_y3[fq_head[2:0]]), .z3(fq_z3[fq_head[2:0]]),
+        .isp_word(fq_out[FF_ISP +:32]), .in_tag(fq_out[FF_TAG +:32]),
+        .x1(fq_out[FF_X1 +:32]), .y1(fq_out[FF_Y1 +:32]), .z1(fq_out[FF_Z1 +:32]),
+        .x2(fq_out[FF_X2 +:32]), .y2(fq_out[FF_Y2 +:32]), .z2(fq_out[FF_Z2 +:32]),
+        .x3(fq_out[FF_X3 +:32]), .y3(fq_out[FF_Y3 +:32]), .z3(fq_out[FF_Z3 +:32]),
         .xbase(t_xbase), .ybase(t_ybase),
         .busy(su_busy),
         .out_ready(!pq_full),
@@ -615,7 +617,10 @@ module peel_core import tsp_pkg::*; (
     reg [5:0] st;
 
     // consumer sub-FSM (setup is now the streamed pipeline u_isp -> pq FIFO)
-    localparam RS_IDLE=0, RS_RAS=1, RS_DRAIN=2;  reg [1:0] rs_st;
+    // RS_POP absorbs the 1-cycle registered-read latency of the M10K plane FIFO:
+    // RS_IDLE issues the read (pq_ram[pq_head] -> pq_rdw) and advances head; RS_POP
+    // splices pq_rdw into the active plane regs and starts the sweep.
+    localparam RS_IDLE=0, RS_POP=1, RS_RAS=2, RS_DRAIN=3;  reg [2:0] rs_st;
 
     // ---- unified PT+TL layer-peel pass loop (TB-FSM; refsw do..while(MoreToDraw)) ----
     reg        more_to_draw;      // set by the raster consumer during a peel pass
@@ -665,15 +670,38 @@ module peel_core import tsp_pkg::*; (
     assign it_entry_valid = !eq_empty;
 
     // ---- triangle FIFO (producer -> consumer), depth 8 ----
+    // Like pq, the data lives in ONE M10K word per entry instead of 11 register
+    // arrays. But setup reads the head COMBINATIONALLY (its .x1/.y1/... ports), which
+    // M10K can't do, so this is a FIRST-WORD-FALL-THROUGH FIFO with a registered
+    // "output register" fq_out that always holds the head entry, pre-read one cycle
+    // ahead. accept (su_in_valid && in_ready) IS the pop: it consumes fq_out and, the
+    // same cycle, issues the M10K read of the NEXT head so fq_out is refreshed next
+    // cycle -> zero-bubble back-to-back accepts (the read latency exactly fills the
+    // gap). fq_out_valid gates su_in_valid so setup never consumes a not-yet-loaded
+    // head. Push into the slot being (re)loaded is BYPASSED from the write data, since
+    // no_rw_check M10K returns OLD data on a same-address same-cycle read+write.
     localparam integer FIFO_N = 8;
-    reg [31:0] fq_isp [0:FIFO_N-1];
-    reg [31:0] fq_tag [0:FIFO_N-1];
-    reg [31:0] fq_x1[0:FIFO_N-1], fq_y1[0:FIFO_N-1], fq_z1[0:FIFO_N-1];
-    reg [31:0] fq_x2[0:FIFO_N-1], fq_y2[0:FIFO_N-1], fq_z2[0:FIFO_N-1];
-    reg [31:0] fq_x3[0:FIFO_N-1], fq_y3[0:FIFO_N-1], fq_z3[0:FIFO_N-1];
+    localparam integer FQ_W = 352;   // 11 * 32
+    localparam integer FF_ISP=0,  FF_TAG=32,
+                       FF_X1=64,  FF_Y1=96,  FF_Z1=128,
+                       FF_X2=160, FF_Y2=192, FF_Z2=224,
+                       FF_X3=256, FF_Y3=288, FF_Z3=320;
+    (* ramstyle = "M10K, no_rw_check" *) reg [FQ_W-1:0] fq_ram [0:FIFO_N-1];
+    reg [FQ_W-1:0] fq_out;         // registered head entry (FWFT output register)
+    reg            fq_out_valid;   // fq_out holds a valid head entry
     reg [3:0]  fq_head, fq_tail;   // ring indices 0..FIFO_N-1 (0..7)
     reg [4:0]  fq_count;
     reg        fifo_push, fifo_pop; // 1-cycle intents (reconciled into fq_count)
+
+    // assemble the push word from the iterator's triangle
+    wire [FQ_W-1:0] fq_wrw;
+    assign fq_wrw[FF_ISP +:32] = it_trio.isp;  assign fq_wrw[FF_TAG +:32] = it_trio.tag;
+    assign fq_wrw[FF_X1  +:32] = it_trio.v0.x; assign fq_wrw[FF_Y1 +:32] = it_trio.v0.y;
+    assign fq_wrw[FF_Z1  +:32] = it_trio.v0.z;
+    assign fq_wrw[FF_X2  +:32] = it_trio.v1.x; assign fq_wrw[FF_Y2 +:32] = it_trio.v1.y;
+    assign fq_wrw[FF_Z2  +:32] = it_trio.v1.z;
+    assign fq_wrw[FF_X3  +:32] = it_trio.v2.x; assign fq_wrw[FF_Y3 +:32] = it_trio.v2.y;
+    assign fq_wrw[FF_Z3  +:32] = it_trio.v2.z;
     wire fq_full  = (fq_count == FIFO_N);
     wire fq_empty = (fq_count == 0);
 
@@ -681,17 +709,41 @@ module peel_core import tsp_pkg::*; (
     // Decouples the (interleaved) setup from the rasterizer so setup runs ahead and
     // fills the FIFO instead of lock-stepping through the old 1-deep pend handoff.
     localparam integer PQ_N = 8;
-    reg [31:0] pq_dx12[0:PQ_N-1],pq_dx23[0:PQ_N-1],pq_dx31[0:PQ_N-1],pq_dx41[0:PQ_N-1];
-    reg [31:0] pq_dy12[0:PQ_N-1],pq_dy23[0:PQ_N-1],pq_dy31[0:PQ_N-1],pq_dy41[0:PQ_N-1];
-    reg [31:0] pq_c1[0:PQ_N-1],pq_c2[0:PQ_N-1],pq_c3[0:PQ_N-1],pq_c4[0:PQ_N-1];
-    reg [31:0] pq_ddx[0:PQ_N-1],pq_ddy[0:PQ_N-1],pq_cinvw[0:PQ_N-1];
-    reg [31:0] pq_isp[0:PQ_N-1],pq_tag[0:PQ_N-1];
-    reg [4:0]  pq_bx0[0:PQ_N-1],pq_bx1[0:PQ_N-1],pq_by0[0:PQ_N-1],pq_by1[0:PQ_N-1];
+    // Plane FIFO data now lives in ONE M10K word per entry instead of ~21 separate
+    // register arrays (~5.6 kbit of FFs -> block RAM). Every field is written once at
+    // push (pq_tail) and read once at pop (pq_head), and the read is ALREADY registered
+    // (isp_*/rbx*/ras_* latch it in RS_IDLE), so a registered-read M10K is a drop-in:
+    // push and pop never target the same address in the same cycle (pop only fires when
+    // !pq_empty -> head!=tail; push is blocked by out_ready=!pq_full when head==tail),
+    // so no_rw_check is safe. Only the small head/tail/count control stays in logic.
+    localparam integer PQ_W = 564;   // 17*32 + 4*5
+    localparam integer QF_DX12=0,  QF_DX23=32,  QF_DX31=64,  QF_DX41=96;
+    localparam integer QF_DY12=128,QF_DY23=160, QF_DY31=192, QF_DY41=224;
+    localparam integer QF_C1=256,  QF_C2=288,   QF_C3=320,   QF_C4=352;
+    localparam integer QF_DDX=384, QF_DDY=416,  QF_CINVW=448;
+    localparam integer QF_ISP=480, QF_TAG=512;
+    localparam integer QF_BX0=544, QF_BX1=549,  QF_BY0=554,  QF_BY1=559;   // 5b each
+    (* ramstyle = "M10K, no_rw_check" *) reg [PQ_W-1:0] pq_ram [0:PQ_N-1];
+    reg [PQ_W-1:0] pq_rdw;            // registered read word (valid the cycle after pop)
     reg [3:0]  pq_head, pq_tail;
     reg [4:0]  pq_count;
     reg        pq_push, pq_pop;
     wire pq_full  = (pq_count == PQ_N);
     wire pq_empty = (pq_count == 0);
+
+    // assemble the push word from the retiring planes
+    wire [PQ_W-1:0] pq_wrw;
+    assign pq_wrw[QF_DX12 +: 32] = w_dx12; assign pq_wrw[QF_DX23 +: 32] = w_dx23;
+    assign pq_wrw[QF_DX31 +: 32] = w_dx31; assign pq_wrw[QF_DX41 +: 32] = w_dx41;
+    assign pq_wrw[QF_DY12 +: 32] = w_dy12; assign pq_wrw[QF_DY23 +: 32] = w_dy23;
+    assign pq_wrw[QF_DY31 +: 32] = w_dy31; assign pq_wrw[QF_DY41 +: 32] = w_dy41;
+    assign pq_wrw[QF_C1   +: 32] = w_c1;   assign pq_wrw[QF_C2   +: 32] = w_c2;
+    assign pq_wrw[QF_C3   +: 32] = w_c3;   assign pq_wrw[QF_C4   +: 32] = w_c4;
+    assign pq_wrw[QF_DDX  +: 32] = w_ddx;  assign pq_wrw[QF_DDY  +: 32] = w_ddy;
+    assign pq_wrw[QF_CINVW+: 32] = w_cinvw;
+    assign pq_wrw[QF_ISP  +: 32] = su_out_isp; assign pq_wrw[QF_TAG +: 32] = su_out_tag;
+    assign pq_wrw[QF_BX0  +:  5] = w_bx0;  assign pq_wrw[QF_BX1  +:  5] = w_bx1;
+    assign pq_wrw[QF_BY0  +:  5] = w_by0;  assign pq_wrw[QF_BY1  +:  5] = w_by1;
 
     // consumer fully idle: entry FIFO empty, iterator authoritative-idle (it_pf_busy
     // clear: no record buffered/being read/emitted/outstanding), streamed setup
@@ -789,7 +841,7 @@ module peel_core import tsp_pkg::*; (
             sh_out_n<=0; ras_inflight<=0;
             rs_st<=RS_IDLE;
             pq_head<=0; pq_tail<=0; pq_count<=0;
-            fq_head<=0; fq_tail<=0; fq_count<=0;
+            fq_head<=0; fq_tail<=0; fq_count<=0; fq_out_valid<=1'b0;
             eq_head<=0; eq_tail<=0; eq_count<=0;
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
@@ -1303,11 +1355,7 @@ module peel_core import tsp_pkg::*; (
 
             // push emitted triangles into the tri FIFO (hold-until-space handshake)
             if (it_trio.triangle_ready && !fq_full && !it_ack.triangle_done) begin
-                fq_isp[fq_tail[2:0]] <= it_trio.isp;
-                fq_tag[fq_tail[2:0]] <= it_trio.tag;
-                fq_x1[fq_tail[2:0]]<=it_trio.v0.x; fq_y1[fq_tail[2:0]]<=it_trio.v0.y; fq_z1[fq_tail[2:0]]<=it_trio.v0.z;
-                fq_x2[fq_tail[2:0]]<=it_trio.v1.x; fq_y2[fq_tail[2:0]]<=it_trio.v1.y; fq_z2[fq_tail[2:0]]<=it_trio.v1.z;
-                fq_x3[fq_tail[2:0]]<=it_trio.v2.x; fq_y3[fq_tail[2:0]]<=it_trio.v2.y; fq_z3[fq_tail[2:0]]<=it_trio.v2.z;
+                fq_ram[fq_tail[2:0]] <= fq_wrw;   // one packed M10K word
                 it_ack.triangle_done <= 1'b1;   // advance iterator to next tri
                 fq_tail  <= (fq_tail==FIFO_N-1) ? 4'd0 : fq_tail+4'd1;
                 fifo_push = 1'b1;
@@ -1323,9 +1371,36 @@ module peel_core import tsp_pkg::*; (
 
             // present a triangle to the streaming setup; pop fq when accepted.
             // su_in_valid is assigned combinationally outside the always block.
+            // accept IS the pop: it consumes the head entry sitting in fq_out.
             if (su_in_valid && su_in_ready) begin
                 fq_head <= (fq_head==FIFO_N-1) ? 4'd0 : fq_head+4'd1;
                 fifo_pop = 1'b1;
+            end
+
+            // ---- FWFT read-ahead: keep fq_out loaded with the head entry ----
+            // Reload fq_out when it was just consumed (fifo_pop) or is empty
+            // (!fq_out_valid). The source is the post-pop head (fq_nh). An entry is
+            // available there iff the occupancy at fq_nh is > 0: that's the current
+            // count minus (this cycle's pop) plus (a push landing at fq_nh this cycle).
+            // A push whose tail == fq_nh must be BYPASSED from fq_wrw, because the
+            // no_rw_check M10K read below would return the OLD word for that address.
+            if (fifo_pop || !fq_out_valid) begin
+                reg [3:0] fq_nh;                 // next head to present
+                reg [4:0] fq_avail;              // entries at/after fq_nh
+                reg       fq_push_here;          // this cycle's push targets fq_nh
+                fq_nh = fifo_pop ? ((fq_head==FIFO_N-1) ? 4'd0 : fq_head+4'd1) : fq_head;
+                // occupancy after this cycle's pop (push is accounted via bypass below)
+                fq_avail = fq_count - (fifo_pop ? 5'd1 : 5'd0);
+                fq_push_here = fifo_push && (fq_tail[2:0] == fq_nh[2:0]);
+                if (fq_push_here) begin
+                    fq_out       <= fq_wrw;      // bypass: RAM would return stale word
+                    fq_out_valid <= 1'b1;
+                end else if (fq_avail != 0) begin
+                    fq_out       <= fq_ram[fq_nh[2:0]];   // registered M10K read
+                    fq_out_valid <= 1'b1;
+                end else begin
+                    fq_out_valid <= 1'b0;        // nothing to present next cycle
+                end
             end
 
             // retire: on out_valid, push non-culled triangles into the plane FIFO.
@@ -1333,17 +1408,7 @@ module peel_core import tsp_pkg::*; (
                 if (isp_cull) begin
                     cull_count <= cull_count + 1;
                 end else begin
-                    pq_dx12[pq_tail[2:0]]<=w_dx12; pq_dx23[pq_tail[2:0]]<=w_dx23;
-                    pq_dx31[pq_tail[2:0]]<=w_dx31; pq_dx41[pq_tail[2:0]]<=w_dx41;
-                    pq_dy12[pq_tail[2:0]]<=w_dy12; pq_dy23[pq_tail[2:0]]<=w_dy23;
-                    pq_dy31[pq_tail[2:0]]<=w_dy31; pq_dy41[pq_tail[2:0]]<=w_dy41;
-                    pq_c1[pq_tail[2:0]]<=w_c1; pq_c2[pq_tail[2:0]]<=w_c2;
-                    pq_c3[pq_tail[2:0]]<=w_c3; pq_c4[pq_tail[2:0]]<=w_c4;
-                    pq_ddx[pq_tail[2:0]]<=w_ddx; pq_ddy[pq_tail[2:0]]<=w_ddy;
-                    pq_cinvw[pq_tail[2:0]]<=w_cinvw;
-                    pq_isp[pq_tail[2:0]]<=su_out_isp; pq_tag[pq_tail[2:0]]<=su_out_tag;
-                    pq_bx0[pq_tail[2:0]]<=w_bx0; pq_bx1[pq_tail[2:0]]<=w_bx1;
-                    pq_by0[pq_tail[2:0]]<=w_by0; pq_by1[pq_tail[2:0]]<=w_by1;
+                    pq_ram[pq_tail[2:0]] <= pq_wrw;   // one packed M10K word
                     pq_tail <= (pq_tail==PQ_N-1) ? 4'd0 : pq_tail+4'd1;
                     pq_push  = 1'b1;
                 end
@@ -1356,24 +1421,30 @@ module peel_core import tsp_pkg::*; (
             pq_pop = 1'b0;
             case (rs_st)
             RS_IDLE: if (!pq_empty) begin
-                isp_dx12<=pq_dx12[pq_head[2:0]]; isp_dx23<=pq_dx23[pq_head[2:0]];
-                isp_dx31<=pq_dx31[pq_head[2:0]]; isp_dx41<=pq_dx41[pq_head[2:0]];
-                isp_dy12<=pq_dy12[pq_head[2:0]]; isp_dy23<=pq_dy23[pq_head[2:0]];
-                isp_dy31<=pq_dy31[pq_head[2:0]]; isp_dy41<=pq_dy41[pq_head[2:0]];
-                isp_c1<=pq_c1[pq_head[2:0]]; isp_c2<=pq_c2[pq_head[2:0]];
-                isp_c3<=pq_c3[pq_head[2:0]]; isp_c4<=pq_c4[pq_head[2:0]];
-                isp_ddx_invw<=pq_ddx[pq_head[2:0]]; isp_ddy_invw<=pq_ddy[pq_head[2:0]];
-                isp_c_invw<=pq_cinvw[pq_head[2:0]];
-                isp_word<=pq_isp[pq_head[2:0]]; tri_tag<=pq_tag[pq_head[2:0]];
+                // issue the M10K read; head advances now, data lands in pq_rdw next cyc
+                pq_rdw <= pq_ram[pq_head[2:0]];
                 pq_head <= (pq_head==PQ_N-1) ? 4'd0 : pq_head+4'd1;
                 pq_pop  = 1'b1;
+                rs_st   <= RS_POP;
+            end
+            RS_POP: begin
+                // pq_rdw now holds the popped entry: splice it into the active planes.
+                isp_dx12<=pq_rdw[QF_DX12 +:32]; isp_dx23<=pq_rdw[QF_DX23 +:32];
+                isp_dx31<=pq_rdw[QF_DX31 +:32]; isp_dx41<=pq_rdw[QF_DX41 +:32];
+                isp_dy12<=pq_rdw[QF_DY12 +:32]; isp_dy23<=pq_rdw[QF_DY23 +:32];
+                isp_dy31<=pq_rdw[QF_DY31 +:32]; isp_dy41<=pq_rdw[QF_DY41 +:32];
+                isp_c1<=pq_rdw[QF_C1 +:32]; isp_c2<=pq_rdw[QF_C2 +:32];
+                isp_c3<=pq_rdw[QF_C3 +:32]; isp_c4<=pq_rdw[QF_C4 +:32];
+                isp_ddx_invw<=pq_rdw[QF_DDX +:32]; isp_ddy_invw<=pq_rdw[QF_DDY +:32];
+                isp_c_invw<=pq_rdw[QF_CINVW +:32];
+                isp_word<=pq_rdw[QF_ISP +:32]; tri_tag<=pq_rdw[QF_TAG +:32];
                 tri_count<=tri_count+1;
                 // chunk-aligned x range + row range from the bbox
-                rbx0 <= pq_bx0[pq_head[2:0]] & 5'(~(RAS_LANES-1));
-                rbx1 <= pq_bx1[pq_head[2:0]] & 5'(~(RAS_LANES-1));
-                rby1 <= pq_by1[pq_head[2:0]];
-                ras_y <= pq_by0[pq_head[2:0]];
-                ras_x <= pq_bx0[pq_head[2:0]] & 5'(~(RAS_LANES-1));
+                rbx0 <= pq_rdw[QF_BX0 +:5] & 5'(~(RAS_LANES-1));
+                rbx1 <= pq_rdw[QF_BX1 +:5] & 5'(~(RAS_LANES-1));
+                rby1 <= pq_rdw[QF_BY1 +:5];
+                ras_y <= pq_rdw[QF_BY0 +:5];
+                ras_x <= pq_rdw[QF_BX0 +:5] & 5'(~(RAS_LANES-1));
                 rs_st <= RS_RAS;
             end
             RS_RAS: begin
