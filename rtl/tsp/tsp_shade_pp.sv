@@ -92,11 +92,40 @@ module tsp_shade_pp import tsp_pkg::*; #(
     fp_rcp_fast u_rc (.clk(clk),.reset(reset),.stall(stall),.in_valid(in_valid & en),
                       .x(invw_in),.out_valid(rc_ov),.y(rc_W));
 
-    // 3-deep shift regs for the operands that must arrive with rc_W
+    // RCP latency realignment: everything else is delayed by RCPLAT to arrive
+    // with rc_W. The three WIDE arrays (ddx/ddy/c, 10 planes x 32b = 960 FF each
+    // as a flop chain) are carried in M10K delay lines instead of ALM registers.
+    // The narrow scalars stay as a plain flop shift chain - too shallow/small to
+    // benefit from block RAM, and mixing them in would only add addressing logic.
     localparam RCPLAT = 3;
-    reg [31:0] d_ddx [0:RCPLAT-1][0:9];
-    reg [31:0] d_ddy [0:RCPLAT-1][0:9];
-    reg [31:0] d_c   [0:RCPLAT-1][0:9];
+
+    // --- wide operands via M10K delay lines (packed 10 x 32b per line) ---
+    wire [319:0] q_ddx, q_ddy, q_c;   // RCP-aligned, == d_*[RCPLAT-1] of old chain
+    wire [319:0] in_ddx_p, in_ddy_p, in_c_p;
+    genvar pk;
+    generate
+      for (pk=0; pk<10; pk=pk+1) begin : pack
+        assign in_ddx_p[pk*32 +: 32] = in_ddx[pk];
+        assign in_ddy_p[pk*32 +: 32] = in_ddy[pk];
+        assign in_c_p  [pk*32 +: 32] = in_c[pk];
+      end
+    endgenerate
+    delay_ram #(.WIDTH(320),.DELAY(RCPLAT)) u_dl_ddx (.clk(clk),.reset(reset),.en(en),.din(in_ddx_p),.dout(q_ddx));
+    delay_ram #(.WIDTH(320),.DELAY(RCPLAT)) u_dl_ddy (.clk(clk),.reset(reset),.en(en),.din(in_ddy_p),.dout(q_ddy));
+    delay_ram #(.WIDTH(320),.DELAY(RCPLAT)) u_dl_c   (.clk(clk),.reset(reset),.en(en),.din(in_c_p),  .dout(q_c));
+    // per-plane aligned views (replace old d_ddx[RCPLAT-1][gi] etc.)
+    wire [31:0] rcp_ddx [0:9];
+    wire [31:0] rcp_ddy [0:9];
+    wire [31:0] rcp_c   [0:9];
+    generate
+      for (pk=0; pk<10; pk=pk+1) begin : unpack
+        assign rcp_ddx[pk] = q_ddx[pk*32 +: 32];
+        assign rcp_ddy[pk] = q_ddy[pk*32 +: 32];
+        assign rcp_c[pk]   = q_c  [pk*32 +: 32];
+      end
+    endgenerate
+
+    // --- narrow scalars: plain flop shift chain (unchanged) ---
     reg [4:0]  d_px  [0:RCPLAT-1];
     reg [4:0]  d_py  [0:RCPLAT-1];
     reg [31:0] d_tsp [0:RCPLAT-1];
@@ -110,15 +139,9 @@ module tsp_shade_pp import tsp_pkg::*; #(
     always @(posedge clk) begin
         if (en) begin
             // stage 0 samples the module inputs
-            for (k=0;k<10;k=k+1) begin
-                d_ddx[0][k]<=in_ddx[k]; d_ddy[0][k]<=in_ddy[k]; d_c[0][k]<=in_c[k];
-            end
             d_px[0]<=px; d_py[0]<=py; d_tsp[0]<=tsp; d_tcw[0]<=tcw; d_tc[0]<=text_ctrl;
             d_ptx[0]<=pp_texture; d_pof[0]<=pp_offset; d_id[0]<=in_id;
             for (s=1;s<RCPLAT;s=s+1) begin
-                for (k=0;k<10;k=k+1) begin
-                    d_ddx[s][k]<=d_ddx[s-1][k]; d_ddy[s][k]<=d_ddy[s-1][k]; d_c[s][k]<=d_c[s-1][k];
-                end
                 d_px[s]<=d_px[s-1]; d_py[s]<=d_py[s-1]; d_tsp[s]<=d_tsp[s-1];
                 d_tcw[s]<=d_tcw[s-1]; d_tc[s]<=d_tc[s-1];
                 d_ptx[s]<=d_ptx[s-1]; d_pof[s]<=d_pof[s-1]; d_id[s]<=d_id[s-1];
@@ -154,8 +177,8 @@ module tsp_shade_pp import tsp_pkg::*; #(
     generate
       for (gi=0; gi<10; gi=gi+1) begin : plane
         // i1: RCP-aligned planes * pixel coord
-        fp_mul_i5 mx (.f(d_ddx[RCPLAT-1][gi]), .k(rc_px), .y(mprx[gi]));
-        fp_mul_i5 my (.f(d_ddy[RCPLAT-1][gi]), .k(rc_py), .y(mpry[gi]));
+        fp_mul_i5 mx (.f(rcp_ddx[gi]), .k(rc_px), .y(mprx[gi]));
+        fp_mul_i5 my (.f(rcp_ddy[gi]), .k(rc_py), .y(mpry[gi]));
         // i2: prx + pry
         fp_add24 a2 (.a(i1_prx[gi]), .b_in(i1_pry[gi]), .sub(1'b0), .y(asum[gi]));
         // i3: sum + c
@@ -178,8 +201,8 @@ module tsp_shade_pp import tsp_pkg::*; #(
     // ==============================================================
     wire [3:0] mip_lvl;
     tsp_miplevel u_mip (
-        .ddxU(d_ddx[RCPLAT-1][0]), .ddxV(d_ddx[RCPLAT-1][1]),
-        .ddyU(d_ddy[RCPLAT-1][0]), .ddyV(d_ddy[RCPLAT-1][1]),
+        .ddxU(rcp_ddx[0]), .ddxV(rcp_ddx[1]),
+        .ddyU(rcp_ddy[0]), .ddyV(rcp_ddy[1]),
         .w(rc_W),
         .texu(d_tsp[RCPLAT-1][5:3]), .mipmapd(d_tsp[RCPLAT-1][11:8]),
         .mipmapped(d_tcw[RCPLAT-1][31]),
@@ -193,7 +216,7 @@ module tsp_shade_pp import tsp_pkg::*; #(
         else if (en) begin
             // i1: capture products; carry c and W
             for (k=0;k<10;k=k+1) begin
-                i1_prx[k]<=mprx[k]; i1_pry[k]<=mpry[k]; i1_c[k]<=d_c[RCPLAT-1][k];
+                i1_prx[k]<=mprx[k]; i1_pry[k]<=mpry[k]; i1_c[k]<=rcp_c[k];
             end
             i1_W<=rc_W; v1<=rc_ov; mip1<=mip_lvl;
             px1<=rc_px; py1<=rc_py; tsp1<=d_tsp[RCPLAT-1]; tcw1<=d_tcw[RCPLAT-1];
