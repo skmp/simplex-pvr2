@@ -54,6 +54,10 @@ module peel_tile_buffer import tsp_pkg::*; #(
     input                       b_peeling,   // 1 = layer-peel compare, 0 = opaque
     output     [LANES-1:0]      b_pass_lp,   // per-lane peel accept (for dt_pt)
     output     [LANES-1:0]      b_more,      // per-lane MoreToDraw (peel)
+    // per-lane STAGE-B WRITE-ENABLE (accept: inside & pass, peel or opaque). Mirrors
+    // exactly the lanes this module writes back, so the split-out u_taginvw handoff
+    // buffer can DUPLICATE the {valid,tag,invW} write with an identical mask.
+    output     [LANES-1:0]      b_we,
 
     // ---- SHADE: single-pixel read (id = {y[4:0], x[4:0]}) ----
     input                       sh_rd_valid,
@@ -146,6 +150,11 @@ module peel_tile_buffer import tsp_pkg::*; #(
     // peel accept / more are only meaningful on peeling lanes that are inside
     assign b_pass_lp = ras_pass_lp & b_inside & {NB{b_peeling}};
     assign b_more    = ras_more_lp & b_inside & {NB{b_peeling}};
+    // per-lane stage-B write-enable = inside & (peel accept | opaque accept). This is
+    // exactly the `we[cw]` computed in the write mux below; expose it so u_taginvw can
+    // duplicate the accepted {valid,tag,invW} write with an identical mask.
+    assign b_we = ras_b_valid ? (b_inside &
+                  (b_peeling ? ras_pass_lp : ras_pass_op)) : '0;
 
     // -------------------- READ port mux --------------------
     always @(*) begin
