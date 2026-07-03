@@ -782,6 +782,40 @@ module peel_core import tsp_pkg::*; (
     reg [5:0] cur_tx, cur_ty;      // latched tile coords (stable during lists)
     integer i, l, j;
 
+`ifndef SYNTHESIS
+    // ---------------- performance counters (sim only) ----------------
+    // Two INDEPENDENT classifications (ISP/raster engine, TSP/shade engine), each
+    // charging every clock to exactly one bucket -> each set sums to pc_total. The two
+    // engines can be busy the SAME cycle (they overlap), so keeping them separate shows
+    // real per-engine utilisation. Plus a top-level FSM-state view (pc_top_*). Dumped
+    // at S_DONE.
+    integer pc_total;
+    // ISP / raster engine (classified by rs_st)
+    integer pc_ras_active;      // RS_RAS: rasterizing chunks
+    integer pc_ras_pop;         // RS_POP: plane-FIFO pop + splice
+    integer pc_ras_drain;       // RS_DRAIN: raster pipe drain
+    integer pc_ras_idle;        // RS_IDLE: not rasterizing (waiting / nothing to do)
+    // TSP / shade engine (classified by top FSM `st` when in a shade sub-phase)
+    integer pc_sh_present;      // SH_PRESENT accepted: pixel issued into shade pipe
+    integer pc_sh_tex_stall;    // SH_PRESENT && pp_stall: blocked on texture fetch
+    integer pc_sh_setup_wait;   // TSP_RUN: waiting on tsp_setup_min (plane-cache MISS)
+    integer pc_sh_fetch;        // FH_*/FV_*: fetching vertex params from DDR (miss)
+    integer pc_sh_look;         // SH_PIX/SH_RD/SH_LOOK/SH_LOOK2: plane-cache lookup
+    integer pc_sh_drain;        // SH_DRAIN: shade pipe drain
+    integer pc_sh_none;         // not in a shade sub-phase this clock
+    // top-level phase view (whole-core, mutually exclusive by `st` group)
+    integer pc_top_clear;       // S_CLEAR_WR
+    integer pc_top_peelbuf;     // S_PEEL_BUF_RUN
+    integer pc_top_flush;       // S_FLUSH_RD/WR (framebuffer writeout / scanout)
+    integer pc_top_ol;          // S_OL_RUN (region/objlist walk feeding the iterator)
+    integer pc_top_barrier;     // S_DRAIN (wait consumer idle)
+    integer pc_top_shade;       // any shade sub-phase (SH_*/FH_*/FV_*/TSP_RUN)
+    integer pc_top_other;       // remaining setup/idle states
+    // extra: texture-stall clocks regardless of state; setup(tsp) invocation clocks
+    integer pc_tex_busy;        // pp_stall asserted (texture pipe busy) any clock
+    integer pc_su_busy;         // streamed ISP-setup busy (su_busy) any clock
+`endif
+
     // ---- COMBINATIONAL framebuffer-write (FLUSH), valid/ready handshake ----
     // fbw_req is presented + accepted the SAME cycle so a blocking controller works
     // (busy holds; we advance fw_i only when the pixel is consumed). The screen
@@ -839,6 +873,15 @@ module peel_core import tsp_pkg::*; (
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             tri_count<=0; cull_count<=0; miss_count<=0; hit_count<=0; tri_seen<=0;
             sh_out_n<=0; ras_inflight<=0;
+`ifndef SYNTHESIS
+            pc_total<=0;
+            pc_ras_active<=0; pc_ras_pop<=0; pc_ras_drain<=0; pc_ras_idle<=0;
+            pc_sh_present<=0; pc_sh_tex_stall<=0; pc_sh_setup_wait<=0; pc_sh_fetch<=0;
+            pc_sh_look<=0; pc_sh_drain<=0; pc_sh_none<=0;
+            pc_top_clear<=0; pc_top_peelbuf<=0; pc_top_flush<=0; pc_top_ol<=0;
+            pc_top_barrier<=0; pc_top_shade<=0; pc_top_other<=0;
+            pc_tex_busy<=0; pc_su_busy<=0;
+`endif
             rs_st<=RS_IDLE;
             pq_head<=0; pq_tail<=0; pq_count<=0;
             fq_head<=0; fq_tail<=0; fq_count<=0; fq_out_valid<=1'b0;
@@ -851,6 +894,48 @@ module peel_core import tsp_pkg::*; (
             // (plane cache valid bits are cleared by u_pc's own reset; pc_lu_req is
             //  combinational, driven from st==SH_LOOK)
         end else begin
+`ifndef SYNTHESIS
+            // -------- performance counters: charge THIS clock to its buckets --------
+            // Only count while the core is doing tile work (not the top-level idle wait
+            // for a start). Approximate "active" as: not S_IDLE, or any engine busy.
+            if (st != S_IDLE || rs_st != RS_IDLE || su_busy) begin
+                pc_total <= pc_total + 1;
+
+                // ISP / raster engine (by rs_st)
+                case (rs_st)
+                    RS_RAS:   pc_ras_active <= pc_ras_active + 1;
+                    RS_POP:   pc_ras_pop    <= pc_ras_pop    + 1;
+                    RS_DRAIN: pc_ras_drain  <= pc_ras_drain  + 1;
+                    default:  pc_ras_idle   <= pc_ras_idle   + 1;   // RS_IDLE
+                endcase
+
+                // TSP / shade engine (by top FSM `st`, shade sub-phases only)
+                if (st == SH_PRESENT) begin
+                    if (pp_stall) pc_sh_tex_stall <= pc_sh_tex_stall + 1;
+                    else          pc_sh_present    <= pc_sh_present    + 1;
+                end else if (st == TSP_RUN)                       pc_sh_setup_wait <= pc_sh_setup_wait + 1;
+                else if (st==FH_ISP||st==FH_ISPW||st==FH_TSPW||st==FH_TCWW||
+                         st==FV_RD||st==FV_W)                     pc_sh_fetch <= pc_sh_fetch + 1;
+                else if (st==SH_PIX||st==SH_RD||st==SH_LOOK||st==SH_LOOK2) pc_sh_look <= pc_sh_look + 1;
+                else if (st==SH_DRAIN)                            pc_sh_drain <= pc_sh_drain + 1;
+                else                                              pc_sh_none  <= pc_sh_none  + 1;
+
+                // top-level phase view (whole-core)
+                if (st==S_CLEAR_WR)                               pc_top_clear   <= pc_top_clear   + 1;
+                else if (st==S_PEEL_BUF_RUN)                      pc_top_peelbuf <= pc_top_peelbuf + 1;
+                else if (st==S_FLUSH_RD||st==S_FLUSH_WR)          pc_top_flush   <= pc_top_flush   + 1;
+                else if (st==S_OL_RUN)                            pc_top_ol      <= pc_top_ol      + 1;
+                else if (st==S_DRAIN)                             pc_top_barrier <= pc_top_barrier + 1;
+                else if (st==SH_PIX||st==SH_RD||st==SH_LOOK||st==SH_LOOK2||
+                         st==SH_PRESENT||st==SH_DRAIN||st==TSP_RUN||
+                         st==FH_ISP||st==FH_ISPW||st==FH_TSPW||st==FH_TCWW||
+                         st==FV_RD||st==FV_W)                     pc_top_shade   <= pc_top_shade   + 1;
+                else                                              pc_top_other   <= pc_top_other   + 1;
+
+                if (pp_stall) pc_tex_busy <= pc_tex_busy + 1;
+                if (su_busy)  pc_su_busy  <= pc_su_busy  + 1;
+            end
+`endif
             done<=0; ra_start<=0; ol_start<=0;
             tsp_start<=0; pp_in_valid<=0; f_go<=0;
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
@@ -1335,6 +1420,32 @@ module peel_core import tsp_pkg::*; (
             S_DONE: begin
                 $display("=== done: %0d triangles rasterized, %0d culled, tsp$ %0d hits / %0d misses ===",
                          tri_count, cull_count, hit_count, miss_count);
+`ifndef SYNTHESIS
+                $display("=== PERF (active clks=%0d) ===", pc_total);
+                $display("  ISP/raster:  RAS=%0d (%0d%%)  POP=%0d  DRAIN=%0d  IDLE=%0d (%0d%%)",
+                    pc_ras_active, (pc_ras_active*100)/(pc_total?pc_total:1),
+                    pc_ras_pop, pc_ras_drain,
+                    pc_ras_idle, (pc_ras_idle*100)/(pc_total?pc_total:1));
+                $display("  TSP/shade:   PRESENT=%0d (%0d%%)  TEX_STALL=%0d (%0d%%)  SETUP_WAIT=%0d (%0d%%)",
+                    pc_sh_present, (pc_sh_present*100)/(pc_total?pc_total:1),
+                    pc_sh_tex_stall, (pc_sh_tex_stall*100)/(pc_total?pc_total:1),
+                    pc_sh_setup_wait, (pc_sh_setup_wait*100)/(pc_total?pc_total:1));
+                $display("               FETCH=%0d (%0d%%)  CACHE_LOOK=%0d (%0d%%)  DRAIN=%0d  none=%0d",
+                    pc_sh_fetch, (pc_sh_fetch*100)/(pc_total?pc_total:1),
+                    pc_sh_look, (pc_sh_look*100)/(pc_total?pc_total:1),
+                    pc_sh_drain, pc_sh_none);
+                $display("  top phases:  SHADE=%0d (%0d%%)  CLEAR=%0d  PEELBUF=%0d  FLUSH=%0d (%0d%%)",
+                    pc_top_shade, (pc_top_shade*100)/(pc_total?pc_total:1),
+                    pc_top_clear, pc_top_peelbuf,
+                    pc_top_flush, (pc_top_flush*100)/(pc_total?pc_total:1));
+                $display("               OL_WALK=%0d (%0d%%)  BARRIER=%0d (%0d%%)  other=%0d",
+                    pc_top_ol, (pc_top_ol*100)/(pc_total?pc_total:1),
+                    pc_top_barrier, (pc_top_barrier*100)/(pc_total?pc_total:1),
+                    pc_top_other);
+                $display("  resources:   tex_busy=%0d (%0d%%)  isp_setup_busy=%0d (%0d%%)",
+                    pc_tex_busy, (pc_tex_busy*100)/(pc_total?pc_total:1),
+                    pc_su_busy, (pc_su_busy*100)/(pc_total?pc_total:1));
+`endif
                 done<=1'b1; st<=S_IDLE;
             end
             default: st<=S_IDLE;
