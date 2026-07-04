@@ -73,27 +73,36 @@ module spanner_v2 import tsp_pkg::*; #(
     input  ddr_rd_resp_t        dresp
 );
     // ============================ dedup / slot store ============================
-    // id = pc_slot(tag): param_offs low bits XOR tag_offset (identical to peel_core's
-    // hash so behaviour matches the current plane-cache slotting). Direct-mapped into
-    // the NSLOT-entry triangle_setups array.
+    // id = pc_slot(tag): 10-bit hash -> DIRECT-MAPPED into all NSLOT(=1024) slots. The old
+    // 6-bit hash used only 64 slots and thrashed (aliasing tags evicted each other -> ~1.9x
+    // re-setups). tag = {skip[26:24], param_offs[23:3], tag_offset[2:0]}; strip triangles
+    // share param_offs and differ in tag_offset, so fold tag_offset into the low bits and
+    // mix two param_offs windows for spread.
     function automatic [SLOTW-1:0] pc_slot(input [31:0] tag);
-        pc_slot = { {(SLOTW-6){1'b0}}, (tag[8:3] ^ {3'b000, tag[2:0]}) };
+        pc_slot = tag[12:3] ^ tag[22:13] ^ { {(SLOTW-3){1'b0}}, tag[2:0] };
     endfunction
 
-    // slot_valid / slot_tag: which tag owns each direct-mapped slot.
-    //   slot_valid : NSLOT-bit register vector. Read COMBINATIONALLY and bulk-cleared in
-    //                one cycle at `start` (an M10K can't clear all entries at once).
-    //   slot_tag   : NSLOT x 32b. REGISTERED-read block RAM (M10K, no async read). The
-    //                dedup test is PIPELINED: COAL presents the read of run_id, EMIT (next
-    //                cycle) does the compare + span write. See the SPANGEN pipeline below.
-    // COHERENCY: EMIT retires a span every cycle and can WRITE a slot the same cycle COAL
-    // presents the next span's read. M10K returns OLD data on a same-address read+write, so
-    // the two most-recent emitted allocations are FORWARDED (fwd0/fwd1) into the EMIT
-    // compare, covering back-to-back same-slot dedup (see fwd_* below).
-    reg [NSLOT-1:0] slot_valid;
-    (* ramstyle = "M10K, no_rw_check" *) reg [31:0] slot_tag [0:NSLOT-1];
-    reg [31:0]      slot_tag_q;                  // registered read of slot_tag[coal id]
-    reg             slot_valid_q;                // slot_valid, aligned to slot_tag_q
+    // dedup store: ONE M10K holding {gen, tag} per slot, so BOTH the tag AND the validity
+    // live in block RAM - no 1024-bit flop valid-vector, no 1024:1 read mux, no per-pass
+    // bulk clear (an M10K can't clear all entries at once). A slot is VALID for the current
+    // pass iff its stored gen == cur_gen; `start` bumps cur_gen so all prior-pass slots go
+    // stale for free. cur_gen never uses 0 (=cleared sentinel); on wrap a clear-walk writes
+    // gen=0 to every slot (rare: every 255 passes). REGISTERED read (1-cyc) like the old
+    // slot_tag; the dedup test is PIPELINED COAL(present read)->EMIT(compare+write).
+    // COHERENCY: EMIT can WRITE a slot the same cycle COAL presents the next read; M10K
+    // returns OLD data on same-addr r+w, so the two most-recent in-pass allocations are
+    // FORWARDED (fwd0/fwd1) into the EMIT compare (see fwd_* below).
+    localparam integer GEN_W = 8;
+    localparam integer DD_W  = GEN_W + 32;       // {gen, tag}
+    localparam [GEN_W-1:0] GEN_MAX = {GEN_W{1'b1}};
+    (* ramstyle = "M10K, no_rw_check" *) reg [DD_W-1:0] dedup_ram [0:NSLOT-1];
+    reg [DD_W-1:0]     dd_rd_q;                   // registered read {gen,tag} of coal id
+    reg [GEN_W-1:0]    cur_gen;                   // current pass generation (never 0)
+    reg                dd_clearing;               // clear-walk in progress (gen wrap)
+    reg [SLOTW-1:0]    dd_clr_addr;
+    wire [GEN_W-1:0]   dd_rd_gen = dd_rd_q[DD_W-1:32];
+    wire [31:0]        slot_tag_q   = dd_rd_q[31:0];
+    wire               slot_valid_q = (dd_rd_gen == cur_gen);
 
     // ============================ setup FIFO (SPANGEN -> SETUP) ============================
     // {id, tag} pushed when a span allocates a NEW slot; drained by the SETUP engine.
@@ -316,7 +325,9 @@ module spanner_v2 import tsp_pkg::*; #(
             busy <= 1'b0;
             sg_active <= 1'b0; sg_x <= '0; t_valid <= 1'b0;
             g_ready <= 1'b0;
-            slot_valid <= '0;
+            cur_gen <= GEN_MAX;           // force a clear-walk on the FIRST start (HW-safe
+                                          // regardless of M10K power-up state)
+            dd_clearing <= 1'b0;
             fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
             sf_wp <= '0; sf_rp <= '0;
             fetch_busy <= 1'b0; pend_v <= 1'b0; su_run <= 1'b0; ts_pend <= 1'b0;
@@ -326,15 +337,29 @@ module spanner_v2 import tsp_pkg::*; #(
             tsp_start <= 1'b0;
 
             // ---------------- start a tile pass ----------------
+            // Bump the generation so all prior-pass dedup slots go stale for free. If gen
+            // would wrap, do a clear-walk first (write gen=0 to every slot) so a reused gen
+            // value can't false-hit an ancient slot. begin_pass (below) actually launches
+            // SPANGEN - deferred past the clear-walk when one is needed.
             if (start) begin
-                slot_valid <= '0;         // bulk clear the dedup
-                sg_x  <= '0;
-                sg_active <= 1'b1;
-                t_valid <= 1'b0;
-                g_ready <= 1'b0;          // first COAL waits one fill cycle for the read
-                fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
                 busy  <= 1'b1;
+                fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
                 sf_wp <= '0; sf_rp <= '0;
+                if (cur_gen == GEN_MAX) begin
+                    dd_clearing <= 1'b1; dd_clr_addr <= '0;   // SPANGEN idle until clear done
+                end else begin
+                    cur_gen <= cur_gen + 1'b1;
+                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0; g_ready <= 1'b0;
+                end
+            end
+
+            // ---------------- dedup clear-walk (gen wrap) ----------------
+            if (dd_clearing) begin
+                dedup_ram[dd_clr_addr] <= '0;   // gen=0 -> permanently invalid
+                if (dd_clr_addr == NSLOT-1) begin
+                    dd_clearing <= 1'b0; cur_gen <= {{(GEN_W-1){1'b0}}, 1'b1};   // gen=1
+                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0; g_ready <= 1'b0;
+                end else dd_clr_addr <= dd_clr_addr + 1'b1;
             end
 
             // =================== FSM 1: SPANGEN pipeline (COAL + EMIT) ===================
@@ -344,8 +369,7 @@ module spanner_v2 import tsp_pkg::*; #(
                 // span write is combinational (sp_*); here just commit the allocation to
                 // the slot store and shift the forwarding history.
                 if (t_valid && needs_alloc) begin
-                    slot_valid[t_id] <= 1'b1;
-                    slot_tag[t_id]   <= t_tag;
+                    dedup_ram[t_id] <= {cur_gen, t_tag};
                 end
                 // forwarding shift: fwd0 = alloc this cycle, fwd1 = previous fwd0.
                 fwd1_valid <= fwd0_valid; fwd1_id <= fwd0_id; fwd1_tag <= fwd0_tag;
@@ -364,9 +388,8 @@ module spanner_v2 import tsp_pkg::*; #(
                     t_at     <= ti_pt[sg_lane];
                     for (q = 0; q < 4; q = q + 1)
                         t_invw[q] <= (q < run_rep) ? ti_invw[sg_lane + q[1:0]] : 32'd0;
-                    // present the slot read for THIS descriptor (resolves next cycle in EMIT)
-                    slot_tag_q   <= slot_tag[run_id];
-                    slot_valid_q <= slot_valid[run_id];
+                    // present the dedup read for THIS descriptor (resolves next cycle in EMIT)
+                    dd_rd_q <= dedup_ram[run_id];
 
                     // advance. The read for sg_x_next's group is presented THIS cycle
                     // (rd_group tracks rd_next_x continuously) -> ti_* is correct next cycle.
@@ -472,7 +495,7 @@ module spanner_v2 import tsp_pkg::*; #(
             // =================== busy / done ===================
             // done when SPANGEN drained (not walking, EMIT stage empty) AND the whole
             // setup path is drained (FIFO, fetch, skid, setup run, write pulse).
-            if (busy && !start && !sg_active && !t_valid && sf_empty
+            if (busy && !start && !dd_clearing && !sg_active && !t_valid && sf_empty
                 && !fetch_busy && !pend_v && !su_run && !ts_pend)
                 busy <= 1'b0;
         end
