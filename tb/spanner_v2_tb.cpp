@@ -231,12 +231,22 @@ int main(int argc,char**argv){
                     x+=rep;
                 }
             }
-            for(int id=0;id<1024;id++) if(need_setup[id] && !TSG_VALID[id]){
-                if(fails<10) printf("pass %d: setup id %d NOT written (triangle_setups miss)\n",n,id);
+            int n_need=0, n_written=0;
+            for(int id=0;id<1024;id++){
+                if(need_setup[id]) n_need++;
+                if(TSG_VALID[id])  n_written++;
+                if(need_setup[id] && !TSG_VALID[id]){
+                    if(fails<10) printf("pass %d: setup id %d NOT written (triangle_setups miss)\n",n,id);
+                    fails++;
+                }
+            }
+            // distinct setups = distinct slots the DUT filled = golden allocation count.
+            if(n_written != n_need){
+                if(fails<10) printf("pass %d: setup COUNT mismatch: dut wrote %d slots, golden needs %d\n",n,n_written,n_need);
                 fails++;
             }
 
-            if(fails==0){ printf("pass %d: OK  (%zu spans, cyc=%ld)\n",n,gold.size(),cyc); total_pass++; }
+            if(fails==0){ printf("pass %d: OK  (%zu spans, %d setups, cyc=%ld)\n",n,gold.size(),n_written,cyc); total_pass++; }
             else        { printf("pass %d: %d FAILURES (cyc=%ld)\n",n,fails,cyc); total_fail++; }
         }
         next:;

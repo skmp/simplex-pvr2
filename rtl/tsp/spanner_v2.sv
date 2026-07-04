@@ -84,16 +84,16 @@ module spanner_v2 import tsp_pkg::*; #(
     //   slot_valid : NSLOT-bit register vector. Read COMBINATIONALLY and bulk-cleared in
     //                one cycle at `start` (an M10K can't clear all entries at once).
     //   slot_tag   : NSLOT x 32b. REGISTERED-read block RAM (M10K, no async read). The
-    //                dedup test is therefore PIPELINED: SG_RUN presents the read of run_id
-    //                and SG_TEST (next cycle) does the compare + emit. See the SG FSM.
-    // COHERENCY: a slot allocated in SG_TEST cycle N must be seen by the read presented in
-    // SG_RUN cycle N+1. M10K returns OLD data on a same-address read+write, so we forward
-    // the just-written {tag,valid} when the pending read address matches (fwd_* below).
+    //                dedup test is PIPELINED: COAL presents the read of run_id, EMIT (next
+    //                cycle) does the compare + span write. See the SPANGEN pipeline below.
+    // COHERENCY: EMIT retires a span every cycle and can WRITE a slot the same cycle COAL
+    // presents the next span's read. M10K returns OLD data on a same-address read+write, so
+    // the two most-recent emitted allocations are FORWARDED (fwd0/fwd1) into the EMIT
+    // compare, covering back-to-back same-slot dedup (see fwd_* below).
     reg [NSLOT-1:0] slot_valid;
     (* ramstyle = "M10K, no_rw_check" *) reg [31:0] slot_tag [0:NSLOT-1];
-    reg [31:0]      slot_tag_q;                  // registered read of slot_tag[run_id]
-    reg             slot_valid_q;                // slot_valid[run_id], aligned to slot_tag_q
-    reg [SLOTW-1:0] test_id;                     // run_id being tested in SG_TEST
+    reg [31:0]      slot_tag_q;                  // registered read of slot_tag[coal id]
+    reg             slot_valid_q;                // slot_valid, aligned to slot_tag_q
 
     // ============================ setup FIFO (SPANGEN -> SETUP) ============================
     // {id, tag} pushed when a span allocates a NEW slot; drained by the SETUP engine.
@@ -108,30 +108,35 @@ module spanner_v2 import tsp_pkg::*; #(
     reg             sf_push;  reg [SF_W-1:0] sf_pdata;
     wire [SF_W-1:0] sf_head  = sf_mem[sf_rp[SF_AW-1:0]];
 
-    // ============================ FSM 1: SPANGEN ============================
-    // 4-stage walk (M10K-friendly - the slot store has a registered read):
-    //   SG_ISSUE : present the aligned 4-group tag-buffer read (1-cyc latency).
-    //   SG_LATCH : the 4 lanes are valid -> latch into g_*.
-    //   SG_RUN   : coalesce the leading same-tag run from the current intra-group position
-    //              into run_*; latch it into t_*; PRESENT the registered slot_tag read of
-    //              run_id (dedup lookup).
-    //   SG_TEST  : slot read resolved -> dedup compare (with write-forwarding), EMIT the
-    //              span, allocate the slot on a miss, advance the walk. If the held group
-    //              still has pixels -> back to SG_RUN (no reread); else SG_ISSUE next group.
-    // So one span every 2 cycles within a group (RUN/TEST). At avg ~3.4px/span that is
-    // ~2*210k = ~420k SPANGEN cycles - still well under the 709k shade floor, so setup
-    // stays fully hidden. The group HOLDS until its last pixel is consumed (a group may
-    // need up to 4 spans: A B C D).
-    localparam SG_IDLE=3'd0, SG_ISSUE=3'd1, SG_LATCH=3'd2, SG_RUN=3'd3, SG_TEST=3'd4,
-               SG_DONE=3'd5;
-    reg [2:0]        sg_st;
-    reg [SLOTW-1:0]  sg_x;          // next pixel to emit a span at (0..NSLOT-1)
-    reg [3:0]        g_valid;       // latched lane fields
-    reg [31:0]       g_tag  [0:3];
-    reg [31:0]       g_invw [0:3];
-    reg [3:0]        g_pt;
+    // ============================ FSM 1: SPANGEN (pipelined, 1 span/cycle) ============================
+    // A continuously-advancing 2-stage pipeline (M10K-friendly: slot read is registered):
+    //   COAL (this cycle): a group's 4 lanes are held in g_*; coalesce the leading same-tag
+    //        run at the current intra-group position sg_x -> a span descriptor run_*.
+    //        PRESENT the registered slot_tag read of run_id. Advance sg_x by run_rep. If the
+    //        group is exhausted, the group PREFETCH (ahead) supplies the next group's lanes
+    //        so COAL keeps producing one descriptor EVERY cycle with no reissue bubble.
+    //   EMIT (next cycle): the descriptor produced by COAL last cycle is in t_*; its slot
+    //        read has resolved (slot_*_q, forwarded) -> dedup compare, WRITE the span,
+    //        allocate on a miss. Retires one span/cycle.
+    // Uniform tile (one tag, 4px runs) -> 256 groups x 1 span x 1 cyc + fill/drain ~= 258.
+    // Multi-span group (A B C D) -> COAL produces 4 descriptors on 4 consecutive cycles
+    // (sg_x steps within the held group, no reissue) -> 4 cyc, still 1 span/cyc.
+    //
+    // GROUP PREFETCH: the tag buffer read has 1-cyc latency, so we must present the NEXT
+    // group's read the cycle BEFORE COAL needs it. gp_* holds the prefetched group; when
+    // COAL exhausts the current group it swaps gp_* -> g_* and the prefetch reads group+1.
+    reg              sg_active;     // SPANGEN still walking (COAL may produce)
+    reg [SLOTW-1:0]  sg_x;          // next pixel to coalesce a span at (0..NSLOT-1)
+    reg              g_ready;       // ti_* holds sg_x's group this cycle (read landed)
+    // The tag buffer is a registered-read RAM: its output ti_* reflects the address
+    // presented LAST cycle, and updates EVERY cycle. So we present rd_group = the group of
+    // the pixel COAL coalesces NEXT cycle, continuously; then ti_* is ALWAYS the correct
+    // group source for the current sg_x -> COAL coalesces directly off ti_* (no held-group
+    // register, no source mux). g_ready gates the 1-cycle fill latency after start/stall.
+    reg [SLOTW-1:0]  rd_next_x;     // combinational: pixel whose group we address
 
-    // ---- run payload latched at SG_RUN, consumed (emitted) at SG_TEST ----
+    // ---- span descriptor latched at COAL, consumed (emitted) at EMIT ----
+    reg              t_valid;       // EMIT stage occupied
     reg [SLOTW-1:0]  t_x;           // run-start pixel index
     reg [SLOTW-1:0]  t_id;          // pc_slot(run_tag)
     reg [31:0]       t_tag;
@@ -142,53 +147,59 @@ module spanner_v2 import tsp_pkg::*; #(
 
     wire [1:0] sg_lane = sg_x[1:0];              // intra-group position of sg_x
 
-    // ---- leading-run coalesce (combinational off latched group) ----
-    // Start lane = sg_lane. Extend while lane in-group, tag equal, and shade-eligible
-    // (OP: any; PEEL: valid). shade_ok(l) = shade_mode | g_valid[l]. A run of tags that
-    // are NOT shade-eligible is still a span (it advances the walk) but with shmask=0
-    // (SHADE writes nothing for those pixels); we still coalesce equal tags so the walk
-    // matches the aligned model.
+    // ---- leading-run coalesce (combinational off ti_*, the current group source) ----
+    // Start lane = sg_lane. Extend while lane in-group, tag equal. shade_ok(l) =
+    // shade_mode | ti_valid[l]. A run of not-shade-eligible tags is still a span (advances
+    // the walk) but with shmask=0; we coalesce equal tags to match the aligned model.
     reg  [2:0] run_rep;                          // 1..4
     reg  [3:0] run_shmask;                       // per-lane shade-valid over the run
     reg  [31:0] run_tag;
     integer rl;
     always @(*) begin
-        run_tag    = g_tag[sg_lane];
+        run_tag    = ti_tag[sg_lane];
         run_rep    = 3'd1;
         run_shmask = 4'd0;
-        // lane sg_lane always part of the run
-        run_shmask[sg_lane] = shade_mode | g_valid[sg_lane];
-        // extend to lanes above sg_lane while tag matches
+        run_shmask[sg_lane] = shade_mode | ti_valid[sg_lane];
         for (rl = 0; rl < 4; rl = rl + 1) begin
-            if (rl > sg_lane && rl == sg_lane + run_rep && g_tag[rl] == run_tag) begin
+            if (rl > sg_lane && rl == sg_lane + run_rep && ti_tag[rl] == run_tag) begin
                 run_rep = run_rep + 3'd1;
-                run_shmask[rl] = shade_mode | g_valid[rl];
+                run_shmask[rl] = shade_mode | ti_valid[rl];
             end
         end
     end
 
     wire [SLOTW-1:0] run_id = pc_slot(run_tag);
 
-    // dedup test in SG_TEST, using the REGISTERED slot read (slot_tag_q/slot_valid_q) of
-    // t_id, WITH forwarding: if the slot was just written last cycle (M10K read-during-
-    // write returns stale data) the forwarded {tag,valid} wins. fwd_hit/fwd_tag are set
-    // when the previous SG_TEST allocated t_id (see the sequential block).
-    reg             fwd_valid;      // a slot write happened last cycle
-    reg [SLOTW-1:0] fwd_id;         // its slot
-    reg [31:0]      fwd_tag;        // its tag
-    wire            eff_valid = (fwd_valid && fwd_id == test_id) ? 1'b1     : slot_valid_q;
-    wire [31:0]     eff_tag   = (fwd_valid && fwd_id == test_id) ? fwd_tag  : slot_tag_q;
-    wire is_dedup_hit = eff_valid && (eff_tag == t_tag);
-    wire needs_alloc  = !is_dedup_hit;
+    // dedup test in EMIT, using the REGISTERED slot read (slot_tag_q/slot_valid_q) of
+    // t_id, WITH forwarding. In the 1-span/cycle pipeline, EMIT retires a span every cycle
+    // and may write the slot store the SAME cycle COAL presents the next span's read (M10K
+    // read-during-write returns stale data). So we forward the LAST TWO emitted allocations:
+    //   fwd0 = the allocation done LAST cycle (its write is in flight, read returns stale)
+    //   fwd1 = the allocation done TWO cycles ago (covers the M10K's write-settle window)
+    // Both are checked against t_id; the most recent wins. Uniform tile (same tag every
+    // group -> same id) is covered: after the first alloc, every later EMIT sees fwd and
+    // dedups (no re-push, no re-setup).
+    reg             fwd0_valid, fwd1_valid;
+    reg [SLOTW-1:0] fwd0_id,    fwd1_id;
+    reg [31:0]      fwd0_tag,   fwd1_tag;
+    wire            fwd0_hit = fwd0_valid && (fwd0_id == t_id);
+    wire            fwd1_hit = fwd1_valid && (fwd1_id == t_id);
+    wire            eff_valid = fwd0_hit ? 1'b1 : (fwd1_hit ? 1'b1 : slot_valid_q);
+    wire [31:0]     eff_tag   = fwd0_hit ? fwd0_tag : (fwd1_hit ? fwd1_tag : slot_tag_q);
+    wire is_dedup_hit = t_valid && eff_valid && (eff_tag == t_tag);
+    wire needs_alloc  = t_valid && !is_dedup_hit;
 
-    // emit can commit in SG_TEST when: if it ALLOCATES (new tag), the setup FIFO has room.
-    // A same-tag reuse never needs the FIFO.
+    // emit can commit when: if it ALLOCATES (new tag), the setup FIFO has room. A same-tag
+    // reuse never needs the FIFO. When it can't, the WHOLE pipeline freezes (COAL + EMIT).
     wire emit_stall_fifo = needs_alloc && sf_full;
+    wire pipe_stall      = emit_stall_fifo;   // freezes both stages this cycle
 
-    // walk advance after this emit. t_rep is 1..4; t_x is group-aligned + intra-group so
-    // t_x_next stays <= a group boundary. group_done when we land on the next group.
-    wire [SLOTW-1:0] t_x_next = t_x + { {(SLOTW-3){1'b0}}, t_rep };
-    wire group_done_after = (t_x_next[1:0] == 2'd0);      // crossed into next group
+    // ---- COAL advance: sg_x steps by run_rep; group exhausted when it crosses the group ----
+    wire [SLOTW-1:0] sg_x_next   = sg_x + { {(SLOTW-3){1'b0}}, run_rep };
+    wire walk_last              = (sg_x_next == '0);          // wrapped past pixel 1023
+    // COAL produces a descriptor this cycle iff walking, the group read has landed
+    // (g_ready), and the pipeline isn't frozen.
+    wire coal_fires = sg_active && g_ready && !pipe_stall;
 
     // ============================ FSM 2: SETUP ============================
     // Drains the setup FIFO: {id,tag} -> record_fetcher -> tsp_setup_min -> ts write.
@@ -247,9 +258,10 @@ module spanner_v2 import tsp_pkg::*; #(
     // ============================ combinational OUT + FIFO drive ============================
     integer k;
     always @(*) begin
-        // ----- SPANGEN span write + FIFO push: fire in SG_TEST (the run payload was
-        // latched into t_* at SG_RUN; the registered slot read resolves the dedup here) -----
-        sp_we      = 1'b0;
+        // ----- EMIT: span write + FIFO push. The descriptor produced by COAL last cycle
+        // is in t_* (t_valid); its slot read has resolved -> dedup here and write. Held
+        // (no write, no advance) when the pipeline is frozen. -----
+        sp_we      = t_valid && !pipe_stall;
         sp_idx     = t_x;
         sp_id      = t_id;
         sp_rep     = t_rep;
@@ -257,18 +269,17 @@ module spanner_v2 import tsp_pkg::*; #(
         sp_at      = t_at;
         for (k = 0; k < 4; k = k + 1) sp_invw[k] = t_invw[k];
 
-        sf_push  = 1'b0;
+        sf_push  = sp_we && needs_alloc;   // allocate -> push a setup
         sf_pdata = { t_id, t_tag };
 
-        // present a group read only in SG_ISSUE (read latency: data in SG_LATCH). Group
-        // base = sg_x & ~3. Once latched, SG_RUN re-indexes the held group with no reread.
-        rd_valid = (sg_st == SG_ISSUE);
-        rd_group = { sg_x[SLOTW-1:2], 2'b00 };
-
-        if ((sg_st == SG_TEST) && !emit_stall_fifo) begin
-            sp_we = 1'b1;
-            if (needs_alloc) sf_push = 1'b1;
-        end
+        // COAL group read address. A registered-read tag buffer updates its output EVERY
+        // cycle from the presented address, so we drive rd_group to the group of the pixel
+        // COAL will coalesce NEXT cycle, CONTINUOUSLY (don't rely on the read output
+        // persisting across cycles). Next-coalesced pixel = sg_x_next if COAL fires this
+        // cycle (advancing), else sg_x (idle/fill/held). rd_valid tracks it while active.
+        rd_next_x = coal_fires ? sg_x_next : sg_x;
+        rd_valid  = sg_active && !pipe_stall;
+        rd_group  = { rd_next_x[SLOTW-1:2], 2'b00 };
 
         // ----- SETUP -> triangle_setups write -----
         ts_we  = (su_st == SU_WRITE);
@@ -286,9 +297,10 @@ module spanner_v2 import tsp_pkg::*; #(
     always @(posedge clk) begin
         if (reset) begin
             busy <= 1'b0;
-            sg_st <= SG_IDLE; sg_x <= '0;
+            sg_active <= 1'b0; sg_x <= '0; t_valid <= 1'b0;
+            g_ready <= 1'b0;
             slot_valid <= '0;
-            fwd_valid <= 1'b0;
+            fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
             sf_wp <= '0; sf_rp <= '0;
             su_st <= SU_IDLE; fx_start <= 1'b0; tsp_start <= 1'b0;
         end else begin
@@ -299,78 +311,61 @@ module spanner_v2 import tsp_pkg::*; #(
             if (start) begin
                 slot_valid <= '0;         // bulk clear the dedup
                 sg_x  <= '0;
-                sg_st <= SG_ISSUE;
+                sg_active <= 1'b1;
+                t_valid <= 1'b0;
+                g_ready <= 1'b0;          // first COAL waits one fill cycle for the read
+                fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
                 busy  <= 1'b1;
                 sf_wp <= '0; sf_rp <= '0;
             end
 
-            // =================== FSM 1: SPANGEN ===================
-            case (sg_st)
-            SG_ISSUE: begin
-                // rd_valid/rd_group presented combinationally this cycle; data next cycle.
-                sg_st <= SG_LATCH;
-            end
-            SG_LATCH: begin
-                // the 4 aligned lanes requested in ISSUE are valid now -> latch them.
-                g_valid <= ti_valid;
-                for (q = 0; q < 4; q = q + 1) begin
-                    g_tag[q]  <= ti_tag[q];
-                    g_invw[q] <= ti_invw[q];
+            // =================== FSM 1: SPANGEN pipeline (COAL + EMIT) ===================
+            // Whole pipeline freezes on pipe_stall (setup FIFO full on an allocating emit).
+            if (!pipe_stall) begin
+                // ---------- EMIT: retire the descriptor produced last cycle ----------
+                // span write is combinational (sp_*); here just commit the allocation to
+                // the slot store and shift the forwarding history.
+                if (t_valid && needs_alloc) begin
+                    slot_valid[t_id] <= 1'b1;
+                    slot_tag[t_id]   <= t_tag;
                 end
-                g_pt    <= ti_pt;
-                sg_st   <= SG_RUN;
-            end
-            SG_RUN: begin
-                // coalesce the run (combinational run_*), LATCH its payload into t_*, and
-                // present the REGISTERED slot read of run_id. The dedup compare + emit
-                // happen next cycle in SG_TEST (slot_tag is M10K, read has 1-cyc latency).
-                t_x      <= sg_x;
-                t_id     <= run_id;
-                t_tag    <= run_tag;
-                t_rep    <= run_rep;
-                t_shmask <= run_shmask;
-                t_at     <= g_pt[sg_lane];
-                for (q = 0; q < 4; q = q + 1)
-                    t_invw[q] <= (q < run_rep) ? g_invw[sg_lane + q[1:0]] : 32'd0;
-                // present slot read
-                test_id      <= run_id;
-                slot_tag_q   <= slot_tag[run_id];
-                slot_valid_q <= slot_valid[run_id];
-                sg_st <= SG_TEST;
-            end
-            SG_TEST: begin
-                // slot read resolved (slot_tag_q/slot_valid_q, forwarded via eff_*). Emit
-                // the span (combinational sp_*), allocate on a miss, advance the walk.
-                // emit_stall_fifo holds here (an allocating span with a full setup FIFO).
-                if (!emit_stall_fifo) begin
-                    if (needs_alloc) begin
-                        slot_valid[t_id] <= 1'b1;
-                        slot_tag[t_id]   <= t_tag;
-                    end
-                    // advance the walk from the run-start (t_x), by t_rep
-                    sg_x <= t_x_next;
-                    if (t_x_next == '0) begin
-                        // wrapped past the last pixel (NSLOT is a power of two) -> done
-                        sg_st <= SG_DONE;
-                    end else if (group_done_after) begin
-                        // group fully consumed -> issue a read for the next group
-                        sg_st <= SG_ISSUE;
-                    end else begin
-                        // more spans in this held group -> compute the next run
-                        sg_st <= SG_RUN;
-                    end
-                end
-            end
-            SG_DONE: ;   // SPANGEN finished; busy clears once SETUP drains (bottom).
-            default: ;   // SG_IDLE
-            endcase
+                // forwarding shift: fwd0 = alloc this cycle, fwd1 = previous fwd0.
+                fwd1_valid <= fwd0_valid; fwd1_id <= fwd0_id; fwd1_tag <= fwd0_tag;
+                fwd0_valid <= t_valid && needs_alloc;
+                fwd0_id    <= t_id;
+                fwd0_tag   <= t_tag;
 
-            // ---- slot-write FORWARDING: remember the write done THIS cycle so the read
-            // presented next cycle (SG_RUN) sees it despite M10K read-during-write returning
-            // stale data. Valid for exactly one cycle. ----
-            fwd_valid <= (sg_st == SG_TEST) && !emit_stall_fifo && needs_alloc;
-            fwd_id    <= t_id;
-            fwd_tag   <= t_tag;
+                // ---------- COAL: coalesce one span off ti_* (the current group) ----------
+                if (coal_fires) begin
+                    t_valid  <= 1'b1;
+                    t_x      <= sg_x;
+                    t_id     <= run_id;
+                    t_tag    <= run_tag;
+                    t_rep    <= run_rep;
+                    t_shmask <= run_shmask;
+                    t_at     <= ti_pt[sg_lane];
+                    for (q = 0; q < 4; q = q + 1)
+                        t_invw[q] <= (q < run_rep) ? ti_invw[sg_lane + q[1:0]] : 32'd0;
+                    // present the slot read for THIS descriptor (resolves next cycle in EMIT)
+                    slot_tag_q   <= slot_tag[run_id];
+                    slot_valid_q <= slot_valid[run_id];
+
+                    // advance. The read for sg_x_next's group is presented THIS cycle
+                    // (rd_group tracks rd_next_x continuously) -> ti_* is correct next cycle.
+                    sg_x <= sg_x_next;
+                    if (walk_last) sg_active <= 1'b0;
+                    // g_ready stays 1 (a valid read was presented this cycle).
+                end else begin
+                    // fill bubble (post start/stall): no descriptor; the read of sg_x's
+                    // group was presented this cycle -> ready next cycle.
+                    t_valid <= 1'b0;
+                end
+
+                // g_ready: a valid read was presented this cycle (sg_active && !pipe_stall
+                // is implied by being in this block); it lands next cycle. Cleared only at
+                // start (below) so the first COAL waits one fill cycle.
+                if (sg_active) g_ready <= 1'b1;
+            end
 
             // =================== FIFO push ===================
             if (sf_push && !sf_full) begin
@@ -414,8 +409,10 @@ module spanner_v2 import tsp_pkg::*; #(
             endcase
 
             // =================== busy / done ===================
-            // done when SPANGEN finished AND setup FIFO empty AND setup engine idle.
-            if (busy && (sg_st == SG_DONE) && sf_empty && (su_st == SU_IDLE) && !fx_busy)
+            // done when SPANGEN drained (not walking, EMIT stage empty) AND setup FIFO
+            // empty AND setup engine idle. Guard on !start so a fresh pass isn't cleared.
+            if (busy && !start && !sg_active && !t_valid && sf_empty
+                && (su_st == SU_IDLE) && !fx_busy)
                 busy <= 1'b0;
         end
     end
