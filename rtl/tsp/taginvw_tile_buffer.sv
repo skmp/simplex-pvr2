@@ -37,6 +37,10 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
     input      [4:0]            wr_x,           // chunk base (LANES-aligned)
     input      [31:0]           wr_tag,         // fragment CoreTag (same for all lanes)
     input      [32*LANES-1:0]   wr_invw,        // per-lane invW (flat)
+    input                       wr_pt,          // PT-list won (b_which==0): the blend's
+                                                // PT alpha-test enable, captured HERE at
+                                                // raster stage-B (dt_pt is stale by the
+                                                // time the decoupled reader blends).
 
     // ---- CLEAR: write {valid=1, tag=bg, invW=bg_depth} to all banks at clr_addr ----
     // (refsw ClearBuffers sets tagStatus.valid=true so the OP shade fills col_buf
@@ -59,7 +63,8 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
     input      [9:0]            sh_rd_id,
     output reg                  sh_valid,       // staged-this-pass bit  (1-cyc latency)
     output reg [31:0]           sh_tag,         // pending tag           (1-cyc latency)
-    output reg [31:0]           sh_depth        // depthBufferA (invW)   (1-cyc latency)
+    output reg [31:0]           sh_depth,       // depthBufferA (invW)   (1-cyc latency)
+    output reg                  sh_pt           // PT-list-won bit       (1-cyc latency)
 );
     localparam integer NB        = LANES;
     localparam integer BANK_BITS = $clog2(LANES);   // 3 for 8, 2 for 4
@@ -67,7 +72,8 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
     localparam integer TW_INVW   = 0;    // [31:0] depthBufferA (invW)
     localparam integer TW_TAG    = 32;   // [31:0] tagBufferA
     localparam integer TW_VALID  = 64;   // [0]    tagStatus.valid
-    localparam integer TI_W      = 65;
+    localparam integer TW_PT     = 65;   // [0]    PT-list-won (blend alpha-test enable)
+    localparam integer TI_W      = 66;
 
     reg  [NB-1:0]        we;
     reg  [AW*NB-1:0]     waddr;
@@ -128,6 +134,7 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
                 wdata[TI_W*cw + TW_INVW +: 32] = wr_invw[32*cw +: 32];
                 wdata[TI_W*cw + TW_TAG  +: 32] = wr_tag;
                 wdata[TI_W*cw + TW_VALID]      = 1'b1;
+                wdata[TI_W*cw + TW_PT]         = wr_pt;   // PT-list-won (same for all lanes)
             end
         end
     end
@@ -143,6 +150,7 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
         sh_valid = rdata[TI_W*sh_lane_r + TW_VALID];
         sh_tag   = rdata[TI_W*sh_lane_r + TW_TAG  +: 32];
         sh_depth = rdata[TI_W*sh_lane_r + TW_INVW +: 32];
+        sh_pt    = rdata[TI_W*sh_lane_r + TW_PT];
     end
 
 `ifndef SYNTHESIS

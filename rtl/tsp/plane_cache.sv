@@ -78,6 +78,19 @@ module plane_cache #(
     (* ramstyle = "M10K, no_rw_check" *) reg [EW-1:0] pc_ram [0:NENT-1];
     reg [EW-1:0] rd_word;                    // registered read data (1-cyc)
 
+    // ---- 1-ENTRY VICTIM cache (registers) ----
+    // The main store is DIRECT-MAPPED, so two tags that hash to the same slot evict
+    // each other and re-miss within a pass (measured: e.g. 0x...613b and 0x...6932 both
+    // map to slot 0x24 and ping-pong). Keep the LAST-EVICTED entry in a register and
+    // check it in parallel with the main lookup, so an alternating pair hits instead of
+    // re-missing. Captured on a WRITE that overwrites a valid entry with a DIFFERENT tag
+    // (a conflict eviction): the old occupant is read back (M10K read-first, wr_slot read
+    // on the write cycle -> old word next cycle) and latched here.
+    reg          vic_valid;
+    reg [EW-1:0] vic_word;
+    reg          vic_cap;                    // 1-cyc: capture the evicted word next cycle
+    reg [EW-1:0] evict_rd;                   // registered read of the overwritten slot
+
     // assemble the write word from the payload ports (tag now rides in pc_ram too)
     wire [EW-1:0] wr_word;
     assign wr_word[PW_TAG +: 32]  = wr_tag;
@@ -95,17 +108,36 @@ module plane_cache #(
     reg        lu_valid_q;                   // valid[lu_slot], aligned with rd_word
     reg [31:0] lu_tag_q;                      // lu_tag, aligned with rd_word
 
+    reg [31:0] evict_wtag;                    // wr_tag of the write that may evict
     always @(posedge clk) begin
         if (reset) begin
-            valid    <= '0;
-            rd_valid <= 1'b0;
+            valid     <= '0;
+            rd_valid  <= 1'b0;
+            vic_valid <= 1'b0;
+            vic_cap   <= 1'b0;
         end else begin
             rd_valid <= 1'b0;
+            vic_cap  <= 1'b0;
 
-            // WRITE: store wide payload (tag included) + set valid.
+            // WRITE: store wide payload (tag included) + set valid. If the slot was
+            // already valid, its old occupant is being evicted -> read it back this
+            // cycle (M10K read-first returns OLD data on same-addr r+w) and arm a
+            // victim capture for next cycle (only if the old tag differs from wr_tag).
             if (wr_req) begin
+                evict_rd   <= pc_ram[wr_slot];   // OLD word (read-first) before overwrite
+                evict_wtag <= wr_tag;
+                if (valid[wr_slot]) vic_cap <= 1'b1;
                 pc_ram[wr_slot] <= wr_word;
                 valid [wr_slot] <= 1'b1;
+                // if the write's tag matches the current victim, the victim is now stale
+                // (that entry is back in the main cache) -> drop it.
+                if (vic_valid && vic_word[PW_TAG +: 32] == wr_tag) vic_valid <= 1'b0;
+            end
+            // capture the evicted entry into the victim (a cycle after the write), unless
+            // it was just a same-tag refresh (no real eviction).
+            if (vic_cap && (evict_rd[PW_TAG +: 32] != evict_wtag)) begin
+                vic_valid <= 1'b1;
+                vic_word  <= evict_rd;
             end
 
             // LOOKUP: registered payload+tag read; sample valid + hold lu_tag so the
@@ -117,21 +149,23 @@ module plane_cache #(
                 rd_valid <= 1'b1;
             end
 
-            // INVALIDATE all: single-cycle clear. Callers issue inval only at shade
-            // sub-phase entry, never concurrently with a lookup.
-            if (inval) valid <= '0;
+            // INVALIDATE all: single-cycle clear (main + victim).
+            if (inval) begin valid <= '0; vic_valid <= 1'b0; end
         end
     end
 
-    // hit: valid (aligned) && tag from the registered RAM word == held lu_tag.
-    // Combinational, so it is valid the same cycle as rd_valid/payload.
-    assign hit = rd_valid && lu_valid_q && (rd_word[PW_TAG +: 32] == lu_tag_q);
+    // hit: main slot (valid + tag match) OR the victim (valid + tag match). Both land
+    // aligned with rd_valid (victim is a register, held stable).
+    wire main_hit = lu_valid_q && (rd_word[PW_TAG +: 32] == lu_tag_q);
+    wire vic_hit  = vic_valid  && (vic_word[PW_TAG +: 32] == lu_tag_q);
+    assign hit = rd_valid && (main_hit || vic_hit);
 
-    // payload outputs (valid the cycle rd_valid is high)
-    assign o_isp = rd_word[PW_ISP +: 32];
-    assign o_tsp = rd_word[PW_TSP +: 32];
-    assign o_tcw = rd_word[PW_TCW +: 32];
-    assign o_ddx = rd_word[PW_DDX +: 320];
-    assign o_ddy = rd_word[PW_DDY +: 320];
-    assign o_c   = rd_word[PW_C   +: 320];
+    // payload outputs: from the victim on a victim-only hit, else the main RAM word.
+    wire [EW-1:0] sel_word = (!main_hit && vic_hit) ? vic_word : rd_word;
+    assign o_isp = sel_word[PW_ISP +: 32];
+    assign o_tsp = sel_word[PW_TSP +: 32];
+    assign o_tcw = sel_word[PW_TCW +: 32];
+    assign o_ddx = sel_word[PW_DDX +: 320];
+    assign o_ddy = sel_word[PW_DDY +: 320];
+    assign o_c   = sel_word[PW_C   +: 320];
 endmodule
