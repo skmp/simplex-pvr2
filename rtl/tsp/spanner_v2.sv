@@ -8,22 +8,24 @@
 //   FSM 1  SPANGEN  - walks the tile's tag buffer 4 ALIGNED pixels/clk, coalesces the
 //                     leading same-tag run within each aligned group into a SPAN, and
 //                     writes {id, repeat, invW[0:3]} to the OUT span buffer at the
-//                     run-start pixel index. A NEW (not-yet-seen) tag allocates a
-//                     direct-mapped setup id (id = pc_slot(tag)) and pushes {id,tag}
-//                     to the setup FIFO. NEVER stalls on setup (that is downstream).
+//                     run-start pixel index. A NEW (not-yet-seen) tag BUMP-ALLOCATES a
+//                     ring setup id (id = top_tag++) and pushes {id,tag} to the setup FIFO.
+//                     NEVER stalls on setup (that is downstream).
 //   FSM 2  SETUP    - drains the setup FIFO: tag -> record_fetcher (GetFpuEntry) ->
-//                     tsp_setup_min (10 planes) -> WRITE triangle_setups[id]. Runs in
+//                     tsp_setup (10 planes) -> WRITE triangle_setups[id]. Runs in
 //                     parallel with SPANGEN and the (external) shade stage.
 //
-// DEDUP / ID: id = pc_slot(core_tag), DIRECT-MAPPED into the 1024-entry triangle_setups
-// array (id == storage slot). slot_tag[id]/slot_valid[id] remember which tag currently
-// owns each slot. A 32x32 tile has <=1024 pixels, so <=1024 distinct tags can appear ->
-// the id space (1024) CANNOT overflow. Collisions (two tags -> same slot) just cause a
-// re-setup (measured +0.5% on menu2); NO allocator, NO overflow fallback. slot_valid is
-// bulk-cleared at `start` (new tile pass); slot_tag rides in M10K.
+// DEDUP / ID: a direct-mapped M10K dedup map (indexed by pc_slot(tag)) holds {gen,tag,id};
+// the setup id is BUMP-ALLOCATED (top_tag), so triangle_setups ids are DENSE (0..distinct-1
+// per tile) not hash-scattered. triangle_setups is a RING shared with TSP (no ping-pong):
+// tsp_go signals a tile's setups done, tsp_rd_done frees that tile's ring range (tail).
+// A single 32x32 tile has <=1024 distinct tags, so ring_size=NSLOT never intra-tile
+// overflows; cross-tile overlap can overflow -> SPANGEN stalls for tsp_rd_done. The dedup
+// map's `gen` (bumped per start) invalidates prior-tile buckets for free ("don't reuse when
+// x/y change"); on gen wrap a clear-walk writes gen=0.
 //
-// BOTH the triangle_setups array AND the span buffer are EXTERNAL (module output write
-// ports) so the A/B ping-pong lives in peel_core glue, not here.
+// The triangle_setups RING + span buffer are EXTERNAL (module write ports); the ring
+// tail/reclaim handshake (tsp_go/tsp_rd_done) lets peel_core share ONE buffer with TSP.
 //
 // IN (tag buffer): a 4-wide ALIGNED read port. The module presents a group base
 // (rd_group = x & ~3) and receives the 4 lanes' {valid,tag,invW,pt} the NEXT cycle
@@ -44,6 +46,12 @@ module spanner_v2 import tsp_pkg::*; #(
     input      [31:0]           xbase, ybase,// this tile's origin (for tsp_setup_min)
     input      [26:0]           param_base,
     input                       intensity_shadow, // regs.fpu_shad_scale.intensity_shadow
+
+    // ---- shared-ring handshake with the TSP consumer ----
+    // triangle_setups is a RING shared with TSP (no ping-pong): ids are bump-allocated
+    // (top_tag), TSP reads them, and a whole tile's ring range frees when TSP finishes it.
+    output reg                  tsp_go,      // 1-cyc: this tile's setups are all done -> TSP may read
+    input                       tsp_rd_done, // 1-cyc: TSP finished the oldest handed tile -> free its range
 
     // ---- IN: 4-wide ALIGNED tag-buffer read (present addr -> data NEXT cycle) ----
     output reg                  rd_valid,    // present a group read this cycle
@@ -73,37 +81,53 @@ module spanner_v2 import tsp_pkg::*; #(
     output ddr_rd_req_t         dreq,
     input  ddr_rd_resp_t        dresp
 );
-    // ============================ dedup / slot store ============================
-    // id = pc_slot(tag): 10-bit hash -> DIRECT-MAPPED into all NSLOT(=1024) slots. The old
-    // 6-bit hash used only 64 slots and thrashed (aliasing tags evicted each other -> ~1.9x
-    // re-setups). tag = {skip[26:24], param_offs[23:3], tag_offset[2:0]}; strip triangles
-    // share param_offs and differ in tag_offset, so fold tag_offset into the low bits and
-    // mix two param_offs windows for spread.
+    // ============================ dedup map + setup-id ring ============================
+    // id = BUMP-ALLOCATED (top_tag), not the hash. The dedup MAP is a direct-mapped M10K
+    // (indexed by pc_slot(tag)) that remembers, per hash bucket, {gen, tag, id} = which
+    // ring id a tag was assigned. triangle_setups[id] is a RING (top_tag..tail) shared
+    // with TSP; ids are dense (0..distinct-1 per tile) instead of scattered by the hash,
+    // so the ring can be far smaller than 1024 and shared with TSP without ping-pong.
+    //   lookup:  h = pc_slot(tag); if map[h].gen==cur_gen && map[h].tag==tag -> HIT, id=map[h].id
+    //            else MISS -> id = top_tag++, map[h] = {cur_gen, tag, id}, push a setup.
+    // pc_slot spreads tags across the 1024 map buckets (10-bit hash). tag =
+    // {skip[26:24], param_offs[23:3], tag_offset[2:0]}; strip triangles share param_offs.
     function automatic [SLOTW-1:0] pc_slot(input [31:0] tag);
         pc_slot = tag[12:3] ^ tag[22:13] ^ { {(SLOTW-3){1'b0}}, tag[2:0] };
     endfunction
 
-    // dedup store: ONE M10K holding {gen, tag} per slot, so BOTH the tag AND the validity
-    // live in block RAM - no 1024-bit flop valid-vector, no 1024:1 read mux, no per-pass
-    // bulk clear (an M10K can't clear all entries at once). A slot is VALID for the current
-    // pass iff its stored gen == cur_gen; `start` bumps cur_gen so all prior-pass slots go
-    // stale for free. cur_gen never uses 0 (=cleared sentinel); on wrap a clear-walk writes
-    // gen=0 to every slot (rare: every 255 passes). REGISTERED read (1-cyc) like the old
-    // slot_tag; the dedup test is PIPELINED COAL(present read)->EMIT(compare+write).
-    // COHERENCY: EMIT can WRITE a slot the same cycle COAL presents the next read; M10K
-    // returns OLD data on same-addr r+w, so the two most-recent in-pass allocations are
-    // FORWARDED (fwd0/fwd1) into the EMIT compare (see fwd_* below).
+    // dedup MAP: ONE M10K holding {gen, tag, id} per bucket, so tag+validity+id all live
+    // in block RAM (no flop valid-vector, no bulk clear). A bucket is VALID this pass iff
+    // gen==cur_gen; `start` bumps cur_gen so prior-pass buckets go stale for free ("don't
+    // reuse when x/y change"). cur_gen never 0; on wrap a clear-walk writes gen=0 to all.
+    // REGISTERED read (1-cyc); the dedup test is PIPELINED COAL(read)->EMIT(compare+write).
+    // COHERENCY: EMIT can WRITE a bucket the same cycle COAL presents the next read (M10K
+    // returns stale on same-addr r+w) -> the two most-recent allocations are FORWARDED.
     localparam integer GEN_W = 8;
-    localparam integer DD_W  = GEN_W + 32;       // {gen, tag}
+    localparam integer DD_W  = GEN_W + 32 + SLOTW;   // {gen, tag, id}
     localparam [GEN_W-1:0] GEN_MAX = {GEN_W{1'b1}};
     (* ramstyle = "M10K, no_rw_check" *) reg [DD_W-1:0] dedup_ram [0:NSLOT-1];
-    reg [DD_W-1:0]     dd_rd_q;                   // registered read {gen,tag} of coal id
+    reg [DD_W-1:0]     dd_rd_q;                   // registered read {gen,tag,id} of coal bucket
     reg [GEN_W-1:0]    cur_gen;                   // current pass generation (never 0)
     reg                dd_clearing;               // clear-walk in progress (gen wrap)
     reg [SLOTW-1:0]    dd_clr_addr;
-    wire [GEN_W-1:0]   dd_rd_gen = dd_rd_q[DD_W-1:32];
-    wire [31:0]        slot_tag_q   = dd_rd_q[31:0];
+    wire [GEN_W-1:0]   dd_rd_gen  = dd_rd_q[DD_W-1 -: GEN_W];
+    wire [31:0]        slot_tag_q = dd_rd_q[SLOTW +: 32];
+    wire [SLOTW-1:0]   slot_id_q  = dd_rd_q[0 +: SLOTW];
     wire               slot_valid_q = (dd_rd_gen == cur_gen);
+
+    // ---- setup-id RING (triangle_setups slots), shared with TSP ----
+    // top_tag = next id to allocate; tail = oldest id still owned by TSP. Extra MSB (like a
+    // FIFO) disambiguates full vs empty so all NSLOT ids are usable. On tsp_done the oldest
+    // handed tile's range frees (tail <- that tile's end). If the ring would overflow (a
+    // single tile with >NSLOT distinct, or two dense tiles overlapping), SPANGEN stalls
+    // until TSP frees a tile. A go-FIFO records each handed tile's end pointer.
+    reg [SLOTW:0]      top_tag, tail;            // ring head / tail (SLOTW+1 bits)
+    wire ring_empty = (top_tag == tail);
+    wire ring_full  = (top_tag[SLOTW] != tail[SLOTW]) && (top_tag[SLOTW-1:0] == tail[SLOTW-1:0]);
+    localparam integer GF_AW = 2;                 // up to 4 tiles handed-but-not-done
+    reg [SLOTW:0]      gf_mem [0:(1<<GF_AW)-1];   // tile END pointers handed to TSP
+    reg [GF_AW:0]      gf_wp, gf_rp;
+    wire gf_empty = (gf_wp == gf_rp);
 
     // ============================ setup FIFO (SPANGEN -> SETUP) ============================
     // {id, tag} pushed when a span allocates a NEW slot; drained by the SETUP engine.
@@ -148,7 +172,7 @@ module spanner_v2 import tsp_pkg::*; #(
     // ---- span descriptor latched at COAL, consumed (emitted) at EMIT ----
     reg              t_valid;       // EMIT stage occupied
     reg [SLOTW-1:0]  t_x;           // run-start pixel index
-    reg [SLOTW-1:0]  t_id;          // pc_slot(run_tag)
+    reg [SLOTW-1:0]  t_h;           // pc_slot(run_tag) = dedup map bucket
     reg [31:0]       t_tag;
     reg [2:0]        t_rep;
     reg [3:0]        t_shmask;
@@ -189,22 +213,31 @@ module spanner_v2 import tsp_pkg::*; #(
     // Both are checked against t_id; the most recent wins. Uniform tile (same tag every
     // group -> same id) is covered: after the first alloc, every later EMIT sees fwd and
     // dedups (no re-push, no re-setup).
+    // forwarding is keyed by the map BUCKET (t_h = pc_slot) and carries {tag, id} of the
+    // two most-recent allocations, so a back-to-back reuse of a just-allocated bucket sees
+    // the fresh {tag,id} despite the M10K read-during-write staleness.
     reg             fwd0_valid, fwd1_valid;
-    reg [SLOTW-1:0] fwd0_id,    fwd1_id;
+    reg [SLOTW-1:0] fwd0_h,     fwd1_h;
     reg [31:0]      fwd0_tag,   fwd1_tag;
-    wire            fwd0_hit = fwd0_valid && (fwd0_id == t_id);
-    wire            fwd1_hit = fwd1_valid && (fwd1_id == t_id);
-    wire            eff_valid = fwd0_hit ? 1'b1 : (fwd1_hit ? 1'b1 : slot_valid_q);
+    reg [SLOTW-1:0] fwd0_id,    fwd1_id;
+    wire            fwd0_hit = fwd0_valid && (fwd0_h == t_h);
+    wire            fwd1_hit = fwd1_valid && (fwd1_h == t_h);
+    wire            eff_valid = fwd0_hit | fwd1_hit | slot_valid_q;
     wire [31:0]     eff_tag   = fwd0_hit ? fwd0_tag : (fwd1_hit ? fwd1_tag : slot_tag_q);
+    wire [SLOTW-1:0] eff_id   = fwd0_hit ? fwd0_id  : (fwd1_hit ? fwd1_id  : slot_id_q);
     wire is_dedup_hit = t_valid && eff_valid && (eff_tag == t_tag);
     wire needs_alloc  = t_valid && !is_dedup_hit;
+    // the ring id this emit uses: reuse the cached/forwarded id on a hit, else the next
+    // bump-allocated id (top_tag).
+    wire [SLOTW-1:0] emit_id = is_dedup_hit ? eff_id : top_tag[SLOTW-1:0];
 
-    // emit can commit when: if it ALLOCATES (new tag), the setup FIFO has room. A same-tag
-    // reuse never needs the FIFO. When it can't, the WHOLE pipeline freezes (COAL + EMIT).
+    // emit can commit when: an ALLOCATING emit needs setup-FIFO room AND a free ring slot.
+    // A same-tag reuse needs neither. When blocked, the WHOLE pipeline freezes (COAL+EMIT).
     wire emit_stall_fifo = needs_alloc && sf_full;
+    wire emit_stall_ring = needs_alloc && ring_full;   // no free ring id -> wait for TSP
     // also freeze if the span consumer (expander) can't accept the span this emit produces
     wire emit_stall_span = t_valid && !sp_ready;
-    wire pipe_stall      = emit_stall_fifo | emit_stall_span;   // freezes both stages
+    wire pipe_stall      = emit_stall_fifo | emit_stall_ring | emit_stall_span;
 
     // ---- COAL advance: sg_x steps by run_rep; group exhausted when it crosses the group ----
     wire [SLOTW-1:0] sg_x_next   = sg_x + { {(SLOTW-3){1'b0}}, run_rep };
@@ -292,14 +325,14 @@ module spanner_v2 import tsp_pkg::*; #(
         // (no write, no advance) when the pipeline is frozen. -----
         sp_we      = t_valid && !pipe_stall;
         sp_idx     = t_x;
-        sp_id      = t_id;
+        sp_id      = emit_id;              // bump-allocated (or reused) ring id
         sp_rep     = t_rep;
         sp_shmask  = t_shmask;
         sp_at      = t_at;
         for (k = 0; k < 4; k = k + 1) sp_invw[k] = t_invw[k];
 
         sf_push  = sp_we && needs_alloc;   // allocate -> push a setup
-        sf_pdata = { t_id, t_tag };
+        sf_pdata = { emit_id, t_tag };
 
         // COAL group read address. A registered-read tag buffer updates its output EVERY
         // cycle from the presented address, so we drive rd_group to the group of the pixel
@@ -325,7 +358,7 @@ module spanner_v2 import tsp_pkg::*; #(
     integer q;
     always @(posedge clk) begin
         if (reset) begin
-            busy <= 1'b0;
+            busy <= 1'b0; tsp_go <= 1'b0;
             sg_active <= 1'b0; sg_x <= '0; t_valid <= 1'b0;
             g_ready <= 1'b0;
             cur_gen <= GEN_MAX;           // force a clear-walk on the FIRST start (HW-safe
@@ -333,21 +366,30 @@ module spanner_v2 import tsp_pkg::*; #(
             dd_clearing <= 1'b0;
             fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
             sf_wp <= '0; sf_rp <= '0;
+            top_tag <= '0; tail <= '0; gf_wp <= '0; gf_rp <= '0;
             fetch_busy <= 1'b0; pend_v <= 1'b0; su_run <= 1'b0; ts_pend <= 1'b0;
             fx_start <= 1'b0; tsp_start <= 1'b0;
         end else begin
             fx_start  <= 1'b0;
             tsp_start <= 1'b0;
+            tsp_go    <= 1'b0;            // 1-cyc pulse
+
+            // ---------------- TSP freed a tile -> advance the ring tail ----------------
+            if (tsp_rd_done && !gf_empty) begin
+                tail  <= gf_mem[gf_rp[GF_AW-1:0]];   // free up to the oldest handed tile's end
+                gf_rp <= gf_rp + 1'b1;
+            end
 
             // ---------------- start a tile pass ----------------
-            // Bump the generation so all prior-pass dedup slots go stale for free. If gen
-            // would wrap, do a clear-walk first (write gen=0 to every slot) so a reused gen
-            // value can't false-hit an ancient slot. begin_pass (below) actually launches
-            // SPANGEN - deferred past the clear-walk when one is needed.
+            // Bump the generation so all prior-pass dedup buckets go stale for free ("don't
+            // reuse when x/y change"). If gen would wrap, clear-walk first. When the ring is
+            // idle (all handed tiles done - the standalone/sequential case) NORMALIZE it to 0
+            // so ids restart dense at 0; when overlapped with TSP the head just continues.
             if (start) begin
                 busy  <= 1'b1;
                 fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
                 sf_wp <= '0; sf_rp <= '0;
+                if (ring_empty && !(tsp_rd_done && !gf_empty)) begin top_tag <= '0; tail <= '0; end
                 if (cur_gen == GEN_MAX) begin
                     dd_clearing <= 1'b1; dd_clr_addr <= '0;   // SPANGEN idle until clear done
                 end else begin
@@ -369,22 +411,24 @@ module spanner_v2 import tsp_pkg::*; #(
             // Whole pipeline freezes on pipe_stall (setup FIFO full on an allocating emit).
             if (!pipe_stall) begin
                 // ---------- EMIT: retire the descriptor produced last cycle ----------
-                // span write is combinational (sp_*); here just commit the allocation to
-                // the slot store and shift the forwarding history.
+                // On a MISS, bump-allocate id=top_tag into the ring and write the map
+                // bucket {cur_gen, tag, id}. span write + setup push are combinational (sp_*).
                 if (t_valid && needs_alloc) begin
-                    dedup_ram[t_id] <= {cur_gen, t_tag};
+                    dedup_ram[t_h] <= {cur_gen, t_tag, top_tag[SLOTW-1:0]};
+                    top_tag <= top_tag + 1'b1;    // advance ring head (wraps via SLOTW+1 bits)
                 end
-                // forwarding shift: fwd0 = alloc this cycle, fwd1 = previous fwd0.
-                fwd1_valid <= fwd0_valid; fwd1_id <= fwd0_id; fwd1_tag <= fwd0_tag;
+                // forwarding shift: fwd0 = alloc this cycle (bucket t_h -> {tag,id}).
+                fwd1_valid <= fwd0_valid; fwd1_h <= fwd0_h; fwd1_id <= fwd0_id; fwd1_tag <= fwd0_tag;
                 fwd0_valid <= t_valid && needs_alloc;
-                fwd0_id    <= t_id;
+                fwd0_h     <= t_h;
+                fwd0_id    <= top_tag[SLOTW-1:0];
                 fwd0_tag   <= t_tag;
 
                 // ---------- COAL: coalesce one span off ti_* (the current group) ----------
                 if (coal_fires) begin
                     t_valid  <= 1'b1;
                     t_x      <= sg_x;
-                    t_id     <= run_id;
+                    t_h      <= run_id;            // dedup map bucket = pc_slot(run_tag)
                     t_tag    <= run_tag;
                     t_rep    <= run_rep;
                     t_shmask <= run_shmask;
@@ -495,12 +539,18 @@ module spanner_v2 import tsp_pkg::*; #(
                 ts_pend <= 1'b0;
             end
 
-            // =================== busy / done ===================
-            // done when SPANGEN drained (not walking, EMIT stage empty) AND the whole
-            // setup path is drained (FIFO, fetch, skid, setup run, write pulse).
+            // =================== busy / done -> tsp_go ===================
+            // done when SPANGEN drained (not walking, EMIT stage empty) AND the whole setup
+            // path is drained (FIFO, fetch, skid, setup run, write pulse). At that moment the
+            // tile's setups are ALL in triangle_setups -> pulse tsp_go and record the tile's
+            // END pointer (top_tag) so tsp_done can later free this tile's ring range.
             if (busy && !start && !dd_clearing && !sg_active && !t_valid && sf_empty
-                && !fetch_busy && !pend_v && !su_run && !ts_pend)
-                busy <= 1'b0;
+                && !fetch_busy && !pend_v && !su_run && !ts_pend) begin
+                busy   <= 1'b0;
+                tsp_go <= 1'b1;
+                gf_mem[gf_wp[GF_AW-1:0]] <= top_tag;
+                gf_wp <= gf_wp + 1'b1;
+            end
         end
     end
 
