@@ -74,9 +74,9 @@ static bool bad(uint32_t a, uint32_t b){
 
 static void tick(){ dut->clk=0; dut->eval(); dut->clk=1; dut->eval(); }
 
-// pc_slot: MUST match spanner_v2.pc_slot exactly.
+// pc_slot: MUST match spanner_v2.pc_slot exactly (10-bit, 1024 slots).
 static uint32_t pc_slot(uint32_t tag){
-    return ((tag>>3)&0x3F) ^ (tag&0x7);
+    return ((tag>>3)&0x3FF) ^ ((tag>>13)&0x3FF) ^ (tag&0x7);
 }
 
 static uint8_t* load(const char* path, long* out_sz){
@@ -135,7 +135,7 @@ static bool load_vec(const std::string& path, Vec& vc){
 // pc_slot direct-mapped. Records, per run-start pixel: {id,rep,shmask,invw[4],at}.
 struct Span { uint32_t idx,id,rep,shmask,at; uint32_t invw[4]; };
 static void golden(const Vec& vc, std::vector<Span>& out){
-    uint32_t slot_valid[64]={0}, slot_tag[64];
+    uint32_t slot_valid[1024]={0}, slot_tag[1024];
     int x=0;
     while(x<1024){
         int lane=x&3;
@@ -154,8 +154,8 @@ static void golden(const Vec& vc, std::vector<Span>& out){
         // (id is a 6-bit slot here since NSLOT hash uses [8:3]^[2:0]; but spanner uses
         //  SLOTW=10 with the same low-6 hash, so id fits 0..63)
         (void)slot_tag;
-        if(!(slot_valid[id&63] && slot_tag[id&63]==tag)){
-            slot_valid[id&63]=1; slot_tag[id&63]=tag;
+        if(!(slot_valid[id] && slot_tag[id]==tag)){
+            slot_valid[id]=1; slot_tag[id]=tag;
         }
         Span s; s.idx=x; s.id=id; s.rep=rep; s.shmask=shmask; s.at=vc.pt[x];
         for(int k=0;k<4;k++) s.invw[k] = (k<rep) ? vc.invw[(x&~3)+lane+k] : 0;
@@ -262,11 +262,11 @@ int main(int argc,char**argv){
             // 3) every allocated setup id got a triangle_setups write
             bool need_setup[1024]={false};
             {
-                uint32_t sv[64]={0},st[64];
+                static uint32_t sv[1024],st[1024]; memset(sv,0,sizeof(sv));
                 int x=0;
                 while(x<1024){
                     uint32_t tag=vc.tag[x]; uint32_t id=pc_slot(tag);
-                    if(!(sv[id&63] && st[id&63]==tag)){ sv[id&63]=1; st[id&63]=tag; need_setup[id]=true; }
+                    if(!(sv[id] && st[id]==tag)){ sv[id]=1; st[id]=tag; need_setup[id]=true; }
                     int lane=x&3,rep=1;
                     for(int l=lane+1;l<4;l++){ if(vc.tag[(x&~3)+l]==tag) rep++; else break; }
                     x+=rep;
