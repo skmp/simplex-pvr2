@@ -59,6 +59,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/isp_primitive_iterator_pf
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/f2u8.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_fetch_pp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_cache_4p.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tex_cache_4p_1c.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_miplevel.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/delay_ram.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/tsp/tsp_shade_pp.sv
