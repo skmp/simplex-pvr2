@@ -153,11 +153,14 @@ module spanner_v2_tb_top import tsp_pkg::*; (
     );
 
     // ==================== DUT ====================
+    (* verilator public_flat_rw *) wire tsp_go;
+    (* verilator public_flat_rw *) reg  tsp_rd_done;
     spanner_v2 #(.NSLOT(NSLOT), .SLOTW(10)) u_dut (
         .clk(clk), .reset(reset),
         .start(start), .busy(busy), .shade_mode(shade_mode),
         .xbase(xbase), .ybase(ybase), .param_base(param_base),
         .intensity_shadow(intensity_shadow),
+        .tsp_go(tsp_go), .tsp_rd_done(tsp_rd_done),
         .rd_valid(rd_valid), .rd_group(rd_group),
         .ti_valid(ti_valid), .ti_tag(ti_tag), .ti_invw(ti_invw), .ti_pt(ti_pt),
         .ts_we(ts_we), .ts_id(ts_id),

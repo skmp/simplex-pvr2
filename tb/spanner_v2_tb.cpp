@@ -135,7 +135,8 @@ static bool load_vec(const std::string& path, Vec& vc){
 // pc_slot direct-mapped. Records, per run-start pixel: {id,rep,shmask,invw[4],at}.
 struct Span { uint32_t idx,id,rep,shmask,at; uint32_t invw[4]; };
 static void golden(const Vec& vc, std::vector<Span>& out){
-    uint32_t slot_valid[1024]={0}, slot_tag[1024];
+    // bump-allocated ids: dedup map (direct-mapped by pc_slot) -> {tag, id}; id = top++.
+    uint32_t map_valid[1024]={0}, map_tag[1024], map_id[1024]; uint32_t top=0;
     int x=0;
     while(x<1024){
         int lane=x&3;
@@ -149,14 +150,9 @@ static void golden(const Vec& vc, std::vector<Span>& out){
             if(vc.tag[(x&~3)+l]==tag){ rep++; shmask |= shok((x&~3)+l)<<l; }
             else break;
         }
-        uint32_t id=pc_slot(tag);
-        // dedup: allocate if slot empty or holds a different tag
-        // (id is a 6-bit slot here since NSLOT hash uses [8:3]^[2:0]; but spanner uses
-        //  SLOTW=10 with the same low-6 hash, so id fits 0..63)
-        (void)slot_tag;
-        if(!(slot_valid[id] && slot_tag[id]==tag)){
-            slot_valid[id]=1; slot_tag[id]=tag;
-        }
+        uint32_t h=pc_slot(tag), id;
+        if(map_valid[h] && map_tag[h]==tag){ id=map_id[h]; }              // dedup hit
+        else { id=top++; map_valid[h]=1; map_tag[h]=tag; map_id[h]=id; }  // bump-allocate
         Span s; s.idx=x; s.id=id; s.rep=rep; s.shmask=shmask; s.at=vc.pt[x];
         for(int k=0;k<4;k++) s.invw[k] = (k<rep) ? vc.invw[(x&~3)+lane+k] : 0;
         out.push_back(s);
@@ -187,6 +183,7 @@ int main(int argc,char**argv){
     for(int i=0;i<20;i++) tick();
     load_vram(vpath);
     dut->reset=0; tick();
+    ROOT->spanner_v2_tb_top__DOT__tsp_rd_done=0;
 
     int total_fail=0, total_pass=0; long total_cyc=0, practical_cyc=0;
     long total_distinct=0, total_runs=0;   // dedup: distinct setups vs actual engine runs
@@ -259,14 +256,14 @@ int main(int argc,char**argv){
                 if(fails<10) printf("pass %d: EXTRA span at idx %d (id=%u rep=%u)\n",n,i,SPO_ID[i],SPO_REP[i]);
                 fails++;
             }
-            // 3) every allocated setup id got a triangle_setups write
+            // 3) every allocated setup id got a triangle_setups write (bump-allocated ids)
             bool need_setup[1024]={false};
             {
-                static uint32_t sv[1024],st[1024]; memset(sv,0,sizeof(sv));
-                int x=0;
+                static uint32_t mv[1024],mt[1024],mi[1024]; memset(mv,0,sizeof(mv));
+                uint32_t top=0; int x=0;
                 while(x<1024){
-                    uint32_t tag=vc.tag[x]; uint32_t id=pc_slot(tag);
-                    if(!(sv[id] && st[id]==tag)){ sv[id]=1; st[id]=tag; need_setup[id]=true; }
+                    uint32_t tag=vc.tag[x]; uint32_t h=pc_slot(tag);
+                    if(!(mv[h] && mt[h]==tag)){ uint32_t id=top++; mv[h]=1; mt[h]=tag; mi[h]=id; need_setup[id]=true; }
                     int lane=x&3,rep=1;
                     for(int l=lane+1;l<4;l++){ if(vc.tag[(x&~3)+l]==tag) rep++; else break; }
                     x+=rep;
@@ -323,6 +320,10 @@ int main(int argc,char**argv){
             }
             else        { printf("pass %d: %d FAILURES (cyc=%ld)\n",n,fails,cyc); total_fail++; }
         }
+        // model TSP finishing this tile: pulse tsp_rd_done so the ring frees (tail catches
+        // up) and the next pass normalizes ids back to 0.
+        ROOT->spanner_v2_tb_top__DOT__tsp_rd_done=1; tick();
+        ROOT->spanner_v2_tb_top__DOT__tsp_rd_done=0; tick();
         next:;
     }
 
