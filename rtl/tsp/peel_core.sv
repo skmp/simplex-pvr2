@@ -218,12 +218,8 @@ module peel_core import tsp_pkg::*; (
 
     // ---- peel tile buffer control (typed ports; driven by the raster/shade/FSM) ----
     reg                    pb_ra_valid;         // (=ras_out_valid: stage-A read)
-    reg                    pb_clr_valid;        // CLEAR walk write
-    reg  [CHUNK_AW-1:0]    pb_clr_addr;
-    reg                    pb_bufrd_valid;      // PeelBuffers read-ahead
-    reg  [CHUNK_AW-1:0]    pb_bufrd_addr;
-    reg                    pb_bufwr_valid;      // PeelBuffers delayed write
-    reg  [CHUNK_AW-1:0]    pb_bufwr_addr;
+    reg                    pb_clr_all;          // 1-cyc: lazy CLEAR (invalidate + latch bg)
+    reg                    pb_peel_swap;        // 1-cyc: peel-pass A/B swap + valid clear
     wire [RAS_LANES-1:0]   b_pass_lp;           // per-lane peel accept (for dt_pt)
     wire [RAS_LANES-1:0]   b_more;              // per-lane MoreToDraw
     wire [RAS_LANES-1:0]   b_we;                // per-lane stage-B accept (-> u_taginvw)
@@ -373,13 +369,10 @@ module peel_core import tsp_pkg::*; (
         // is tied off.
         .sh_rd_valid(1'b0), .sh_rd_id(10'd0),
         .sh_valid(), .sh_tag(), .sh_depth(),
-        // CLEAR
-        .clr_valid(pb_clr_valid), .clr_addr(pb_clr_addr),
+        // LAZY CLEAR + A/B pointer swap (no RAM walks)
+        .clr_all(pb_clr_all),
         .clr_depth(regs.isp_backgnd_d), .clr_tag(regs.isp_backgnd_t),
-        // PeelBuffers RMW walk
-        .pb_rd_valid(pb_bufrd_valid), .pb_rd_addr(pb_bufrd_addr),
-        .pb_wr_valid(pb_bufwr_valid), .pb_wr_addr(pb_bufwr_addr),
-        .pb_first(first_peel)
+        .peel_swap(pb_peel_swap), .pb_first(first_peel)
     );
 
     // ---- PING-PONG ISP->TSP handoff buffer (u_taginvw): the {valid,tag,invW} slice
@@ -419,11 +412,10 @@ module peel_core import tsp_pkg::*; (
             .wr_valid(ti_prod && b_valid), .wr_we(b_we),
             .wr_y(b_oy), .wr_x(b_ox), .wr_tag(b_tag), .wr_invw(b_invw),
             .wr_pt(b_peeling && (b_which==1'b0)),   // PT alpha-test enable (peel + PT list)
-            // CLEAR (producer half only)
-            .clr_valid(ti_prod && pb_clr_valid), .clr_addr(pb_clr_addr),
+            // LAZY CLEAR + per-pass valid clear (producer half only; 1-cyc pulses, no walk)
+            .clr_all(ti_prod && pb_clr_all),
             .clr_depth(regs.isp_backgnd_d), .clr_tag(regs.isp_backgnd_t),
-            // PeelBuffers valid-clear walk (producer half; mirrors u_peel's pb write)
-            .pbc_valid(ti_prod && pb_bufwr_valid), .pbc_addr(pb_bufwr_addr),
+            .pbc_all(ti_prod && pb_peel_swap),   // per-pass valid clear mirrors u_peel's swap
             // single-pixel shade read retired: spanner_v2 uses the 4-wide port
             .sh_rd_valid(1'b0), .sh_rd_id(10'd0),
             .sh_valid(), .sh_tag(), .sh_depth(), .sh_pt(),
@@ -753,13 +745,10 @@ module peel_core import tsp_pkg::*; (
     reg [7:0]  peel_pass;         // pass counter (safety bound)
     localparam integer PEEL_MAX_PASS = 64;
 
-    // ---- M10K bulk-op walk counters (NCHUNK addresses = whole 32x32 tile) ----
-    reg [CHUNK_AW-1:0]  cl_i;     // CLEAR chunk-address counter 0..NCHUNK-1
-    reg [CHUNK_AW-1:0]  pb_i;     // PeelBuffers chunk-address counter 0..NCHUNK-1
-    reg [CHUNK_AW-1:0]  pb_rd;    // PeelBuffers read-ahead chunk (1 ahead of pb_i)
-    reg        pb_pipe;         // PeelBuffers RMW pipe primed (stage-B has valid rdata)
-    reg        first_peel;      // this tile's FIRST PeelBuffers (folds refsw SetTagToMax:
-                                //   pb2 <- 0xFFFFFFFF instead of copying tagA)
+    // (CLEAR/PeelBuffers M10K walk counters cl_i/pb_i/pb_rd/pb_pipe removed - both are now
+    //  1-cycle register pulses, no NCHUNK walk.)
+    reg        first_peel;      // this tile's FIRST peel pass (folds refsw SetTagToMax:
+                                //   pb2 <- 0xFFFFFFFF; consumed by pb_peel_swap's pb_first)
 
     // ---- single shared shade sub-phase (ONE tsp_shade_pp pipeline) ----
     // Invoked as a subroutine after OP and after each peel pass. The TSP pipeline
@@ -1130,12 +1119,8 @@ module peel_core import tsp_pkg::*; (
     always @(*) begin
         // ---- peel buffer ----
         pb_ra_valid    = ras_out_valid;               // stage-A read (chunk resolved)
-        pb_clr_valid   = (st == S_CLEAR_WR);          // CLEAR walk write
-        pb_clr_addr    = cl_i;
-        pb_bufrd_valid = (st == S_PEEL_BUF_RUN);      // PeelBuffers read-ahead
-        pb_bufrd_addr  = pb_rd;
-        pb_bufwr_valid = (st == S_PEEL_BUF_RUN) && pb_pipe;  // PeelBuffers delayed write
-        pb_bufwr_addr  = pb_i;
+        // CLEAR + PeelBuffers are now 1-cyc register pulses (pb_clr_all / pb_peel_swap),
+        // driven in the FSM clocked block (RSTATE_CLEAR / S_PEEL_BUF), not combinational walks.
         // (stage-B write is driven by the b_valid port directly on u_peel)
 
         // ---- color buffer ----
@@ -1210,7 +1195,7 @@ module peel_core import tsp_pkg::*; (
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
             b_valid<=1'b0; cb_valid<=1'b0;
-            cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
+            first_peel<=1'b0;
             col_post<=1'b0;                   // color post-to-VO intent
             ra_done_l<=1'b0;                  // latched region-done
             // SPANNER_v2 glue + TSP reader FSMs
@@ -1317,6 +1302,7 @@ module peel_core import tsp_pkg::*; (
 `endif
             done<=0; ra_start<=0; ol_start<=0;
             spv_start<=1'b0; spv_rd_done<=1'b0;  // 1-cyc spanner start / ring-free strobes
+            pb_clr_all<=1'b0; pb_peel_swap<=1'b0; // 1-cyc lazy-CLEAR / peel-swap strobes
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             eq_push = 1'b0;
             col_post<=1'b0;                   // 1-cyc: color-buffer post-to-VO intent
@@ -1449,19 +1435,19 @@ module peel_core import tsp_pkg::*; (
                 t_xbase <= i2f({10'd0, cur_tx} * 16'd32);
                 t_ybase <= i2f({10'd0, cur_ty} * 16'd32);
                 case (ra_out.state)
-                // CLEAR touches the whole tile buffer: BARRIER first (consumer of
-                // the previous state must be fully done). The M10K CLEAR is a 128-
-                // chunk write walk (S_CLEAR_WR) instead of a single-cycle for-loop.
-                // gate on !ti_ready[htile]: CLEAR writes u_taginvw[htile], which TSP may
-                // still be reading from an earlier pass (ping-pong back-pressure).
+                // CLEAR touches the whole tile buffer: BARRIER first (consumer of the previous
+                // state must be fully done). Now a 1-CYCLE lazy clear (pb_clr_all invalidates
+                // valid_r + latches bg) instead of a 256-chunk write walk. gate on
+                // !ti_ready[htile]: CLEAR invalidates u_taginvw[htile], which TSP may still be
+                // reading from an earlier pass (ping-pong back-pressure).
                 RSTATE_CLEAR: if (consumer_idle && fq_empty && !ti_ready[htile]) begin
-                    // as tile_engine_top TILE_CLEAR: {bg depth, bg CoreTag}. Every
-                    // pixel's tag = background tag and is "valid" for OP shading
-                    // (refsw ClearBuffers sets tagStatus.valid=true), so the OP
-                    // shade fills col_buf with the background color.
+                    // as tile_engine_top TILE_CLEAR: {bg depth, bg CoreTag}. A not-yet-written
+                    // pixel then reads bg (valid_r==0 -> read default), matching refsw
+                    // ClearBuffers. One cycle, then ack the region.
                     op_shaded <= 1'b0;   // OP shade not yet run for this tile
                     has_pt <= 1'b0; has_tr <= 1'b0;   // PT/TL lists for this tile: none yet
-                    cl_i <= '0; st <= S_CLEAR_WR;
+                    pb_clr_all <= 1'b1;               // lazy CLEAR pulse
+                    ra_ack.list_done <= 1'b1; st <= S_RA_ACK;
                 end
                 // OPAQUE: single pass, plain DepthMode compare (no peeling). Gate on
                 // !ti_ready[htile] (raster writes u_taginvw[htile]).
@@ -1523,12 +1509,8 @@ module peel_core import tsp_pkg::*; (
                 endcase
             end
 
-            // CLEAR write walk: the combi block writes background {depth,tag} to all
-            // banks at address cl_i each cycle; here we just walk cl_i 0..NCHUNK-1.
-            S_CLEAR_WR: begin
-                if (cl_i == CHUNK_AW'(NCHUNK-1)) begin ra_ack.list_done <= 1'b1; st <= S_RA_ACK; end
-                else cl_i <= cl_i + 1'b1;
-            end
+            // (S_CLEAR_WR walk removed: CLEAR is now the 1-cycle pb_clr_all pulse in RSTATE_CLEAR.
+            //  S_PEEL_BUF_RUN walk removed: PeelBuffers is the 1-cycle pb_peel_swap in S_PEEL_BUF.)
 
             // S_OL_RUN: PRODUCER - push each OL entry into the entry FIFO (eq) and
             // ack the OL parser so it decodes the next entry ahead. STRIP/TRI are
@@ -1659,39 +1641,27 @@ module peel_core import tsp_pkg::*; (
             // (!ti_ready[htile]): PeelBuffers' pbc walk clears this half's valid and the
             // pass's raster fills it, so it must be free (ping-pong back-pressure - if
             // ISP N+1 finished before TSP N, ISP waits here).
+            // PeelBuffers is now a 1-CYCLE A/B pointer swap (pb_peel_swap): B_new = old A
+            // (reference), A_new = old B masked fresh by valid_r<='0; first_peel forces
+            // pb2<-FFFFFFFF for pass 1. No 256-chunk RMW walk. Then issue the pass's OL list.
+            // Still gate on !ti_ready[htile] (the swap invalidates u_taginvw[htile], which TSP
+            // may still be reading from an earlier pass - ping-pong back-pressure).
             S_PEEL_BUF: if (!ti_ready[htile]) begin
                 for (i = 0; i < TILE_W*TILE_H; i = i + 1)
                     dt_pt[i] = 1'b0;
                 more_to_draw <= 1'b0;
-                pb_rd   <= '0;       // read-ahead chunk
-                pb_i    <= '0;       // write chunk (1 behind read once primed)
-                pb_pipe <= 1'b0;     // stage-B not yet primed
-                st <= S_PEEL_BUF_RUN;
-            end
-
-            // PeelBuffers RMW walk: the combi block presents the READ of chunk pb_rd
-            // and (when pb_pipe) WRITES the transformed chunk pb_i (= previous pb_rd,
-            // whose data is now in pr_rdata). Advance read, delay write by one, finish
-            // after the last chunk (NCHUNK-1) has been written back.
-            S_PEEL_BUF_RUN: begin
-                pb_pipe <= 1'b1;
-                pb_i    <= pb_rd;
-                if (pb_pipe && pb_i == CHUNK_AW'(NCHUNK-1)) begin
-                    // whole tile transformed -> issue the object list for this pass.
-                    first_peel <= 1'b0;
-                    peel_pass  <= peel_pass + 8'd1;
-                    // start with the PT list if present, else the TL list.
-                    if (has_pt) begin
-                        peel_which <= 1'b0;                 // rasterizing PT list
-                        ol_list_ptr <= pt_ptr_l; ol_start <= 1'b1;
-                    end else begin
-                        peel_which <= 1'b1;                 // TL list
-                        ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
-                    end
-                    st <= S_OL_RUN;
-                end else if (pb_rd != CHUNK_AW'(NCHUNK-1)) begin
-                    pb_rd <= pb_rd + 1'b1;
+                pb_peel_swap <= 1'b1;                   // flip A/B + clear valid (+first_peel)
+                first_peel   <= 1'b0;                   // consumed by this swap (pb_first port)
+                peel_pass    <= peel_pass + 8'd1;
+                // start with the PT list if present, else the TL list.
+                if (has_pt) begin
+                    peel_which <= 1'b0;                 // rasterizing PT list
+                    ol_list_ptr <= pt_ptr_l; ol_start <= 1'b1;
+                end else begin
+                    peel_which <= 1'b1;                 // TL list
+                    ol_list_ptr <= tr_ptr_l; ol_start <= 1'b1;
                 end
+                st <= S_OL_RUN;
             end
 
             // (peel pass continuation + tile posting are now handled inline in S_DRAIN

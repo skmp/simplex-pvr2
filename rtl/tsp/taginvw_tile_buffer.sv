@@ -42,21 +42,15 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
                                                 // raster stage-B (dt_pt is stale by the
                                                 // time the decoupled reader blends).
 
-    // ---- CLEAR: write {valid=1, tag=bg, invW=bg_depth} to all banks at clr_addr ----
-    // (refsw ClearBuffers sets tagStatus.valid=true so the OP shade fills col_buf
-    //  with the background color.)
-    input                       clr_valid,
-    input      [10-$clog2(LANES)-1:0] clr_addr,
+    // ---- CLEAR / PEELBUFFERS valid-clear: now LAZY (1-cyc register pulses, no RAM walk) ----
+    // clr_all pulses at tile CLEAR: invalidate the whole tile (valid_r<='0) + latch bg tag/invW.
+    // pbc_all pulses per peel pass: invalidate valid_r (mirrors u_peel's PeelBuffers valid<-0)
+    // so pass P+1 doesn't re-shade pass P's staged pixels. A pixel with valid_r==0 reads
+    // {valid:0, tag:bg, invW:bg} via the read defaults below (matches the old CLEAR-wrote-bg).
+    input                       clr_all,        // 1-cyc: invalidate whole tile + latch bg
+    input                       pbc_all,        // 1-cyc: per-pass valid clear
     input      [31:0]           clr_depth,      // background invW/depth
     input      [31:0]           clr_tag,        // background CoreTag
-
-    // ---- PEELBUFFERS valid-clear walk: mirror u_peel's per-pass reset of the staged
-    // bit. u_peel's PeelBuffers RMW sets valid<-0 across the whole tile between peel
-    // passes; since shade now reads THIS buffer, it must be cleared the same way (else
-    // pass P+1 re-shades pass P's staged pixels). We only clear valid (tag/invW are
-    // overwritten by the next pass's raster accepts before they're read). ----
-    input                       pbc_valid,
-    input      [10-$clog2(LANES)-1:0] pbc_addr,
 
     // ---- SHADE: single-pixel read (id = {y[4:0], x[4:0]}) ----
     input                       sh_rd_valid,
@@ -95,6 +89,18 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
         .raddr(raddr), .rdata(rdata)
     );
 
+    // -------------------- LAZY-CLEAR per-pixel valid register --------------------
+    // `valid` (TW_VALID) is now a 1024-bit FF array cleared in ONE cycle (clr_all / pbc_all),
+    // NOT walked into the RAM. A pixel with valid_r==0 reads {valid:0, tag:bg, invW:bg} via the
+    // read defaults. TW_VALID in the RAM word is unused. (This module is per-half; each instance
+    // owns its own valid_r.)
+    reg  [1023:0] valid_r;
+    reg  [31:0]   bg_tag_r, bg_invw_r;   // latched at clr_all (background for un-written px)
+    // pixel index of lane b in the chunk at (y, xchunk-base): {y[4:0], x[4:0]}.
+    function automatic [9:0] pix_idx(input [4:0] y, input [4:0] xchunk, input integer b);
+        pix_idx = {y, xchunk[4:BANK_BITS], b[BANK_BITS-1:0]};
+    endfunction
+
     // pack an AW-bit bank address {y[4:0], x[4:BANK_BITS]} onto all NB banks
     function automatic [AW*NB-1:0] pack_addr(input [4:0] y, input [4:0] xchunk);
         integer b;
@@ -112,53 +118,61 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
         else if (sh_rd_valid) raddr = {NB{ {sh_rd_id[9:5],  sh_rd_id[4:BANK_BITS]}  }};
     end
 
+    // Latch the read group/id so valid_r can be indexed at the OUTPUT cycle (T+1), aligned with
+    // the registered rdata. (valid_r is a register read combinationally; rdata is 1-cyc delayed.)
+    reg [9:0] rd4_group_r;
+    always @(posedge clk) begin
+        if (reset) rd4_group_r <= '0;
+        else if (rd4_valid) rd4_group_r <= rd4_group;
+    end
+
     // 4-wide group outputs: with LANES==4, banks 0..3 ARE lanes 0..3 of the aligned group
-    // (combinational off the registered read rdata, 1-cyc after rd4_group presented).
+    // (combinational off the registered read rdata, 1-cyc after rd4_group presented). A lane
+    // with valid_r==0 (not written since clear) reads {valid:0, tag:bg, invW:bg, pt:0}.
     genvar gl;
     generate
       for (gl = 0; gl < 4; gl = gl + 1) begin : g4lane
-        assign g4_valid[gl] = rdata[TI_W*gl + TW_VALID];
-        assign g4_pt   [gl] = rdata[TI_W*gl + TW_PT];
-        assign g4_tag  [gl] = rdata[TI_W*gl + TW_TAG  +: 32];
-        assign g4_invw [gl] = rdata[TI_W*gl + TW_INVW +: 32];
+        wire v = valid_r[ {rd4_group_r[9:2], gl[1:0]} ];   // pixel (group | lane), LANES==4
+        assign g4_valid[gl] = v;
+        assign g4_pt   [gl] = v ? rdata[TI_W*gl + TW_PT]         : 1'b0;
+        assign g4_tag  [gl] = v ? rdata[TI_W*gl + TW_TAG  +: 32] : bg_tag_r;
+        assign g4_invw [gl] = v ? rdata[TI_W*gl + TW_INVW +: 32] : bg_invw_r;
       end
     endgenerate
 
     // -------------------- WRITE port mux --------------------
+    // Only the raster stage-B accept-duplicate writes the RAM now (CLEAR + PeelBuffers valid
+    // walks are the lazy register clears). valid is a register, not a RAM field.
     integer cw;
     always @(*) begin
         we    = '0;
         waddr = '0;
         wdata = '0;
-
-        if (clr_valid) begin                       // CLEAR: {valid=0,tag,invW} all banks
-            we    = {NB{1'b1}};
-            waddr = {NB{clr_addr}};
-            for (cw = 0; cw < NB; cw = cw + 1) begin
-                wdata[TI_W*cw + TW_INVW +: 32] = clr_depth;
-                wdata[TI_W*cw + TW_TAG  +: 32] = clr_tag;
-                // valid<-0, MATCHING the old u_peel CLEAR (it left PW_VALID at the
-                // wdata='0 default). OP shade ignores valid (shades every pixel); the
-                // PEEL passes gate on valid, so a CLEAR-set valid=1 would make peel
-                // passes shade background pixels the reference skips (extra shading +
-                // plane-cache misses). Keep it 0.
-                wdata[TI_W*cw + TW_VALID]      = 1'b0;
-            end
-        end else if (pbc_valid) begin              // PeelBuffers valid-clear walk
-            // Blind-write valid=0 (tag/invW become 0 but are never read while valid=0;
-            // the next peel pass's raster accept overwrites all three before any read).
-            we    = {NB{1'b1}};
-            waddr = {NB{pbc_addr}};
-            // wdata already all-zero from the reset above -> valid=0, tag=0, invW=0.
-        end else if (wr_valid) begin               // stage-B accept duplicate
+        if (wr_valid) begin                        // stage-B accept duplicate
             waddr = pack_addr(wr_y, wr_x);
             for (cw = 0; cw < NB; cw = cw + 1) begin
                 we[cw] = wr_we[cw];
                 wdata[TI_W*cw + TW_INVW +: 32] = wr_invw[32*cw +: 32];
                 wdata[TI_W*cw + TW_TAG  +: 32] = wr_tag;
-                wdata[TI_W*cw + TW_VALID]      = 1'b1;
-                wdata[TI_W*cw + TW_PT]         = wr_pt;   // PT-list-won (same for all lanes)
+                wdata[TI_W*cw + TW_VALID]      = 1'b1;     // (RAM valid field unused; kept 1)
+                wdata[TI_W*cw + TW_PT]         = wr_pt;    // PT-list-won (same for all lanes)
             end
+        end
+    end
+
+    // -------------------- CONTROL: valid_r / bg (lazy CLEAR + per-pass clear) --------------
+    // clr_all : whole-tile invalidate + latch bg tag/invW. pbc_all : per-pass valid clear.
+    // stage B : each accepted lane (wr_we) marks its pixel valid_r<-1.
+    always @(posedge clk) begin
+        if (reset) begin
+            valid_r <= '0; bg_tag_r <= '0; bg_invw_r <= '0;
+        end else if (clr_all) begin
+            valid_r <= '0; bg_tag_r <= clr_tag; bg_invw_r <= clr_depth;
+        end else if (pbc_all) begin
+            valid_r <= '0;
+        end else if (wr_valid) begin
+            for (cw = 0; cw < NB; cw = cw + 1)
+                if (wr_we[cw]) valid_r[ pix_idx(wr_y, wr_x, cw) ] <= 1'b1;
         end
     end
 
@@ -178,9 +192,9 @@ module taginvw_tile_buffer import tsp_pkg::*; #(
 
 `ifndef SYNTHESIS
     always @(posedge clk) if (!reset) begin
-        if ((clr_valid + wr_valid + pbc_valid) > 1)
-            $error("taginvw_tile_buffer: multiple WRITE clients (%b%b%b)",
-                   clr_valid, wr_valid, pbc_valid);
+        // Only stage-B writes the RAM now; clr_all/pbc_all are register-only pulses.
+        if (clr_all && pbc_all)
+            $error("taginvw_tile_buffer: clr_all and pbc_all same cycle");
     end
 `endif
 endmodule

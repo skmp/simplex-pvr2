@@ -66,18 +66,19 @@ module peel_tile_buffer import tsp_pkg::*; #(
     output reg [31:0]           sh_tag,      // pending tag           (1-cyc latency)
     output reg [31:0]           sh_depth,    // depthBufferA (invW)   (1-cyc latency)
 
-    // ---- CLEAR: write {depth, tag} background to all banks at clr_addr ----
-    input                       clr_valid,
-    input      [10-$clog2(LANES)-1:0] clr_addr,
-    input      [31:0]           clr_depth,
-    input      [31:0]           clr_tag,
+    // ---- CLEAR: LAZY. clr_all pulses ONE cycle to invalidate the whole tile (valid_r<='0)
+    //      and latch the background depth/tag; no RAM walk. A pixel with valid_r==0 reads the
+    //      background (OP) / FLT_MAX+invalid (peel) via the stage-B read-mux below. ----
+    input                       clr_all,     // 1-cyc: invalidate whole tile + latch bg
+    input      [31:0]           clr_depth,   // background depth (default for un-written OP px)
+    input      [31:0]           clr_tag,     // background tag
 
-    // ---- PEELBUFFERS RMW walk (read-ahead / delayed write) ----
-    input                       pb_rd_valid,
-    input      [10-$clog2(LANES)-1:0] pb_rd_addr,
-    input                       pb_wr_valid,
-    input      [10-$clog2(LANES)-1:0] pb_wr_addr,
-    input                       pb_first     // fold SetTagToMax: tag2 <- 0xFFFFFFFF
+    // ---- PEELBUFFERS: LAZY. peel_swap pulses ONE cycle at the start of each peel pass:
+    //      flip ab_sel (B_new = old A = the reference plane) and invalidate A (valid_r<='0,
+    //      so the swapped-in A reads FLT_MAX/invalid). No RMW walk. pb_first (pass 1) forces
+    //      the B-tag to 0xFFFFFFFF via first_peel_r (SetTagToMax). ----
+    input                       peel_swap,   // 1-cyc: begin a peel pass (flip A/B, reset A)
+    input                       pb_first     // this peel_swap is the tile's FIRST pass
 );
     localparam integer NB     = LANES;
     localparam integer BANK_BITS = $clog2(LANES);       // 3 for 8, 2 for 4
@@ -101,6 +102,34 @@ module peel_tile_buffer import tsp_pkg::*; #(
         .raddr(raddr), .rdata(rdata)
     );
 
+    // -------------------- LAZY-CLEAR per-pixel valid register --------------------
+    // `valid` (tagStatus.valid) is now a 1024-bit FF array cleared in ONE cycle by clr_all,
+    // NOT a field walked into the RAM. A pixel with valid_r==0 is "not written since clear":
+    // the stage-B read-mux substitutes the background (OP) or FLT_MAX+invalid (peel) for it.
+    // The RAM's PW_VALID field is no longer read/written (kept in the word to avoid a resize).
+    reg  [1023:0] valid_r;               // PACKED so the whole-tile clear is one `<= '0`
+    reg  [31:0] bg_depth_r, bg_tag_r;    // latched at clr_all; the OP-default for un-written px
+
+    // -------------------- A/B pointer (Tier 3: swap-by-field, no copy) --------------------
+    // The RAM word holds BOTH field pairs {depth,tag} (pair 0) and {depth2,tag2} (pair 1).
+    // `ab_sel` names which pair is the CURRENT-pass A: ab_sel=0 -> A=pair0(depth/tag),
+    // B=pair1(depth2/tag2); ab_sel=1 -> swapped. PeelBuffers' "B_new = A_old" is just
+    // `peel_swap` flipping ab_sel (no walk, no copy). The swapped-in A is masked fresh by
+    // valid_r<='0. first_peel_r forces the B-tag (pb2) to 0xFFFFFFFF for pass 1 (SetTagToMax).
+    reg  ab_sel;
+    reg  first_peel_r;
+    // A/B field offsets selected by ab_sel: A = the (ab_sel? pair1 : pair0) fields.
+    wire integer OFF_DA  = ab_sel ? PW_DEPTH2 : PW_DEPTH;    // A depth
+    wire integer OFF_TA  = ab_sel ? PW_TAG2   : PW_TAG;      // A tag
+    wire integer OFF_DB  = ab_sel ? PW_DEPTH  : PW_DEPTH2;   // B depth (reference)
+    wire integer OFF_TB  = ab_sel ? PW_TAG    : PW_TAG2;     // B tag   (reference)
+    function automatic [31:0] fld(input [PEEL_W*NB-1:0] w, input integer off, input integer b);
+        fld = w[PEEL_W*b + off +: 32]; endfunction
+    // pixel index of lane b in the chunk at (y, xchunk-base): {y[4:0], x[4:0]} = y*32 + x.
+    function automatic [9:0] pix_idx(input [4:0] y, input [4:0] xchunk, input integer b);
+        pix_idx = {y, xchunk[4:BANK_BITS], b[BANK_BITS-1:0]};
+    endfunction
+
     // pack an AW-bit bank address {y[4:0], x[4:BANK_BITS]} onto all NB banks
     // (same addr on every bank; the chunk spans one addr across all banks).
     function automatic [AW*NB-1:0] pack_addr(input [4:0] y, input [4:0] xchunk);
@@ -123,9 +152,36 @@ module peel_tile_buffer import tsp_pkg::*; #(
     function automatic       f_valid  (input [PEEL_W*NB-1:0] w, input integer b);
         f_valid  = w[PEEL_W*b + PW_VALID]; endfunction
 
+    // -------------------- stage-B read-mux (LAZY-CLEAR defaulting) --------------------
+    // The compare reads A (depth,tag,valid) through valid_r: a lane not written since the last
+    // clr_all reads the DEFAULT instead of the stale RAM field:
+    //   OP   (!b_peeling): depth=bg_depth_r, tag=bg_tag_r, valid don't-care (OP ignores valid)
+    //   PEEL ( b_peeling): depth=FLT_MAX,    tag=0xFFFFFFFF, valid=0 (fresh A, nothing staged)
+    // valid_r is read at stage B off the registered b_y/b_x - the SAME coords that addressed
+    // rdata one cycle earlier - so the mask aligns with the read-back chunk. B (depth2/tag2)
+    // is NEVER defaulted (real reference-plane content).
+    // A (current pass) read through valid_r + ab_sel; B (reference) read raw via ab_sel,
+    // with the B-tag forced to 0xFFFFFFFF on the first peel pass (SetTagToMax).
+    wire [NB-1:0]  eff_valid;
+    wire [32*NB-1:0] eff_depth, eff_tag, eff_depth2, eff_tag2;
+    genvar gm;
+    generate
+        for (gm = 0; gm < NB; gm = gm + 1) begin : effmux
+            wire v = valid_r[ pix_idx(b_y, b_x, gm) ];
+            assign eff_valid[gm]            = v;
+            assign eff_depth [32*gm +: 32]  = v ? fld(rdata, OFF_DA, gm)
+                                                : (b_peeling ? FLT_MAX : bg_depth_r);
+            assign eff_tag   [32*gm +: 32]  = v ? fld(rdata, OFF_TA, gm)
+                                                : (b_peeling ? 32'hFFFFFFFF : bg_tag_r);
+            assign eff_depth2[32*gm +: 32]  = fld(rdata, OFF_DB, gm);
+            assign eff_tag2  [32*gm +: 32]  = first_peel_r ? 32'hFFFFFFFF
+                                                           : fld(rdata, OFF_TB, gm);
+        end
+    endgenerate
+
     // -------------------- internal depth compare (stage B) --------------------
     // Runs off the read-back chunk (rdata = the chunk stage A read last cycle) using
-    // the latched b_* fragment fields.
+    // the latched b_* fragment fields, via the lazy-clear read-mux (eff_*) above.
     wire [NB-1:0] ras_pass_op, ras_pass_lp, ras_more_lp;
     genvar gd;
     generate
@@ -133,16 +189,16 @@ module peel_tile_buffer import tsp_pkg::*; #(
             isp_depth_cmp u_cmp (
                 .mode(b_mode),
                 .nw  (b_invw[32*gd +: 32]),
-                .ob  (f_depth(rdata, gd)),
+                .ob  (eff_depth[32*gd +: 32]),
                 .pass(ras_pass_op[gd]));
             isp_depth_cmp_lp u_cmp_lp (
                 .nw   (b_invw[32*gd +: 32]),
                 .tag  (b_tag),
-                .zb   (f_depth (rdata, gd)),
-                .zb2  (f_depth2(rdata, gd)),
-                .pb   (f_tag   (rdata, gd)),
-                .pb2  (f_tag2  (rdata, gd)),
-                .valid(f_valid (rdata, gd)),
+                .zb   (eff_depth [32*gd +: 32]),
+                .zb2  (eff_depth2[32*gd +: 32]),
+                .pb   (eff_tag   [32*gd +: 32]),
+                .pb2  (eff_tag2  [32*gd +: 32]),
+                .valid(eff_valid[gd]),
                 .pass (ras_pass_lp[gd]),
                 .more (ras_more_lp[gd]));
         end
@@ -157,64 +213,77 @@ module peel_tile_buffer import tsp_pkg::*; #(
                   (b_peeling ? ras_pass_lp : ras_pass_op)) : '0;
 
     // -------------------- READ port mux --------------------
+    // Only the raster stage-A read remains (shade tied off; PeelBuffers walk removed).
     always @(*) begin
         raddr = '0;
         if (ras_a_valid)      raddr = pack_addr(ras_a_y, ras_a_x);
         else if (sh_rd_valid) raddr = {NB{ {sh_rd_id[9:5], sh_rd_id[4:BANK_BITS]} }};
-        else if (pb_rd_valid) raddr = {NB{pb_rd_addr}};
     end
 
     // -------------------- WRITE port mux --------------------
+    // Only the raster stage-B write-back remains (CLEAR + PeelBuffers walks removed). It writes
+    // the CURRENT-pass A field pair (OFF_DA/OFF_TA, per ab_sel); B (reference) is untouched by
+    // raster. valid is a register (set in the clocked block below), not a RAM field. The
+    // accepted-lane mask is b_we; the write DATA is the same per-lane depth/tag as before but
+    // steered into the A pair. depth default (ZWriteDis keep / peel keep) uses eff_depth (the
+    // lazy-clear/ab_sel-correct read), never a raw RAM field.
     integer cw;
     always @(*) begin
         we    = '0;
         waddr = '0;
         wdata = '0;
-
-        if (clr_valid) begin                       // CLEAR: {depth, tag} all banks
-            we    = {NB{1'b1}};
-            waddr = {NB{clr_addr}};
-            for (cw = 0; cw < NB; cw = cw + 1) begin
-                wdata[PEEL_W*cw + PW_DEPTH +: 32] = clr_depth;
-                wdata[PEEL_W*cw + PW_TAG   +: 32] = clr_tag;
-                // depth2/tag2/valid don't-care for OP; PeelBuffers sets them.
-            end
-        end else if (pb_wr_valid) begin            // PeelBuffers RMW transform
-            we    = {NB{1'b1}};
-            waddr = {NB{pb_wr_addr}};
-            for (cw = 0; cw < NB; cw = cw + 1) begin
-                wdata[PEEL_W*cw + PW_DEPTH  +: 32] = FLT_MAX;
-                wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = f_depth(rdata, cw);
-                wdata[PEEL_W*cw + PW_TAG    +: 32] = f_tag  (rdata, cw);
-                wdata[PEEL_W*cw + PW_TAG2   +: 32] =
-                    pb_first ? 32'hFFFFFFFF : f_tag(rdata, cw);
-                wdata[PEEL_W*cw + PW_VALID]        = 1'b0;
-            end
-        end else if (ras_b_valid) begin            // stage B: depth-cmp write-back
+        if (ras_b_valid) begin
             waddr = pack_addr(b_y, b_x);
             for (cw = 0; cw < NB; cw = cw + 1) begin
+                // The whole 129-bit word is written when we[cw]=1, so a written lane must
+                // PRESERVE its B (reference) pair by copying it back. B is never defaulted.
+                wdata[PEEL_W*cw + OFF_DB +: 32] = fld(rdata, OFF_DB, cw);
+                wdata[PEEL_W*cw + OFF_TB +: 32] = fld(rdata, OFF_TB, cw);
                 if (b_inside[cw]) begin
                     if (b_peeling) begin
-                        if (ras_pass_lp[cw]) begin // peel accept: zb,pb,valid; keep B
+                        if (ras_pass_lp[cw]) begin   // peel accept: A.depth<-invW, A.tag<-tag
                             we[cw] = 1'b1;
-                            wdata[PEEL_W*cw + PW_DEPTH  +: 32] = b_invw[32*cw +: 32];
-                            wdata[PEEL_W*cw + PW_TAG    +: 32] = b_tag;
-                            wdata[PEEL_W*cw + PW_VALID]        = 1'b1;
-                            wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = f_depth2(rdata, cw);
-                            wdata[PEEL_W*cw + PW_TAG2   +: 32] = f_tag2  (rdata, cw);
+                            wdata[PEEL_W*cw + OFF_DA +: 32] = b_invw[32*cw +: 32];
+                            wdata[PEEL_W*cw + OFF_TA +: 32] = b_tag;
                         end
                     end else begin
-                        if (ras_pass_op[cw]) begin // opaque: tag<-tag, depth<-invW
+                        if (ras_pass_op[cw]) begin   // opaque: A.depth<-invW(or keep), A.tag<-tag
                             we[cw] = 1'b1;
-                            wdata[PEEL_W*cw + PW_DEPTH  +: 32] =
-                                b_zwdis ? f_depth(rdata, cw) : b_invw[32*cw +: 32];
-                            wdata[PEEL_W*cw + PW_TAG    +: 32] = b_tag;
-                            wdata[PEEL_W*cw + PW_DEPTH2 +: 32] = f_depth2(rdata, cw);
-                            wdata[PEEL_W*cw + PW_TAG2   +: 32] = f_tag2  (rdata, cw);
-                            wdata[PEEL_W*cw + PW_VALID]        = f_valid (rdata, cw);
+                            wdata[PEEL_W*cw + OFF_DA +: 32] =
+                                b_zwdis ? eff_depth[32*cw +: 32] : b_invw[32*cw +: 32];
+                            wdata[PEEL_W*cw + OFF_TA +: 32] = b_tag;
                         end
                     end
                 end
+            end
+        end
+    end
+
+    // -------------------- CONTROL: valid_r / bg / ab_sel / first_peel_r --------------------
+    // clr_all  : whole-tile invalidate + latch bg (lazy CLEAR). Also normalize ab_sel<-0 and
+    //            clear first_peel_r (a fresh tile starts with A=pair0, no peel yet).
+    // peel_swap: start a peel pass -> flip ab_sel (B_new = old A), invalidate A (valid_r<='0),
+    //            and set first_peel_r from pb_first (forces pb2=FFFFFFFF this pass only).
+    // stage B  : each accepted lane marks its pixel valid_r<-1 (mask same as b_we/we).
+    // clr_all and peel_swap are barrier-separated 1-cyc pulses; stage-B writes never coincide
+    // with them (the peel_core barriers serialize CLEAR/PeelBuffers vs raster).
+    always @(posedge clk) begin
+        if (reset) begin
+            valid_r <= '0;
+            bg_depth_r <= '0; bg_tag_r <= '0; ab_sel <= 1'b0; first_peel_r <= 1'b0;
+        end else begin
+            if (clr_all) begin
+                valid_r <= '0;
+                bg_depth_r <= clr_depth; bg_tag_r <= clr_tag;
+                ab_sel <= 1'b0; first_peel_r <= 1'b0;
+            end else if (peel_swap) begin
+                valid_r      <= '0;
+                ab_sel       <= ~ab_sel;      // B_new = old A (reference); A_new = old B (masked)
+                first_peel_r <= pb_first;     // pass 1: force pb2 <- FFFFFFFF (SetTagToMax)
+            end else if (ras_b_valid) begin
+                // mark accepted lanes valid (they now hold this pass's A fragment).
+                for (cw = 0; cw < NB; cw = cw + 1)
+                    if (we[cw]) valid_r[ pix_idx(b_y, b_x, cw) ] <= 1'b1;
             end
         end
     end
@@ -234,14 +303,17 @@ module peel_tile_buffer import tsp_pkg::*; #(
     end
 
 `ifndef SYNTHESIS
-    // enforce: at most one READ client and one WRITE client active per cycle.
+    // enforce: at most one READ client and one WRITE client active per cycle. The CLEAR and
+    // PeelBuffers RAM walks are gone (lazy valid_r + A/B swap), so RAM read = raster stage-A
+    // (or the tied-off shade), RAM write = raster stage-B only. clr_all/peel_swap touch only
+    // the valid_r/ab_sel registers, not the RAM port.
     always @(posedge clk) if (!reset) begin
-        if ((ras_a_valid + sh_rd_valid + pb_rd_valid) > 1)
-            $error("peel_tile_buffer: multiple READ clients (%b%b%b)",
-                   ras_a_valid, sh_rd_valid, pb_rd_valid);
-        if ((clr_valid + pb_wr_valid + ras_b_valid) > 1)
-            $error("peel_tile_buffer: multiple WRITE clients (%b%b%b)",
-                   clr_valid, pb_wr_valid, ras_b_valid);
+        if ((ras_a_valid + sh_rd_valid) > 1)
+            $error("peel_tile_buffer: multiple READ clients (%b%b)",
+                   ras_a_valid, sh_rd_valid);
+        // (single RAM write client ras_b_valid; clr_all/peel_swap are register-only pulses)
+        if (clr_all && peel_swap)
+            $error("peel_tile_buffer: clr_all and peel_swap same cycle");
     end
 `endif
 endmodule
