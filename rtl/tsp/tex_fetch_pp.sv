@@ -186,21 +186,28 @@ module tex_fetch_pp import tsp_pkg::*; (
     wire t2_adv   = t2_v && t2_here && d_free;
     wire t2_free  = !t2_v || t2_adv;
 
-    wire vq_need  = t1_v && t1_isvq;
+    wire vq_need  = t1_v && t1_isvq;   // t1_isvq gates on [42] textured -> never set if bypass
     wire t1_okvq  = !vq_need || vq_resp.ready;                 // VQ read accepted this cycle
     wire t1_adv   = t1_v && t1_okvq && t2_free;
     wire t1_free  = !t1_v || t1_adv;
 
     // T0's tc word is "here" if already captured (t0_dv) or landing this cycle (tc_resp.ack).
-    wire t0_here  = t0_dv || (t0_v && tc_resp.ack);
+    // Per-pixel texture bypass: a NON-textured pixel (in_textured=0, from ISP.texture) does
+    // NOT need a texel, so it must NOT issue a cache request or wait on the cache to accept -
+    // it flows through the stages (argb forced 0) at 1/clk. Only TEXTURED pixels gate on the
+    // cache. This removes the fetch-slot backpressure that non-textured pixels used to pay.
+    // t0_bypass = the T0 pixel is non-textured (its side[42]=textured bit is 0).
+    wire t0_bypass = t0_v && !t0_s[42];
+    wire t0_here  = t0_bypass || t0_dv || (t0_v && tc_resp.ack);
     wire [63:0] t0_word = t0_dv ? t0_mem : tc_resp.rdata;
     wire t0_adv   = t0_v && t0_here && t1_free;
     wire t0_free  = !t0_v || t0_adv;
 
-    // ---- T0 issue: accept a new pixel when T0 is free and the tc cache is ready. ----
-    assign in_ready   = t0_free && tc_resp.ready;
+    // ---- T0 issue: accept a new pixel when T0 is free. A textured pixel also needs the tc
+    //      cache ready (it will issue a tc_req); a non-textured pixel needs no cache. ----
+    assign in_ready   = t0_free && (!in_textured || tc_resp.ready);
     wire   accept     = in_valid && in_ready;
-    assign tc_req.req   = accept;
+    assign tc_req.req   = accept && in_textured;   // only textured pixels read the cache
     assign tc_req.waddr = { 3'b0, ta_byte[28:3] };
 
     // ---- T1 vq issue: the T1 pixel, if VQ, reads its codebook word from the HELD tc word,
