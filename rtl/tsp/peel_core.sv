@@ -476,8 +476,13 @@ module peel_core import tsp_pkg::*; (
     // spanner hands PUSHES one descriptor {base,cnt,last,post,tx,ty}; the reader POPs the head.
     localparam integer SPAN_NSLOT = 2*TILE_W*TILE_H;   // 2048
     localparam integer SPAN_AW    = $clog2(SPAN_NSLOT); // 11 (slot address width)
-    localparam integer MD_N       = 4;                  // passes in flight (== spanner GF depth)
-    localparam integer MD_AW      = $clog2(MD_N);        // 2
+    localparam integer MD_N       = 8;                  // passes in flight (== spanner GF depth).
+                                                        // 8, not 4: during PEEL few spans/planes
+                                                        // survive, so the DATA rings (span 2048 /
+                                                        // plane 1024) rarely fill even with 8
+                                                        // passes queued - only this control FIFO
+                                                        // (+ the spanner go-FIFO GF_AW) grows.
+    localparam integer MD_AW      = $clog2(MD_N);        // 3
     reg  [SPAN_AW-1:0] md_base [0:MD_N-1];  // per-pass ring base slot (span_pass_base)
     reg  [SPAN_AW:0]   md_cnt  [0:MD_N-1];  // per-pass span count (0 => empty pass)
     reg                md_last [0:MD_N-1];  // per-pass: tile's final shade -> post color
@@ -487,6 +492,16 @@ module peel_core import tsp_pkg::*; (
     wire               md_empty = (md_wp == md_rp);
     wire               md_full  = (md_wp[MD_AW] != md_rp[MD_AW]) &&
                                   (md_wp[MD_AW-1:0] == md_rp[MD_AW-1:0]);
+`ifndef SYNTHESIS
+    // sim-only running counter: total spans QUEUED but not yet freed by the reader. Added when
+    // a real pass is pushed (md_cnt), subtracted when the reader frees a pass at R_DRAIN. Used
+    // by the +tsplag "spans behind" trace. A running counter avoids summing a moving FIFO window
+    // (stale slots / mid-cycle md_rp advance made a combinational sum unreliable).
+    integer spans_inflight;
+    // remember each pushed pass's span count so R_DRAIN can subtract the SAME value on free,
+    // indexed by the reader's md_rp (the pass being freed).
+    reg [SPAN_AW:0] md_cnt_dbg [0:MD_N-1];
+`endif
     // dense span buffer WRITE bus (spanner_v2 sp_* port; driven in the spanner region below)
     wire               sp_we;
     wire [SPAN_AW-1:0] sp_slot;             // ring write slot (span_head)
@@ -1207,6 +1222,9 @@ module peel_core import tsp_pkg::*; (
             span_ptr<='0; span_left<='0; rd_live<=1'b0; sb_rd_pend<=1'b0; span_more<=1'b0; ns_v<=1'b0;
             cs_v<=1'b0; cs_k<=3'd0; s2_v<=1'b0; s2_id<=10'd0;
             md_wp<='0; md_rp<='0;                 // span pass-metadata FIFO ptrs
+`ifndef SYNTHESIS
+            spans_inflight<=0;
+`endif
             ti_ready<=2'b00; tsp_tag<=1'b0; tsp_col<=1'b0;
             ti_postonly[0]<=1'b0; ti_postonly[1]<=1'b0;
             // htile = ISP u_taginvw producer half (per pass); tsp_tag/tsp_col above.
@@ -1786,6 +1804,7 @@ module peel_core import tsp_pkg::*; (
                     tsp_tag  <= ~tsp_tag;
 `ifndef SYNTHESIS
                     pc_span <= pc_span + 1;
+                    md_cnt_dbg[md_wp[MD_AW-1:0]] <= '0;  // post-only: 0 spans (never R_DRAIN-subtracted)
 `endif
                 end else begin
                     // Latch the spanner's OWN tile origin (it runs behind ISP) + shade mode,
@@ -1799,6 +1818,14 @@ module peel_core import tsp_pkg::*; (
                     spv_shade_mode <= ~ti_mode[tsp_tag];
                     spv_start <= 1'b1;
                     spn <= G_START;
+`ifndef SYNTHESIS
+                    // TSP lag at pass START: passes already handed but not yet drained (md
+                    // FIFO occupancy = md_wp - md_rp; nothing pushed yet this pass).
+                    if ($test$plusargs("tsplag"))
+                        $display("[SPN-START] tile(%0d,%0d) mode=%s TSP is %0d pass(es) / %0d span(s) behind (max %0d passes, tsp_st=%0d)",
+                                 ti_tx[tsp_tag], ti_ty[tsp_tag], ti_mode[tsp_tag]?"PEEL":"OP  ",
+                                 md_wp - md_rp, spans_inflight, MD_N, tsp_st);
+`endif
                 end
             end
 
@@ -1814,6 +1841,17 @@ module peel_core import tsp_pkg::*; (
                     $display("[SPN->] tile(%0d,%0d) mode=%s base=%0d cnt=%0d",
                              ti_tx[tsp_tag], ti_ty[tsp_tag], ti_mode[tsp_tag]?"PEEL":"OP  ",
                              spv_sp_range_base[SPAN_AW-1:0], spv_sp_range_cnt);
+                // TSP lag: passes handed to the reader but not yet drained (md FIFO occupancy).
+                // AFTER this push it is (md_wp+1 - md_rp); reader idle => 0 behind. Max = MD_N.
+                if ($test$plusargs("tsplag"))
+                    // spans_inflight is maintained as a running counter (added on push here,
+                    // subtracted when the reader frees a pass) - timing-clean, no stale-slot sum.
+                    // +spv_sp_range_cnt: this pass's spans (its md_cnt NBA lands next cycle).
+                    $display("[SPN-END] tile(%0d,%0d) TSP is %0d pass(es) / %0d span(s) behind (max %0d passes, tsp_st=%0d)",
+                             ti_tx[tsp_tag], ti_ty[tsp_tag],
+                             (md_wp + 1'b1) - md_rp,
+                             spans_inflight + {{(32-(SPAN_AW+1)){1'b0}}, spv_sp_range_cnt},
+                             MD_N, tsp_st);
 `endif
                 md_base[md_wp[MD_AW-1:0]] <= spv_sp_range_base[SPAN_AW-1:0]; // ring base slot
                 md_cnt [md_wp[MD_AW-1:0]] <= spv_sp_range_cnt;               // # spans (0=empty)
@@ -1826,6 +1864,10 @@ module peel_core import tsp_pkg::*; (
                 tsp_tag  <= ~tsp_tag;
 `ifndef SYNTHESIS
                 pc_span <= pc_span + 1;
+                // running "spans behind" counter: this pass adds its span count. Record the
+                // count per-slot so R_DRAIN subtracts the exact same value when it frees.
+                spans_inflight <= spans_inflight + {{(32-(SPAN_AW+1)){1'b0}}, spv_sp_range_cnt};
+                md_cnt_dbg[md_wp[MD_AW-1:0]] <= spv_sp_range_cnt;
 `endif
                 spn <= G_IDLE;
             end
@@ -2026,6 +2068,8 @@ module peel_core import tsp_pkg::*; (
                 spv_rd_done      <= 1'b1;        // free this pass's ring range (real pass)
 `ifndef SYNTHESIS
                 pc_drain <= pc_drain + 1;
+                // running "spans behind": this pass's spans leave the queue now (ring freed).
+                spans_inflight <= spans_inflight - {{(32-(SPAN_AW+1)){1'b0}}, md_cnt_dbg[md_rp[MD_AW-1:0]]};
 `endif
                 if (md_last[md_rp[MD_AW-1:0]]) tsp_st <= R_POST;  // pop happens in R_POST
                 else begin

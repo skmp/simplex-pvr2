@@ -141,7 +141,10 @@ module spanner_v2 import tsp_pkg::*; #(
     reg [SLOTW:0]      top_tag, tail;            // ring head / tail (SLOTW+1 bits)
     wire ring_empty = (top_tag == tail);
     wire ring_full  = (top_tag[SLOTW] != tail[SLOTW]) && (top_tag[SLOTW-1:0] == tail[SLOTW-1:0]);
-    localparam integer GF_AW = 2;                 // up to 4 tiles handed-but-not-done
+    localparam integer GF_AW = 3;                 // up to 8 passes handed-but-not-done (matches
+                                                  // peel_core MD_N=8). Only the end-pointer FIFOs
+                                                  // grow; the span/plane DATA rings are unchanged
+                                                  // (few spans/planes survive PEEL, so no overflow).
     reg [SLOTW:0]      gf_mem [0:(1<<GF_AW)-1];   // tile END pointers handed to TSP
     reg [GF_AW:0]      gf_wp, gf_rp;
     wire gf_empty = (gf_wp == gf_rp);
