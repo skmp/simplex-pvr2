@@ -67,15 +67,30 @@ module reg_file import tsp_pkg::*; (
     assign fog_resp.rdata = fog_rd_r;
 
     // ---- PAL RAM (M10K, 1024 x 32) - 4-copy replicated for 4 corner read ports. Each copy
-    //      takes the SAME host write; each has its own registered read (like the tex cache). ----
-    genvar pc;
-    generate for (pc=0; pc<4; pc=pc+1) begin : palcopy
-        (* ramstyle = "M10K" *) reg [31:0] pal_mem [0:1023];
-        reg [31:0] pal_rd_r;
-        always @(posedge clk) begin
-            if (wr_en && is_pal) pal_mem[woff - 11'h400] <= wr_data;  // 0x1000>>2 = 0x400
-            pal_rd_r <= pal_mem[pal_req[pc].raddr];
+    //      takes the SAME host write; each has its own registered read. The 4 copies are
+    //      declared as ONE flattened [0:3][0:1023] memory written by a SINGLE always-block
+    //      with a shared (address, data, enable) - the same SDP pattern tex_cache_4p_1c's
+    //      4-copy data uses. Per-copy separate write always-blocks in a generate did NOT
+    //      infer M10K (fell back to ~8.5k FFs -> no fit); this does. ----
+    wire [9:0] pal_wa = 10'(woff - 11'h400);         // 0x1000>>2 = 0x400 base (10-bit index)
+    wire       pal_we = wr_en && is_pal;
+    (* ramstyle = "M10K" *) reg [31:0] pal_mem0 [0:1023];
+    (* ramstyle = "M10K" *) reg [31:0] pal_mem1 [0:1023];
+    (* ramstyle = "M10K" *) reg [31:0] pal_mem2 [0:1023];
+    (* ramstyle = "M10K" *) reg [31:0] pal_mem3 [0:1023];
+    reg [31:0] pal_rd0, pal_rd1, pal_rd2, pal_rd3;
+    always @(posedge clk) begin
+        if (pal_we) begin
+            pal_mem0[pal_wa] <= wr_data;  pal_mem1[pal_wa] <= wr_data;
+            pal_mem2[pal_wa] <= wr_data;  pal_mem3[pal_wa] <= wr_data;
         end
-        assign pal_resp[pc].rdata = pal_rd_r;
-    end endgenerate
+        pal_rd0 <= pal_mem0[pal_req[0].raddr];
+        pal_rd1 <= pal_mem1[pal_req[1].raddr];
+        pal_rd2 <= pal_mem2[pal_req[2].raddr];
+        pal_rd3 <= pal_mem3[pal_req[3].raddr];
+    end
+    assign pal_resp[0].rdata = pal_rd0;
+    assign pal_resp[1].rdata = pal_rd1;
+    assign pal_resp[2].rdata = pal_rd2;
+    assign pal_resp[3].rdata = pal_rd3;
 endmodule
