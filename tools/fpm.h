@@ -8,22 +8,29 @@
 //                       .tof32()        read back as a host float32
 //                       -a              unary negate
 //                       a + b, a - b    add / sub
-//                     Internally it holds a float32 bit-pattern with the low
-//                     mantissa bits below N truncated away, so the value is
-//                     always exactly N-significand-bit representable.
-//   fp_mul<M,N>(a,b)  multiply two fpm<N>, result an fpm<M> (M-bit output
-//                     significand). Input precision N, output precision M.
+//   fp_mul<M,N>(a,b)  multiply two operands, seen at N-bit significands, result
+//                     an fpm<M> (M-bit output significand).
+//
+// REPRESENTATION: a value is carried as {sign, 8-bit biased exponent, an N-bit
+// normalized significand} - NOT as a float32 bit-pattern. This is what lets
+// fpm<32>, fpm<48>, fpm<64> hold MORE mantissa precision than float32's 23 stored
+// bits. The float32 exponent range/bias is reused (8-bit, bias 127). Only
+// .tof32() collapses back to 23 stored bits.
+//   sig_ : uint64_t, the N-bit significand with the hidden 1 at bit (N-1), i.e.
+//          value = (sig_ / 2^(N-1)) * 2^(exp_-127).  sig_ in [2^(N-1), 2^N).
+//   exp_ : uint16_t biased exponent (0 => the whole value is zero, DaZ).
+//   sgn_ : sign bit.
 //
 // ALL arithmetic follows the datapath's non-IEEE rules:
 //   - DaZ    : any operand with biased exponent 0 (zero or subnormal) is 0.
 //   - no inf/NaN : exponent 0xFF is treated as a normal number; results never
 //                  produce inf/NaN.
 //   - truncate : no rounding anywhere - significands are chopped, not rounded.
-//   - saturate : exponent overflow -> max finite {exp=0xFE, mant=all-ones
-//                truncated to the target precision}; underflow -> signed zero.
+//   - saturate : exponent overflow -> max finite {exp=0xFE, significand all-ones
+//                to N bits}; underflow -> signed zero.
 //
-// fpm<24> is (nearly) plain float32 done with truncation instead of round-to-
-// nearest; fpm<16> / fp_mul<16,16> match the fp_mul16 setup path.
+// fpm<24> is (nearly) plain float32 with truncation instead of round-to-nearest;
+// fpm<16> / fp_mul<16,16> match the fp_mul16 setup path.
 //
 #ifndef FPM_H
 #define FPM_H
@@ -35,166 +42,156 @@ template <int N>
 struct fpm {
     static_assert(N >= 16 && N <= 64, "fpm<N>: N (significand bits) must be 16..64");
 
-    // ---- construct from a host float32 (DaZ + truncate mantissa to N bits) ----
+    // ---- construct from a host float32 (DaZ + widen/keep to an N-bit significand) --
     explicit fpm(float f) {
         uint32_t raw; std::memcpy(&raw, &f, 4);
         uint32_t exp = (raw >> 23) & 0xFFu;
-        if (exp == 0u) { bits_ = 0u; return; }             // DaZ: flush to +0
-        uint32_t mant = raw & 0x7FFFFFu;
-        if (N < 24) {                                      // chop stored bits below N
-            int drop = 24 - N;
-            mant &= (0x7FFFFFu >> drop) << drop;
-        }
-        bits_ = (raw & 0x80000000u) | (exp << 23) | mant;
+        sgn_ = (raw >> 31) & 1u;
+        if (exp == 0u) { exp_ = 0; sig_ = 0; sgn_ = 0; return; }   // DaZ: flush to +0
+        exp_ = (uint16_t)exp;
+        // float32 significand = hidden 1 + 23 stored (24 bits). Place it as an
+        // N-bit significand (leading 1 at bit N-1): shift up for N>24, chop for N<24.
+        uint64_t s24 = (uint64_t)(0x800000u | (raw & 0x7FFFFFu));  // 24-bit significand
+        sig_ = place_from(s24, 24);
     }
 
-    // ---- read back as a host float32 ----
-    float tof32() const { float f; std::memcpy(&f, &bits_, 4); return f; }
+    // ---- read back as a host float32 (truncate the N-bit significand to 23 stored) --
+    float tof32() const {
+        if (exp_ == 0) { uint32_t z = sgn_ << 31; float f; std::memcpy(&f, &z, 4); return f; }
+        // bring the N-bit significand down to 24 bits (leading 1 at bit23).
+        uint64_t s24 = (N >= 24) ? (sig_ >> (N - 24)) : (sig_ << (24 - N));
+        uint32_t mant = (uint32_t)(s24 & 0x7FFFFFu);
+        uint32_t bits = (sgn_ << 31) | ((uint32_t)exp_ << 23) | mant;
+        float f; std::memcpy(&f, &bits, 4); return f;
+    }
 
     // ---- unary negate: flip the sign; a DaZ zero stays +0 ----
     fpm operator-() const {
-        fpm r;
-        if ((bits_ & 0x7F800000u) == 0u) { r.bits_ = 0u; return r; }
-        r.bits_ = bits_ ^ 0x80000000u;
+        fpm r = *this;
+        if (exp_ == 0) { r.sgn_ = 0; return r; }
+        r.sgn_ ^= 1u;
         return r;
     }
 
-    // ---- add / sub (fp_add24 rules) ----
+    // ---- add / sub (fp_add24 rules, at N-bit significand precision) ----
     fpm operator+(const fpm& o) const { return add_sub(*this, o, false); }
     fpm operator-(const fpm& o) const { return add_sub(*this, o, true);  }
 
     template <int MM, int NN, int KK> friend fpm<MM> fp_mul(const fpm<KK>&, const fpm<KK>&);
+    template <int MM> friend struct fpm;
 
 private:
-    uint32_t bits_;                        // float32 layout, mantissa truncated to N
-    fpm() : bits_(0) {}                     // uninitialized (internal use only)
+    uint64_t sig_;    // N-bit significand, leading 1 at bit (N-1); 0 iff value is 0
+    uint16_t exp_;    // 8-bit biased exponent (0 => zero)
+    uint8_t  sgn_;    // sign
 
-    // build from an already-N-truncated raw pattern (internal fast path)
-    static fpm raw(uint32_t b) { fpm r; r.bits_ = b; return r; }
+    fpm() : sig_(0), exp_(0), sgn_(0) {}
 
-    // re-truncate a raw float32 pattern to N significand bits (with DaZ).
-    static fpm quant(uint32_t rawbits) {
-        uint32_t exp = (rawbits >> 23) & 0xFFu;
-        if (exp == 0u) return raw(0u);
-        uint32_t mant = rawbits & 0x7FFFFFu;
-        if (N < 24) { int drop = 24 - N; mant &= (0x7FFFFFu >> drop) << drop; }
-        return raw((rawbits & 0x80000000u) | (exp << 23) | mant);
+    // place a `from`-bit significand (leading 1 at bit from-1) as an N-bit one.
+    static uint64_t place_from(uint64_t s, int from) {
+        if (N >= from) return s << (N - from);
+        return s >> (from - N);                       // chop low bits (truncate)
     }
 
-    // saturated max-finite mantissa for this precision (all-ones truncated to N).
-    static uint32_t satmant() {
-        return (N < 24) ? (((0x7FFFFFu >> (24 - N)) << (24 - N))) : 0x7FFFFFu;
+    // build from raw fields (already an N-bit significand).
+    static fpm make(uint8_t sgn, int e, uint64_t sig) {
+        fpm r;
+        if (sig == 0 || e <= 0) { r.exp_ = 0; r.sig_ = 0; r.sgn_ = 0; return r; }  // underflow -> +0? keep sign below
+        r.sgn_ = sgn;
+        if (e >= 255) { r.exp_ = 0xFE; r.sig_ = satsig(); return r; }              // saturate max finite
+        r.exp_ = (uint16_t)e; r.sig_ = sig;
+        return r;
+    }
+    // signed-zero underflow helper (keeps sign, value 0).
+    static fpm szero(uint8_t sgn) { fpm r; r.exp_ = 0; r.sig_ = 0; r.sgn_ = sgn ? 1 : 0; return r; }
+
+    // all-ones N-bit significand (max finite).
+    static uint64_t satsig() {
+        return (N >= 64) ? ~0ull : ((uint64_t)1 << N) - 1;
     }
 
-    // align larger/smaller by exponent diff, add/sub the aligned significands,
-    // normalize (leading-1 search), truncate to N, saturate/underflow.
+    // align larger/smaller by exponent diff, add/sub, normalize, truncate to N.
     static fpm add_sub(const fpm& A, const fpm& B, bool sub) {
-        uint32_t ab = A.bits_;
-        uint32_t bb = sub ? (B.bits_ ^ 0x80000000u) : B.bits_;
-
-        uint32_t sa = ab >> 31,           sbb = bb >> 31;
-        uint32_t ea = (ab >> 23) & 0xFFu, eb  = (bb >> 23) & 0xFFu;
-
+        uint8_t sa = A.sgn_, sb = B.sgn_ ^ (sub ? 1u : 0u);
         // DaZ: an exponent-0 operand is zero -> result is the other side.
-        bool az = (ea == 0u), bz = (eb == 0u);
-        if (az && bz) return raw(0u);
-        if (az) return quant(bb);
-        if (bz) return quant(ab);
+        if (A.exp_ == 0 && B.exp_ == 0) { fpm r; return r; }         // +0
+        if (A.exp_ == 0) { fpm r = B; r.sgn_ = (r.exp_==0)?0:sb; return r; }
+        if (B.exp_ == 0) return A;
 
-        // 24-bit significands (hidden 1 + 23 stored), carried in 64 bits so the
-        // alignment shift has head/room.
-        uint64_t sig_a = (uint64_t)(0x800000u | (ab & 0x7FFFFFu));
-        uint64_t sig_b = (uint64_t)(0x800000u | (bb & 0x7FFFFFu));
+        // carry the significands with 1 guard bit of head-room for the carry-out.
+        uint64_t sig_a = A.sig_, sig_b = B.sig_;
+        int ea = A.exp_, eb = B.exp_;
 
         bool a_ge = (ea > eb) || (ea == eb && sig_a >= sig_b);
         uint64_t sig_big = a_ge ? sig_a : sig_b;
         uint64_t sig_sml = a_ge ? sig_b : sig_a;
-        uint32_t e_big   = a_ge ? ea : eb;
-        uint32_t e_sml   = a_ge ? eb : ea;
-        uint32_t s_big   = a_ge ? sa : sbb;
-        uint32_t s_sml   = a_ge ? sbb : sa;
+        int      e_big   = a_ge ? ea : eb;
+        int      e_sml   = a_ge ? eb : ea;
+        uint8_t  s_big   = a_ge ? sa : sb;
+        uint8_t  s_sml   = a_ge ? sb : sa;
 
-        uint32_t shamt  = e_big - e_sml;
-        uint64_t sml_sh = (shamt >= 64u) ? 0ull : (sig_sml >> shamt);
+        int shamt = e_big - e_sml;
+        uint64_t sml_sh = (shamt >= 64) ? 0ull : (sig_sml >> shamt);
 
         bool same_sign = (s_big == s_sml);
         uint64_t sum = same_sign ? (sig_big + sml_sh) : (sig_big - sml_sh);
-        if (sum == 0ull) return raw(0u);
+        if (sum == 0ull) { fpm r; return r; }                        // exact cancel -> +0
 
-        // normalize: put the leading 1 at bit23.
-        int e_norm = (int)e_big;
+        int e_norm = e_big;
         uint64_t norm = sum;
-        if (norm & (1ull << 24)) { norm >>= 1; e_norm += 1; }         // carry out
-        else while (!(norm & (1ull << 23)) && e_norm > 0) { norm <<= 1; e_norm -= 1; }
+        // same-sign add can carry into bit N -> shift right, exp+1.
+        if (norm & ((uint64_t)1 << N)) { norm >>= 1; e_norm += 1; }
+        else {
+            // subtract can drop the leading 1 below bit (N-1) -> shift left.
+            while (!(norm & ((uint64_t)1 << (N - 1))) && e_norm > 0) { norm <<= 1; e_norm -= 1; }
+        }
+        norm &= (N >= 64) ? ~0ull : (((uint64_t)1 << N) - 1);        // keep N bits
 
-        uint32_t mant = (uint32_t)(norm & 0x7FFFFFu);
-        if (N < 24) { int drop = 24 - N; mant &= (0x7FFFFFu >> drop) << drop; }
-
-        if (e_norm <= 0)   return raw(s_big << 31);                   // underflow -> signed 0
-        if (e_norm >= 255) return raw((s_big << 31) | (0xFEu << 23) | satmant());
-        return raw((s_big << 31) | ((uint32_t)e_norm << 23) | mant);
+        if (e_norm <= 0)   return szero(s_big);
+        return make(s_big, e_norm, norm);
     }
 };
 
 //
-// fp_mul<M, N> - multiply two floats, seeing their significands at N bits and
+// fp_mul<M, N> - multiply two operands, seeing their significands at N bits and
 // producing an fpm<M> (M-bit output significand).
 //   M = output significand bits, N = INPUT significand bits.
-// The operands may be any fpm<K> (K deduced); their significands are truncated to
-// N bits inside, the N x N product formed, and the result truncated to M output
-// bits. DaZ, no inf/NaN, truncate, saturate/underflow - fp_mul16 generalized.
-// So a MAC product in the PVR datapath (fp_mul16) is fp_mul<24,16>(a,b): 16-bit
-// inputs, 24-bit output, with a,b carried as fpm<24>.
+// The operands may be any fpm<K> (K deduced); their significands are (re)quantised
+// to N bits, the N x N product formed, and the result truncated to M output bits.
+// DaZ, no inf/NaN, truncate, saturate/underflow - fp_mul16 generalized.
+// A MAC product in the reduced datapath (fp_mul16) is fp_mul<24,16>(a,b): 16-bit
+// inputs, 24-bit output.
 //
 template <int M, int N, int K>
 fpm<M> fp_mul(const fpm<K>& a, const fpm<K>& b) {
     static_assert(M >= 16 && M <= 64, "fp_mul<M,N>: M must be 16..64");
     static_assert(N >= 16 && N <= 64, "fp_mul<M,N>: N must be 16..64");
-    uint32_t ab = a.bits_, bb = b.bits_;
 
-    uint32_t sa = ab >> 31, sb = bb >> 31;
-    uint32_t ea = (ab >> 23) & 0xFFu, eb = (bb >> 23) & 0xFFu;
-    uint32_t res_sign = sa ^ sb;
-
+    uint8_t res_sign = a.sgn_ ^ b.sgn_;
     // DaZ: a zero operand -> signed zero.
-    if (ea == 0u || eb == 0u) return fpm<M>::raw(res_sign << 31);
+    if (a.exp_ == 0 || b.exp_ == 0) return fpm<M>::szero(res_sign);
 
-    // N-bit significands: hidden 1 at bit (N-1), then the top (N-1) float32 stored
-    // mantissa bits. float32 has only 23 stored bits; for N>24 the extra low bits
-    // are zero (the input carries no more precision than float32).
-    uint32_t mant_a = ab & 0x7FFFFFu, mant_b = bb & 0x7FFFFFu;
-    int msh = 24 - N;
-    uint64_t sig_a, sig_b;
-    if (msh >= 0) {
-        sig_a = ((uint64_t)1 << (N - 1)) | (uint64_t)(mant_a >> msh);
-        sig_b = ((uint64_t)1 << (N - 1)) | (uint64_t)(mant_b >> msh);
-    } else {
-        sig_a = ((uint64_t)1 << (N - 1)) | ((uint64_t)mant_a << (-msh));
-        sig_b = ((uint64_t)1 << (N - 1)) | ((uint64_t)mant_b << (-msh));
-    }
+    // requantise each K-bit significand to N bits (leading 1 at bit N-1).
+    uint64_t sig_a = (K >= N) ? (a.sig_ >> (K - N)) : (a.sig_ << (N - K));
+    uint64_t sig_b = (K >= N) ? (b.sig_ >> (K - N)) : (b.sig_ << (N - K));
 
-    // N x N -> up to 2N-bit product (128-bit accumulator so N up to 64 is safe).
+    // N x N -> up to 2N-bit product (128-bit accumulator; N up to 64 safe).
     __uint128_t prod = (__uint128_t)sig_a * (__uint128_t)sig_b;
-    int e_sum = (int)ea + (int)eb - 127;
+    int e_sum = (int)a.exp_ + (int)b.exp_ - 127;
 
-    // leading 1 at bit (2N-2) if product in [1,2), or (2N-1) if in [2,4).
+    // inputs have their hidden 1 at bit (N-1), so the product's leading 1 is at
+    // bit (2N-2) if in [1,2), or (2N-1) if in [2,4).
     bool top = ((prod >> (2 * N - 1)) & 1u) != 0u;
     int lead = top ? (2 * N - 1) : (2 * N - 2);
     if (top) e_sum += 1;
 
-    // shift so the leading 1 sits at bit (M-1); low (M-1) bits are the mantissa.
+    // extract M significand bits: leading 1 -> bit (M-1), truncate the rest.
     int sh = lead - (M - 1);
     uint64_t sig_m = (sh >= 0) ? (uint64_t)(prod >> sh) : (uint64_t)(prod << (-sh));
-    uint64_t mant_m = sig_m & (((uint64_t)1 << (M - 1)) - 1);
+    sig_m &= (M >= 64) ? ~0ull : (((uint64_t)1 << M) - 1);
 
-    // map M-bit mantissa high-aligned into the float32 23-bit stored field.
-    int up = 24 - M;
-    uint32_t stored = (up >= 0) ? (uint32_t)((mant_m << up) & 0x7FFFFFu)
-                                : (uint32_t)((mant_m >> (-up)) & 0x7FFFFFu);
-
-    if (e_sum <= 0)   return fpm<M>::raw(res_sign << 31);                        // underflow
-    if (e_sum >= 255) return fpm<M>::raw((res_sign << 31) | (0xFEu << 23) | fpm<M>::satmant());
-    return fpm<M>::raw((res_sign << 31) | ((uint32_t)e_sum << 23) | stored);
+    if (e_sum <= 0)   return fpm<M>::szero(res_sign);
+    return fpm<M>::make(res_sign, e_sum, sig_m);
 }
 
 #endif // FPM_H

@@ -102,7 +102,7 @@ DDRSTUB = tb/ddram_stub.sv tb/sysmem_stub.sv
 pipe: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-PINCONNECTEMPTY -Wno-PINMISSING --public-flat-rw \
 	  --top-module tile_engine_top \
-	  $(TSP_RTL) legacy/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) $(DDRSTUB) \
+	  $(TSP_RTL) legacy/tile_engine_top.sv $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv $(DDRSTUB) \
 	  $(CWD)/legacy/tsp_pipe_tb.cpp --Mdir $(BUILD)/obj_pipe -o tb
 	./$(BUILD)/obj_pipe/tb
 
@@ -119,7 +119,8 @@ setupstream: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module isp_setup_streamed_tb_top \
 	  tb/isp_setup_streamed_tb_top.sv \
 	  rtl/isp_min/isp_setup_min.sv rtl/isp_min/isp_setup_streamed.sv \
-	  rtl/isp_min/mac16.sv rtl/isp_min/fp_mul16.sv rtl/isp_min/fp_add24.sv rtl/isp_min/fp_rcp_fast.sv \
+	  rtl/isp_min/mac16.sv rtl/isp_min/fp_mul16.sv rtl/isp_min/fp_mul24.sv rtl/isp_min/fp_add24.sv \
+	  rtl/isp_min/fp_wide.sv rtl/isp_min/fp_rcp_fast.sv \
 	  $(CWD)/tb/isp_setup_streamed_tb.cpp --Mdir $(BUILD)/obj_setupstream -o tb
 	./$(BUILD)/obj_setupstream/tb
 
@@ -157,7 +158,7 @@ frontendisp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module frontend_isp_tb_top \
 	  $(TSP_RTL) tb/frontend_isp_tb_top.sv tb/sim_ddr_fb.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/frontend_isp_tb.cpp --Mdir $(BUILD)/obj_frontendisp -o tb
 	./$(BUILD)/obj_frontendisp/tb $(DUMP)
 
@@ -167,7 +168,7 @@ frontendtsp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module frontend_tsp_tb_top \
 	  $(TSP_RTL) tb/frontend_tsp_tb_top.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/frontend_tsp_tb.cpp --Mdir $(BUILD)/obj_frontendtsp -o tb
 	./$(BUILD)/obj_frontendtsp/tb $(DUMP)
 
@@ -179,7 +180,7 @@ frontendtsplp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module frontend_tsp_lp_tb_top \
 	  $(TSP_RTL) tb/frontend_tsp_lp_tb_top.sv tb/sim_ddr_fb.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/frontend_tsp_lp_tb.cpp --Mdir $(BUILD)/obj_frontendtsplp -o tb
 	./$(BUILD)/obj_frontendtsplp/tb $(DUMP)
 
@@ -189,7 +190,7 @@ frontendtsppp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ -Wno-MULTIDRIVEN --public-flat-rw \
 	  --top-module frontend_tsp_pp_tb_top \
 	  $(TSP_RTL) tb/frontend_tsp_pp_tb_top.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/frontend_tsp_pp_tb.cpp --Mdir $(BUILD)/obj_frontendtsppp -o tb
 	./$(BUILD)/obj_frontendtsppp/tb $(DUMP)
 
@@ -198,7 +199,7 @@ tspshadepp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module tsp_shade_pp_tb_top \
 	  $(TSP_RTL) tb/tsp_shade_pp_tb_top.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/tsp_shade_pp_tb.cpp --Mdir $(BUILD)/obj_tspshadepp -o tb
 	./$(BUILD)/obj_tspshadepp/tb
 
@@ -211,7 +212,7 @@ tspshadereplay: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module tsp_shade_pp_tb_top \
 	  $(TSP_RTL) tb/tsp_shade_pp_tb_top.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/tsp_shade_pp_replay_tb.cpp --Mdir $(BUILD)/obj_tspshadereplay -o tb
 	./$(BUILD)/obj_tspshadereplay/tb $(LOG) $(VRAMBIN)
 
@@ -220,7 +221,7 @@ rasterstream: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module isp_raster_stream_tb_top \
 	  $(TSP)/tsp_pkg.sv tb/isp_raster_stream_tb_top.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  $(wildcard rtl/isp_min/*.sv) rtl/u8_to_float.sv \
 	  $(CWD)/tb/isp_raster_stream_tb.cpp --Mdir $(BUILD)/obj_rasterstream -o tb
 	./$(BUILD)/obj_rasterstream/tb
 

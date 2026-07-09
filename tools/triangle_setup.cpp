@@ -447,18 +447,18 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     fpm<24> d_Z3Z1 = Z3 - Z1;
 
     // ---- signed triangle area (2x): (X1-X3)*(Y2-Y3) - (Y1-Y3)*(X2-X3) ----
-    fpm<24> tri_area = fp_mul<24,16>(d_X1X3, d_Y2Y3) - fp_mul<24,16>(d_Y1Y3, d_X2X3);
+    fpm<24> tri_area = fp_mul<24,24>(d_X1X3, d_Y2Y3) - fp_mul<24,24>(d_Y1Y3, d_X2X3);
 
     // ---- 1/w (invW) plane numerators ----
     //   Aa = -(Z2-Z1)*(Y3-Y1) + (Z3-Z1)*(Y2-Y1)
     //   Ba = -(X2-X1)*(Z3-Z1) + (X3-X1)*(Z2-Z1)
-    fpm<24> Aa = fp_mul<24,16>(-d_Z2Z1, d_Y3Y1) + fp_mul<24,16>(d_Z3Z1, d_Y2Y1);
-    fpm<24> Ba = fp_mul<24,16>(-d_X2X1, d_Z3Z1) + fp_mul<24,16>(d_X3X1, d_Z2Z1);
+    fpm<32> Aa = fp_mul<32,24>(-d_Z2Z1, d_Y3Y1) + fp_mul<32,24>(d_Z3Z1, d_Y2Y1);
+    fpm<32> Ba = fp_mul<32,24>(-d_X2X1, d_Z3Z1) + fp_mul<32,24>(d_X3X1, d_Z2Z1);
 
     // ---- reciprocal of area (fp_rcp_fast ~16-bit), and the invW gradients ----
-    fpm<24> inv_area = fpm<24>(fpm<16>(1.0f / tri_area.tof32()).tof32());
-    fpm<24> ddx_invw = -fp_mul<24,16>(Aa, inv_area);
-    fpm<24> ddy_invw = -fp_mul<24,16>(Ba, inv_area);
+    fpm<32> inv_area = fpm<32>(fpm<16>(1.0f / tri_area.tof32()).tof32());
+    fpm<24> ddx_invw = -fp_mul<24,24>(Aa, inv_area);
+    fpm<24> ddy_invw = -fp_mul<24,24>(Ba, inv_area);
 
     // ---- winding sign: area > 0 -> sgn = -1, else +1 (RTL fpos test) ----
     bool    area_pos = (tri_area.tof32() > 0.0f);
@@ -473,12 +473,12 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     R.cull    = cull;
 
     // ---- signed edge gradients (dx = sgn*Δx, dy = sgn*Δy) ----
-    fpm<24> DX12 = fp_mul<24,16>(sgn, d_X1X2);
-    fpm<24> DX23 = fp_mul<24,16>(sgn, d_X2X3);
-    fpm<24> DX31 = fp_mul<24,16>(sgn, d_X3X1);
-    fpm<24> DY12 = fp_mul<24,16>(sgn, d_Y1Y2);
-    fpm<24> DY23 = fp_mul<24,16>(sgn, d_Y2Y3);
-    fpm<24> DY31 = fp_mul<24,16>(sgn, d_Y3Y1);
+    fpm<24> DX12 = fp_mul<24,24>(sgn, d_X1X2);
+    fpm<24> DX23 = fp_mul<24,24>(sgn, d_X2X3);
+    fpm<24> DX31 = fp_mul<24,24>(sgn, d_X3X1);
+    fpm<24> DY12 = fp_mul<24,24>(sgn, d_Y1Y2);
+    fpm<24> DY23 = fp_mul<24,24>(sgn, d_Y2Y3);
+    fpm<24> DY31 = fp_mul<24,24>(sgn, d_Y3Y1);
 
     // ---- tile-local anchor offsets (vertex - tile origin) ----
     fpm<24> XL1 = X1 - XB;
@@ -490,9 +490,9 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
 
     // ---- edge constant terms: c = DY*XL - DX*YT (evaluated at the edge's first
     //      vertex), with the top-left fill rule biasing the RAW value by -1 ULP. --
-    fpm<24> C1raw = fp_mul<24,16>(DY12, XL1) - fp_mul<24,16>(DX12, YT1);
-    fpm<24> C2raw = fp_mul<24,16>(DY23, XL2) - fp_mul<24,16>(DX23, YT2);
-    fpm<24> C3raw = fp_mul<24,16>(DY31, XL3) - fp_mul<24,16>(DX31, YT3);
+    fpm<32> C1raw = fp_mul<32,24>(DY12, XL1) - fp_mul<32,24>(DX12, YT1);
+    fpm<32> C2raw = fp_mul<32,24>(DY23, XL2) - fp_mul<32,24>(DX23, YT2);
+    fpm<32> C3raw = fp_mul<32,24>(DY31, XL3) - fp_mul<32,24>(DX31, YT3);
 
     // top-left test per edge: istl = (dy==0 && dx>0) || dy<0
     bool tl1 = ((DY12.tof32() == 0.0f && DX12.tof32() > 0.0f) || DY12.tof32() < 0.0f);
@@ -519,8 +519,8 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     }
 
     // ---- invW plane constant term (tile-local): c = Z1 - ddx*XL1 - ddy*YT1 ----
-    fpm<24> zc0    = Z1 - fp_mul<24,16>(ddx_invw, XL1);
-    fpm<24> c_invw = zc0 - fp_mul<24,16>(ddy_invw, YT1);
+    fpm<32> zc0    = fpm<32>(Z1.tof32()) - fp_mul<32,24>(ddx_invw, XL1);
+    fpm<32> c_invw = zc0 - fp_mul<32,24>(ddy_invw, YT1);
 
     // ---- store ISP edge / invW planes ----
     R.dx12 = DX12.tof32(); R.dx23 = DX23.tof32(); R.dx31 = DX31.tof32(); R.dx41 = 0.0f;
@@ -571,8 +571,8 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     fpm<24> t_Y3Y1 = Y3 - Y1;
     fpm<24> t_X3X1 = X3 - X1;
     fpm<24> t_X2X1 = X2 - X1;
-    fpm<24> t_area = fp_mul<24,16>(t_X2X1, t_Y3Y1) - fp_mul<24,16>(t_X3X1, t_Y2Y1);
-    fpm<24> t_inv  = fpm<24>(fpm<16>(1.0f / t_area.tof32()).tof32());
+    fpm<24> t_area = fp_mul<24,24>(t_X2X1, t_Y3Y1) - fp_mul<24,24>(t_X3X1, t_Y2Y1);
+    fpm<32> t_inv  = fpm<32>(fpm<16>(1.0f / t_area.tof32()).tof32());
     fpm<24> t_XL1  = X1 - XB;
     fpm<24> t_YT1  = Y1 - YB;
 
@@ -581,28 +581,28 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     // ---- plane 0: U (textured only) ----
     if (texture) {
         fpm<24> a1(v1.u), a2(v2.u), a3(v3.u);
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[0] = ddx.tof32(); R.attr_ddy[0] = ddy.tof32(); R.attr_c[0] = c.tof32();
         R.attr_valid[0] = true;
     }
     // ---- plane 1: V (textured only) ----
     if (texture) {
         fpm<24> a1(v1.v), a2(v2.v), a3(v3.v);
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[1] = ddx.tof32(); R.attr_ddy[1] = ddy.tof32(); R.attr_c[1] = c.tof32();
         R.attr_valid[1] = true;
     }
@@ -611,14 +611,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.col >> 16) & 0xFFu) : ((v3.col >> 16) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.col >> 16) & 0xFFu) : ((v3.col >> 16) & 0xFFu)));
         fpm<24> a3((float)((v3.col >> 16) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[2] = ddx.tof32(); R.attr_ddy[2] = ddy.tof32(); R.attr_c[2] = c.tof32();
         R.attr_valid[2] = true;
     }
@@ -627,14 +627,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.col >> 8) & 0xFFu) : ((v3.col >> 8) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.col >> 8) & 0xFFu) : ((v3.col >> 8) & 0xFFu)));
         fpm<24> a3((float)((v3.col >> 8) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[3] = ddx.tof32(); R.attr_ddy[3] = ddy.tof32(); R.attr_c[3] = c.tof32();
         R.attr_valid[3] = true;
     }
@@ -643,14 +643,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? (v1.col & 0xFFu) : (v3.col & 0xFFu)));
         fpm<24> a2((float)(gouraud ? (v2.col & 0xFFu) : (v3.col & 0xFFu)));
         fpm<24> a3((float)(v3.col & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[4] = ddx.tof32(); R.attr_ddy[4] = ddy.tof32(); R.attr_c[4] = c.tof32();
         R.attr_valid[4] = true;
     }
@@ -659,14 +659,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.col >> 24) & 0xFFu) : ((v3.col >> 24) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.col >> 24) & 0xFFu) : ((v3.col >> 24) & 0xFFu)));
         fpm<24> a3((float)((v3.col >> 24) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[5] = ddx.tof32(); R.attr_ddy[5] = ddy.tof32(); R.attr_c[5] = c.tof32();
         R.attr_valid[5] = true;
     }
@@ -675,14 +675,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.off >> 16) & 0xFFu) : ((v3.off >> 16) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.off >> 16) & 0xFFu) : ((v3.off >> 16) & 0xFFu)));
         fpm<24> a3((float)((v3.off >> 16) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[6] = ddx.tof32(); R.attr_ddy[6] = ddy.tof32(); R.attr_c[6] = c.tof32();
         R.attr_valid[6] = true;
     }
@@ -691,14 +691,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.off >> 8) & 0xFFu) : ((v3.off >> 8) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.off >> 8) & 0xFFu) : ((v3.off >> 8) & 0xFFu)));
         fpm<24> a3((float)((v3.off >> 8) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[7] = ddx.tof32(); R.attr_ddy[7] = ddy.tof32(); R.attr_c[7] = c.tof32();
         R.attr_valid[7] = true;
     }
@@ -707,14 +707,14 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? (v1.off & 0xFFu) : (v3.off & 0xFFu)));
         fpm<24> a2((float)(gouraud ? (v2.off & 0xFFu) : (v3.off & 0xFFu)));
         fpm<24> a3((float)(v3.off & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[8] = ddx.tof32(); R.attr_ddy[8] = ddy.tof32(); R.attr_c[8] = c.tof32();
         R.attr_valid[8] = true;
     }
@@ -723,17 +723,18 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
         fpm<24> a1((float)(gouraud ? ((v1.off >> 24) & 0xFFu) : ((v3.off >> 24) & 0xFFu)));
         fpm<24> a2((float)(gouraud ? ((v2.off >> 24) & 0xFFu) : ((v3.off >> 24) & 0xFFu)));
         fpm<24> a3((float)((v3.off >> 24) & 0xFFu));
-        fpm<24> za1 = fp_mul<24,16>(Z1, a1), za2 = fp_mul<24,16>(Z2, a2), za3 = fp_mul<24,16>(Z3, a3);
+        fpm<24> za1 = fp_mul<24,24>(Z1, a1), za2 = fp_mul<24,24>(Z2, a2), za3 = fp_mul<24,24>(Z3, a3);
         fpm<24> da2 = za2 - za1;
         fpm<24> da3 = za3 - za1;
-        fpm<24> Aa_ = fp_mul<24,16>(da3, t_Y2Y1) - fp_mul<24,16>(da2, t_Y3Y1);
-        fpm<24> Ba_ = fp_mul<24,16>(t_X3X1, da2) - fp_mul<24,16>(t_X2X1, da3);
-        fpm<24> ddx = -fp_mul<24,16>(Aa_, t_inv);
-        fpm<24> ddy = -fp_mul<24,16>(Ba_, t_inv);
-        fpm<24> c   = za1 - fp_mul<24,16>(ddx, t_XL1) - fp_mul<24,16>(ddy, t_YT1);
+        fpm<32> Aa_ = fp_mul<32,24>(da3, t_Y2Y1) - fp_mul<32,24>(da2, t_Y3Y1);
+        fpm<32> Ba_ = fp_mul<32,24>(t_X3X1, da2) - fp_mul<32,24>(t_X2X1, da3);
+        fpm<24> ddx = -fp_mul<24,24>(Aa_, t_inv);
+        fpm<24> ddy = -fp_mul<24,24>(Ba_, t_inv);
+        fpm<32> c   = fpm<32>(za1.tof32()) - fp_mul<32,24>(ddx, t_XL1) - fp_mul<32,24>(ddy, t_YT1);
         R.attr_ddx[9] = ddx.tof32(); R.attr_ddy[9] = ddy.tof32(); R.attr_c[9] = c.tof32();
         R.attr_valid[9] = true;
     }
+
 
     return R;
 }
