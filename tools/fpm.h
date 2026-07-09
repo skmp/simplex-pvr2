@@ -31,8 +31,6 @@
 #include <cstdint>
 #include <cstring>
 
-template <int M, int N> struct fp_mul_impl;   // fwd (friendship for cross-N bits)
-
 template <int N>
 struct fpm {
     static_assert(N >= 16 && N <= 64, "fpm<N>: N (significand bits) must be 16..64");
@@ -65,7 +63,7 @@ struct fpm {
     fpm operator+(const fpm& o) const { return add_sub(*this, o, false); }
     fpm operator-(const fpm& o) const { return add_sub(*this, o, true);  }
 
-    template <int M, int NN> friend fpm<M> fp_mul(const fpm<NN>&, const fpm<NN>&);
+    template <int MM, int NN, int KK> friend fpm<MM> fp_mul(const fpm<KK>&, const fpm<KK>&);
 
 private:
     uint32_t bits_;                        // float32 layout, mantissa truncated to N
@@ -139,14 +137,19 @@ private:
 };
 
 //
-// fp_mul<M, N> - multiply two fpm<N> operands, produce an fpm<M>.
-//   M = output significand bits, N = input significand bits.
-// N x N product truncated to M output bits. DaZ, no inf/NaN, truncate,
-// saturate/underflow - fp_mul16 generalized.
+// fp_mul<M, N> - multiply two floats, seeing their significands at N bits and
+// producing an fpm<M> (M-bit output significand).
+//   M = output significand bits, N = INPUT significand bits.
+// The operands may be any fpm<K> (K deduced); their significands are truncated to
+// N bits inside, the N x N product formed, and the result truncated to M output
+// bits. DaZ, no inf/NaN, truncate, saturate/underflow - fp_mul16 generalized.
+// So a MAC product in the PVR datapath (fp_mul16) is fp_mul<24,16>(a,b): 16-bit
+// inputs, 24-bit output, with a,b carried as fpm<24>.
 //
-template <int M, int N>
-fpm<M> fp_mul(const fpm<N>& a, const fpm<N>& b) {
+template <int M, int N, int K>
+fpm<M> fp_mul(const fpm<K>& a, const fpm<K>& b) {
     static_assert(M >= 16 && M <= 64, "fp_mul<M,N>: M must be 16..64");
+    static_assert(N >= 16 && N <= 64, "fp_mul<M,N>: N must be 16..64");
     uint32_t ab = a.bits_, bb = b.bits_;
 
     uint32_t sa = ab >> 31, sb = bb >> 31;
