@@ -54,7 +54,8 @@ MODE ?= tri
 MODEARG = $(if $(filter quad,$(MODE)),quad,)
 
 .PHONY: all vectors fp sim sim-tri sim-quad seq seq-tri seq-quad ip ip-tri ip-quad quartus clean \
-        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe oparse isprim region regfile regen planecache setupstream
+        test tex tex-addr tex-uv tex-filter tex-combiner tex-fetch pipe oparse isprim region regfile regen planecache setupstream \
+        triangle-setup
 
 # TSP module files (package first). ISP shared FP units come from rtl/isp_min.
 TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
@@ -127,6 +128,16 @@ PVR_REGS_H = ../minicast/libswirl/hw/pvr/pvr_regs.h
 regen:
 	python3 tools/gen_pvr_regs.py $(PVR_REGS_H) > rtl/tsp/gen/pvr_regs_gen.svh
 	@echo "regenerated rtl/tsp/gen/pvr_regs_gen.svh"
+
+# ---- double-vs-float ISP/TSP triangle-setup divergence tool ----
+# Builds tools/triangle_setup.cpp -> $(BUILD)/triangle_setup, then dumps a scene's
+# triangles (via tools/dump_triangles.py) and reports triangles whose float setup
+# diverges from the double reference. Override the scene / threshold:
+#   make triangle-setup SCENE=daytona_front THRESH=1e-4
+SCENE  ?= menu2
+THRESH ?= 1e-3
+triangle-setup: | $(BUILD)
+	g++ -O2 -std=c++17 -Wall -o $(BUILD)/triangle_setup tools/triangle_setup.cpp
 
 # front-end integration run: reg_file + 8MB VRAM + RA/OL/tristrip + faux ISP,
 # driven from real PVR dumps (dumps/pvr_regs_menu.bin, dumps/vram_menu.bin).
