@@ -85,6 +85,80 @@ module fp_mul24_w (
 endmodule
 
 // --------------------------------------------------------------------------
+// fp_mul32_w - WIDE x WIDE multiply, 32-bit significand inputs AND output.
+//   (a 32x32 -> 64 product; ~4 DSPs on Cyclone V). Used where the multiply
+//   OPERANDS themselves need >24-bit precision - e.g. ddy * (huge Y anchor) in
+//   the plane-constant computation, where truncating the operands to 24 bits
+//   loses the low bits the c cancellation needs. TEST WIDENING.
+module fp_mul32_w (
+    input         a_sgn, input [7:0] a_exp, input [31:0] a_sig,
+    input         b_sgn, input [7:0] b_exp, input [31:0] b_sig,
+    output        o_sgn, output [7:0] o_exp, output [31:0] o_sig
+);
+    wire a_zero = (a_exp == 8'd0), b_zero = (b_exp == 8'd0);
+    wire res_sign = a_sgn ^ b_sgn;
+    // 32x32 -> 64 product. Leading 1 at bit63 (>=2) or bit62 ([1,2)).
+    wire [63:0] prod = a_sig * b_sig;
+    wire signed [10:0] e_sum = $signed({3'b0, a_exp}) + $signed({3'b0, b_exp}) - 11'sd127;
+    wire        top = prod[63];
+    // keep 32 significand bits below the leading 1 (leading 1 -> bit31).
+    wire [31:0] sig_m = top ? prod[63:32] : prod[62:31];
+    wire signed [10:0] e_adj = top ? (e_sum + 11'sd1) : e_sum;
+    wire is_zero   = a_zero | b_zero;
+    wire underflow = (e_adj <= 0);
+    wire overflow  = (e_adj >= 255);
+    assign o_sgn = res_sign;
+    assign o_exp = is_zero ? 8'd0 : underflow ? 8'd0 : overflow ? 8'hFE : e_adj[7:0];
+    assign o_sig = is_zero ? 32'd0 : underflow ? 32'd0 : overflow ? 32'hFFFFFFFF : sig_m;
+endmodule
+
+// --------------------------------------------------------------------------
+// fp_sub32_w - float32 - float32 -> WIDE (32-bit sig) difference. Same align/
+//   normalize as fp_add24 but keeps a 32-bit significand result (8 extra bits),
+//   so a difference of large-magnitude coords (e.g. Y3-Y1 ~ -1.1M) retains the
+//   low bits that setup's downstream cancellation needs. sub controls +/-.
+module fp_sub32_w (
+    input  [31:0] a,
+    input  [31:0] b_in,
+    input         sub,
+    output        o_sgn, output reg [7:0] o_exp, output reg [31:0] o_sig
+);
+    wire [31:0] b = sub ? {~b_in[31], b_in[30:0]} : b_in;
+    wire sa = a[31], sb = b[31];
+    wire [7:0] ea = a[30:23], eb = b[30:23];
+    // 32-bit significands: float32's 24 at the top, 8 zero low bits.
+    wire [31:0] sig_a = (ea != 8'd0) ? {1'b1, a[22:0], 8'd0} : 32'd0;
+    wire [31:0] sig_b = (eb != 8'd0) ? {1'b1, b[22:0], 8'd0} : 32'd0;
+    wire [7:0]  exa = (ea == 8'd0) ? 8'd1 : ea;
+    wire [7:0]  exb = (eb == 8'd0) ? 8'd1 : eb;
+    wire a_ge = (exa > exb) || (exa == exb && sig_a >= sig_b);
+    wire [7:0]  e_big = a_ge ? exa : exb;
+    wire [7:0]  e_sml = a_ge ? exb : exa;
+    wire [31:0] sig_big = a_ge ? sig_a : sig_b;
+    wire [31:0] sig_sml = a_ge ? sig_b : sig_a;
+    wire        s_sml   = a_ge ? sb : sa;
+    wire [7:0]  shamt = e_big - e_sml;
+    wire [31:0] sml_sh = (shamt >= 8'd32) ? 32'd0 : (sig_sml >> shamt);
+    assign o_sgn = a_ge ? sa : sb;
+    wire same = (o_sgn == s_sml);
+    wire [32:0] sum = same ? ({1'b0, sig_big} + {1'b0, sml_sh})
+                           : ({1'b0, sig_big} - {1'b0, sml_sh});
+    reg [31:0] nsig; reg signed [10:0] en; integer i; reg found;
+    always @(*) begin
+        found=1'b0; nsig=sum[31:0]; en=$signed({3'b0,e_big});
+        if (sum[32]) begin nsig=sum[32:1]; en=$signed({3'b0,e_big})+11'sd1; end
+        else if (sum[31]) begin nsig=sum[31:0]; en=$signed({3'b0,e_big}); end
+        else for (i=1;i<32;i=i+1) if(!found && sum[31-i]) begin nsig=sum[31:0]<<i; en=$signed({3'b0,e_big})-i; found=1'b1; end
+    end
+    wire res_zero=(sum==33'd0);
+    always @(*) begin
+        if (res_zero || en<=0) begin o_exp=8'd0; o_sig=32'd0; end
+        else if (en>=255) begin o_exp=8'hFE; o_sig=32'hFFFFFFFF; end
+        else begin o_exp=en[7:0]; o_sig=nsig; end
+    end
+endmodule
+
+// --------------------------------------------------------------------------
 // fp_add32_w - wide +/- wide -> wide (32-bit significand throughout).
 //   y = a (sub ? - : +) b, on the wide format. Mirrors fpm<32> operator+/-.
 module fp_add32_w (

@@ -82,44 +82,76 @@ module isp_setup_streamed (
     // ---------------- latched inputs ----------------
     reg [31:0] X1,Y1,Z1,X2,Y2,Z2,X3,Y3,Z3,XB,YB,ISPW,TAG;
 
-    // ================= combinational datapath (mirrors do_triangle_setup_pvr) ==========
-    // difference terms
-    wire [31:0] d_X1X3, d_Y2Y3, d_Y1Y3, d_X2X3, d_X1X2, d_Y1Y2,
-                d_X2X1, d_Y2Y1, d_X3X1, d_Y3Y1, d_Z2Z1, d_Z3Z1;
-    fp_add24 s_x1x3(.a(X1),.b_in(X3),.sub(1'b1),.y(d_X1X3));
-    fp_add24 s_y2y3(.a(Y2),.b_in(Y3),.sub(1'b1),.y(d_Y2Y3));
-    fp_add24 s_y1y3(.a(Y1),.b_in(Y3),.sub(1'b1),.y(d_Y1Y3));
-    fp_add24 s_x2x3(.a(X2),.b_in(X3),.sub(1'b1),.y(d_X2X3));
-    fp_add24 s_x1x2(.a(X1),.b_in(X2),.sub(1'b1),.y(d_X1X2));
-    fp_add24 s_y1y2(.a(Y1),.b_in(Y2),.sub(1'b1),.y(d_Y1Y2));
-    fp_add24 s_x2x1(.a(X2),.b_in(X1),.sub(1'b1),.y(d_X2X1));
-    fp_add24 s_y2y1(.a(Y2),.b_in(Y1),.sub(1'b1),.y(d_Y2Y1));
-    fp_add24 s_x3x1(.a(X3),.b_in(X1),.sub(1'b1),.y(d_X3X1));
-    fp_add24 s_y3y1(.a(Y3),.b_in(Y1),.sub(1'b1),.y(d_Y3Y1));
-    fp_add24 s_z2z1(.a(Z2),.b_in(Z1),.sub(1'b1),.y(d_Z2Z1));
-    fp_add24 s_z3z1(.a(Z3),.b_in(Z1),.sub(1'b1),.y(d_Z3Z1));
+    // ================= combinational datapath (WIDE 32-bit test) ==========
+    // TEST WIDENING: difference terms use fp_sub32_w (wide 32-bit-sig output) and the
+    // multiplies that consume large-magnitude diffs/anchors use fp_mul32_w (32x32).
+    // Wide signals carried as {_s sign, _e exp[7:0], _m sig[31:0]}.
 
-    // tri_area = d_X1X3*d_Y2Y3 - d_Y1Y3*d_X2X3
-    wire [31:0] pA0, pA1, tri_area;
-    fp_mul24 m_pA0(.a(d_X1X3),.b(d_Y2Y3),.y(pA0));
-    fp_mul24 m_pA1(.a(d_Y1Y3),.b(d_X2X3),.y(pA1));
-    fp_add24 a_area(.a(pA0),.b_in(pA1),.sub(1'b1),.y(tri_area));
+    // difference terms (wide). Also keep a float32 view (via fp_from_wide) for the
+    // downstream ops that still take float32 (sgn edge grads, top-left test).
+    wire d_X1X3_s,d_Y2Y3_s,d_Y1Y3_s,d_X2X3_s,d_X1X2_s,d_Y1Y2_s,
+         d_X2X1_s,d_Y2Y1_s,d_X3X1_s,d_Y3Y1_s,d_Z2Z1_s,d_Z3Z1_s;
+    wire [7:0] d_X1X3_e,d_Y2Y3_e,d_Y1Y3_e,d_X2X3_e,d_X1X2_e,d_Y1Y2_e,
+               d_X2X1_e,d_Y2Y1_e,d_X3X1_e,d_Y3Y1_e,d_Z2Z1_e,d_Z3Z1_e;
+    wire [31:0] d_X1X3_m,d_Y2Y3_m,d_Y1Y3_m,d_X2X3_m,d_X1X2_m,d_Y1Y2_m,
+                d_X2X1_m,d_Y2Y1_m,d_X3X1_m,d_Y3Y1_m,d_Z2Z1_m,d_Z3Z1_m;
+    fp_sub32_w s_x1x3(.a(X1),.b_in(X3),.sub(1'b1),.o_sgn(d_X1X3_s),.o_exp(d_X1X3_e),.o_sig(d_X1X3_m));
+    fp_sub32_w s_y2y3(.a(Y2),.b_in(Y3),.sub(1'b1),.o_sgn(d_Y2Y3_s),.o_exp(d_Y2Y3_e),.o_sig(d_Y2Y3_m));
+    fp_sub32_w s_y1y3(.a(Y1),.b_in(Y3),.sub(1'b1),.o_sgn(d_Y1Y3_s),.o_exp(d_Y1Y3_e),.o_sig(d_Y1Y3_m));
+    fp_sub32_w s_x2x3(.a(X2),.b_in(X3),.sub(1'b1),.o_sgn(d_X2X3_s),.o_exp(d_X2X3_e),.o_sig(d_X2X3_m));
+    fp_sub32_w s_x1x2(.a(X1),.b_in(X2),.sub(1'b1),.o_sgn(d_X1X2_s),.o_exp(d_X1X2_e),.o_sig(d_X1X2_m));
+    fp_sub32_w s_y1y2(.a(Y1),.b_in(Y2),.sub(1'b1),.o_sgn(d_Y1Y2_s),.o_exp(d_Y1Y2_e),.o_sig(d_Y1Y2_m));
+    fp_sub32_w s_x2x1(.a(X2),.b_in(X1),.sub(1'b1),.o_sgn(d_X2X1_s),.o_exp(d_X2X1_e),.o_sig(d_X2X1_m));
+    fp_sub32_w s_y2y1(.a(Y2),.b_in(Y1),.sub(1'b1),.o_sgn(d_Y2Y1_s),.o_exp(d_Y2Y1_e),.o_sig(d_Y2Y1_m));
+    fp_sub32_w s_x3x1(.a(X3),.b_in(X1),.sub(1'b1),.o_sgn(d_X3X1_s),.o_exp(d_X3X1_e),.o_sig(d_X3X1_m));
+    fp_sub32_w s_y3y1(.a(Y3),.b_in(Y1),.sub(1'b1),.o_sgn(d_Y3Y1_s),.o_exp(d_Y3Y1_e),.o_sig(d_Y3Y1_m));
+    fp_sub32_w s_z2z1(.a(Z2),.b_in(Z1),.sub(1'b1),.o_sgn(d_Z2Z1_s),.o_exp(d_Z2Z1_e),.o_sig(d_Z2Z1_m));
+    fp_sub32_w s_z3z1(.a(Z3),.b_in(Z1),.sub(1'b1),.o_sgn(d_Z3Z1_s),.o_exp(d_Z3Z1_e),.o_sig(d_Z3Z1_m));
+    // float32 views (packed) for the ops that still need float32
+    wire [31:0] d_X1X2, d_X2X3, d_X3X1, d_Y1Y2, d_Y2Y3, d_Y3Y1;
+    fp_from_wide v_x1x2(.sgn(d_X1X2_s),.exp(d_X1X2_e),.sig(d_X1X2_m),.y(d_X1X2));
+    fp_from_wide v_x2x3(.sgn(d_X2X3_s),.exp(d_X2X3_e),.sig(d_X2X3_m),.y(d_X2X3));
+    fp_from_wide v_x3x1(.sgn(d_X3X1_s),.exp(d_X3X1_e),.sig(d_X3X1_m),.y(d_X3X1));
+    fp_from_wide v_y1y2(.sgn(d_Y1Y2_s),.exp(d_Y1Y2_e),.sig(d_Y1Y2_m),.y(d_Y1Y2));
+    fp_from_wide v_y2y3(.sgn(d_Y2Y3_s),.exp(d_Y2Y3_e),.sig(d_Y2Y3_m),.y(d_Y2Y3));
+    fp_from_wide v_y3y1(.sgn(d_Y3Y1_s),.exp(d_Y3Y1_e),.sig(d_Y3Y1_m),.y(d_Y3Y1));
+
+    // tri_area = d_X1X3*d_Y2Y3 - d_Y1Y3*d_X2X3  (wide 32x32)
+    wire pa0_s,pa1_s,tarea_s; wire [7:0] pa0_e,pa1_e,tarea_e; wire [31:0] pa0_m,pa1_m,tarea_m;
+    wire [31:0] tri_area;
+    fp_mul32_w m_pA0(.a_sgn(d_X1X3_s),.a_exp(d_X1X3_e),.a_sig(d_X1X3_m),
+                     .b_sgn(d_Y2Y3_s),.b_exp(d_Y2Y3_e),.b_sig(d_Y2Y3_m),
+                     .o_sgn(pa0_s),.o_exp(pa0_e),.o_sig(pa0_m));
+    fp_mul32_w m_pA1(.a_sgn(d_Y1Y3_s),.a_exp(d_Y1Y3_e),.a_sig(d_Y1Y3_m),
+                     .b_sgn(d_X2X3_s),.b_exp(d_X2X3_e),.b_sig(d_X2X3_m),
+                     .o_sgn(pa1_s),.o_exp(pa1_e),.o_sig(pa1_m));
+    fp_add32_w a_area(.a_sgn(pa0_s),.a_exp(pa0_e),.a_sig(pa0_m),
+                      .b_sgn(pa1_s),.b_exp(pa1_e),.b_sig(pa1_m),.sub(1'b1),
+                      .o_sgn(tarea_s),.o_exp(tarea_e),.o_sig(tarea_m));
+    fp_from_wide p_area(.sgn(tarea_s),.exp(tarea_e),.sig(tarea_m),.y(tri_area));
 
     // Aa = -d_Z2Z1*d_Y3Y1 + d_Z3Z1*d_Y2Y1 ; Ba = -d_X2X1*d_Z3Z1 + d_X3X1*d_Z2Z1
-    // fpm<32>: 24x24->32-bit WIDE products (fp_mul24_w) summed at 32-bit (fp_add32_w),
-    // then packed to float32 (Aa/Ba feed a 24-bit-input mul downstream).
+    // wide 32x32 products (fp_mul32_w) summed wide (fp_add32_w); Aa/Ba kept WIDE.
     wire pAa0_s,pAa1_s,Aa_s, pBa0_s,pBa1_s,Ba_s;
     wire [7:0] pAa0_e,pAa1_e,Aa_e, pBa0_e,pBa1_e,Ba_e;
     wire [31:0] pAa0_m,pAa1_m,Aa_m, pBa0_m,pBa1_m,Ba_m;
     wire [31:0] Aa, Ba;
-    fp_mul24_w m_aa0(.a(fneg32(d_Z2Z1)),.b(d_Y3Y1),.o_sgn(pAa0_s),.o_exp(pAa0_e),.o_sig(pAa0_m));
-    fp_mul24_w m_aa1(.a(d_Z3Z1),.b(d_Y2Y1),.o_sgn(pAa1_s),.o_exp(pAa1_e),.o_sig(pAa1_m));
+    fp_mul32_w m_aa0(.a_sgn(~d_Z2Z1_s),.a_exp(d_Z2Z1_e),.a_sig(d_Z2Z1_m),
+                     .b_sgn(d_Y3Y1_s),.b_exp(d_Y3Y1_e),.b_sig(d_Y3Y1_m),
+                     .o_sgn(pAa0_s),.o_exp(pAa0_e),.o_sig(pAa0_m));
+    fp_mul32_w m_aa1(.a_sgn(d_Z3Z1_s),.a_exp(d_Z3Z1_e),.a_sig(d_Z3Z1_m),
+                     .b_sgn(d_Y2Y1_s),.b_exp(d_Y2Y1_e),.b_sig(d_Y2Y1_m),
+                     .o_sgn(pAa1_s),.o_exp(pAa1_e),.o_sig(pAa1_m));
     fp_add32_w a_aa(.a_sgn(pAa0_s),.a_exp(pAa0_e),.a_sig(pAa0_m),
                     .b_sgn(pAa1_s),.b_exp(pAa1_e),.b_sig(pAa1_m),.sub(1'b0),
                     .o_sgn(Aa_s),.o_exp(Aa_e),.o_sig(Aa_m));
     fp_from_wide p_aa(.sgn(Aa_s),.exp(Aa_e),.sig(Aa_m),.y(Aa));
-    fp_mul24_w m_ba0(.a(fneg32(d_X2X1)),.b(d_Z3Z1),.o_sgn(pBa0_s),.o_exp(pBa0_e),.o_sig(pBa0_m));
-    fp_mul24_w m_ba1(.a(d_X3X1),.b(d_Z2Z1),.o_sgn(pBa1_s),.o_exp(pBa1_e),.o_sig(pBa1_m));
+    fp_mul32_w m_ba0(.a_sgn(~d_X2X1_s),.a_exp(d_X2X1_e),.a_sig(d_X2X1_m),
+                     .b_sgn(d_Z3Z1_s),.b_exp(d_Z3Z1_e),.b_sig(d_Z3Z1_m),
+                     .o_sgn(pBa0_s),.o_exp(pBa0_e),.o_sig(pBa0_m));
+    fp_mul32_w m_ba1(.a_sgn(d_X3X1_s),.a_exp(d_X3X1_e),.a_sig(d_X3X1_m),
+                     .b_sgn(d_Z2Z1_s),.b_exp(d_Z2Z1_e),.b_sig(d_Z2Z1_m),
+                     .o_sgn(pBa1_s),.o_exp(pBa1_e),.o_sig(pBa1_m));
     fp_add32_w a_ba(.a_sgn(pBa0_s),.a_exp(pBa0_e),.a_sig(pBa0_m),
                     .b_sgn(pBa1_s),.b_exp(pBa1_e),.b_sig(pBa1_m),.sub(1'b0),
                     .o_sgn(Ba_s),.o_exp(Ba_e),.o_sig(Ba_m));
@@ -142,14 +174,24 @@ module isp_setup_streamed (
     fp_mul24 m_dy23(.a(sgn),.b(d_Y2Y3),.y(DY23));
     fp_mul24 m_dy31(.a(sgn),.b(d_Y3Y1),.y(DY31));
 
-    // anchors XL/YT = vertex - tile origin
+    // anchors XL/YT = vertex - tile origin (WIDE; can be huge for guard-band verts)
+    wire xl1_s,xl2_s,xl3_s,yt1_s,yt2_s,yt3_s;
+    wire [7:0] xl1_e,xl2_e,xl3_e,yt1_e,yt2_e,yt3_e;
+    wire [31:0] xl1_m,xl2_m,xl3_m,yt1_m,yt2_m,yt3_m;
+    fp_sub32_w s_xl1(.a(X1),.b_in(XB),.sub(1'b1),.o_sgn(xl1_s),.o_exp(xl1_e),.o_sig(xl1_m));
+    fp_sub32_w s_xl2(.a(X2),.b_in(XB),.sub(1'b1),.o_sgn(xl2_s),.o_exp(xl2_e),.o_sig(xl2_m));
+    fp_sub32_w s_xl3(.a(X3),.b_in(XB),.sub(1'b1),.o_sgn(xl3_s),.o_exp(xl3_e),.o_sig(xl3_m));
+    fp_sub32_w s_yt1(.a(Y1),.b_in(YB),.sub(1'b1),.o_sgn(yt1_s),.o_exp(yt1_e),.o_sig(yt1_m));
+    fp_sub32_w s_yt2(.a(Y2),.b_in(YB),.sub(1'b1),.o_sgn(yt2_s),.o_exp(yt2_e),.o_sig(yt2_m));
+    fp_sub32_w s_yt3(.a(Y3),.b_in(YB),.sub(1'b1),.o_sgn(yt3_s),.o_exp(yt3_e),.o_sig(yt3_m));
+    // float32 views for the edge-constant products (those are small×small, 24-bit OK)
     wire [31:0] XL1,XL2,XL3,YT1,YT2,YT3;
-    fp_add24 s_xl1(.a(X1),.b_in(XB),.sub(1'b1),.y(XL1));
-    fp_add24 s_xl2(.a(X2),.b_in(XB),.sub(1'b1),.y(XL2));
-    fp_add24 s_xl3(.a(X3),.b_in(XB),.sub(1'b1),.y(XL3));
-    fp_add24 s_yt1(.a(Y1),.b_in(YB),.sub(1'b1),.y(YT1));
-    fp_add24 s_yt2(.a(Y2),.b_in(YB),.sub(1'b1),.y(YT2));
-    fp_add24 s_yt3(.a(Y3),.b_in(YB),.sub(1'b1),.y(YT3));
+    fp_from_wide v_xl1(.sgn(xl1_s),.exp(xl1_e),.sig(xl1_m),.y(XL1));
+    fp_from_wide v_xl2(.sgn(xl2_s),.exp(xl2_e),.sig(xl2_m),.y(XL2));
+    fp_from_wide v_xl3(.sgn(xl3_s),.exp(xl3_e),.sig(xl3_m),.y(XL3));
+    fp_from_wide v_yt1(.sgn(yt1_s),.exp(yt1_e),.sig(yt1_m),.y(YT1));
+    fp_from_wide v_yt2(.sgn(yt2_s),.exp(yt2_e),.sig(yt2_m),.y(YT2));
+    fp_from_wide v_yt3(.sgn(yt3_s),.exp(yt3_e),.sig(yt3_m),.y(YT3));
 
     // edge constants Craw = DY*XL - DX*YT  (fpm<32>: wide products + wide sub, packed)
     wire c1a_s,c1b_s,C1r_s, c2a_s,c2b_s,C2r_s, c3a_s,c3b_s,C3r_s;
@@ -189,20 +231,28 @@ module isp_setup_streamed (
     assign ddx_w = fneg32(pddx);
     assign ddy_w = fneg32(pddy);
 
-    // invW constant c = Z1 - ddx*XL1 - ddy*YT1  (fpm<32>: wide products+subs, packed)
-    //   zc0    = Z1 - ddx*XL1        (Z1 promoted to wide; product wide)
-    //   c_invw = zc0 - ddy*YT1
+    // invW constant c = Z1 - ddx*XL1 - ddy*YT1
+    // The killer cancellation: ddy*YT1 ~ 500 (YT1 huge for guard-band vert) must
+    // cancel Z1 to leave ~c. WIDE 32x32 products with the huge WIDE anchors, wide subs.
     wire z1_s; wire [7:0] z1_e; wire [31:0] z1_m;
     fp_to_wide w_z1(.f(Z1),.sgn(z1_s),.exp(z1_e),.sig(z1_m));
+    // ddx_w/ddy_w (float32) promoted to wide multiply operands
+    wire ddxw_s,ddyw_s; wire [7:0] ddxw_e,ddyw_e; wire [31:0] ddxw_m,ddyw_m;
+    fp_to_wide w_ddx(.f(ddx_w),.sgn(ddxw_s),.exp(ddxw_e),.sig(ddxw_m));
+    fp_to_wide w_ddy(.f(ddy_w),.sgn(ddyw_s),.exp(ddyw_e),.sig(ddyw_m));
     wire dx1_s,zc0_s, dy1_s,civ_s;
     wire [7:0]  dx1_e,zc0_e, dy1_e,civ_e;
     wire [31:0] dx1_m,zc0_m, dy1_m,civ_m;
     wire [31:0] cinvw_w;
-    fp_mul24_w m_dx1(.a(ddx_w),.b(XL1),.o_sgn(dx1_s),.o_exp(dx1_e),.o_sig(dx1_m));
+    fp_mul32_w m_dx1(.a_sgn(ddxw_s),.a_exp(ddxw_e),.a_sig(ddxw_m),
+                     .b_sgn(xl1_s),.b_exp(xl1_e),.b_sig(xl1_m),
+                     .o_sgn(dx1_s),.o_exp(dx1_e),.o_sig(dx1_m));
     fp_add32_w a_zc0(.a_sgn(z1_s),.a_exp(z1_e),.a_sig(z1_m),
                      .b_sgn(dx1_s),.b_exp(dx1_e),.b_sig(dx1_m),.sub(1'b1),
                      .o_sgn(zc0_s),.o_exp(zc0_e),.o_sig(zc0_m));
-    fp_mul24_w m_dy1(.a(ddy_w),.b(YT1),.o_sgn(dy1_s),.o_exp(dy1_e),.o_sig(dy1_m));
+    fp_mul32_w m_dy1(.a_sgn(ddyw_s),.a_exp(ddyw_e),.a_sig(ddyw_m),
+                     .b_sgn(yt1_s),.b_exp(yt1_e),.b_sig(yt1_m),
+                     .o_sgn(dy1_s),.o_exp(dy1_e),.o_sig(dy1_m));
     fp_add32_w a_civ(.a_sgn(zc0_s),.a_exp(zc0_e),.a_sig(zc0_m),
                      .b_sgn(dy1_s),.b_exp(dy1_e),.b_sig(dy1_m),.sub(1'b1),
                      .o_sgn(civ_s),.o_exp(civ_e),.o_sig(civ_m));

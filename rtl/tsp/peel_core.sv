@@ -626,6 +626,18 @@ module peel_core import tsp_pkg::*; (
             sd_seq = sd_seq + 1;
         end
     end
+
+    // -------- TILE (9,13) probe: $display every shaded pixel's inputs --------------
+    // Isolated tile that contains only the problematic road triangle. Dumps invW and
+    // the U/V (planes 0,1) plane coeffs so the per-pixel interp+divide can be traced.
+    always @(posedge clk) begin
+        if (!reset && pp_in_valid && !pp_stall && cur_tx == 6'd9 && cur_ty == 6'd13) begin
+            $display("[T9,13] px=%0d py=%0d invw=%08x  U{ddx=%08x ddy=%08x c=%08x}  V{ddx=%08x ddy=%08x c=%08x}",
+                     pp_px, pp_py, pp_invw,
+                     pp_ddx[0], pp_ddy[0], pp_c[0],
+                     pp_ddx[1], pp_ddy[1], pp_c[1]);
+        end
+    end
     final if (sd_en && sd_fd != 0) begin
         $fflush(sd_fd);
         $fclose(sd_fd);

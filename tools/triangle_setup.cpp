@@ -456,7 +456,7 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     fpm<32> Ba = fp_mul<32,24>(-d_X2X1, d_Z3Z1) + fp_mul<32,24>(d_X3X1, d_Z2Z1);
 
     // ---- reciprocal of area (fp_rcp_fast ~16-bit), and the invW gradients ----
-    fpm<32> inv_area = fpm<32>(fpm<16>(1.0f / tri_area.tof32()).tof32());
+    fpm<32> inv_area = fpm<32>(1.0f / tri_area.tof32());
     fpm<24> ddx_invw = -fp_mul<24,24>(Aa, inv_area);
     fpm<24> ddy_invw = -fp_mul<24,24>(Ba, inv_area);
 
@@ -572,7 +572,7 @@ TriangleSetup do_triangle_setup_pvr(uint32_t isp_word,
     fpm<24> t_X3X1 = X3 - X1;
     fpm<24> t_X2X1 = X2 - X1;
     fpm<24> t_area = fp_mul<24,24>(t_X2X1, t_Y3Y1) - fp_mul<24,24>(t_X3X1, t_Y2Y1);
-    fpm<32> t_inv  = fpm<32>(fpm<16>(1.0f / t_area.tof32()).tof32());
+    fpm<32> t_inv  = fpm<32>(1.0f / t_area.tof32());
     fpm<24> t_XL1  = X1 - XB;
     fpm<24> t_YT1  = Y1 - YB;
 
