@@ -47,19 +47,27 @@ module isp_setup_min (
     reg [31:0] X1,Y1,Z1,X2,Y2,Z2,X3,Y3,Z3,XB,YB;
 
     // ---------------- tile-local bounding box ----------------
-    // float -> signed integer (floor toward -inf) for screen coords (0..2047).
+    // float -> signed integer (floor toward -inf), SATURATED to the valid screen
+    // region [0, 2047]. Off-screen vertices must saturate to the screen edge, NOT
+    // wrap: a strip triangle spanning to the horizon has coords in the millions
+    // (~2^21), and a plain 16-bit truncation (mag[15:0]) wraps those to a garbage
+    // tile-local value, collapsing the bbox min/max to a corner. The rasterizer then
+    // only visits that corner -> the whole tile below its first row renders black.
+    // Saturating keeps the off-screen vertex correctly "past the edge" so the bbox
+    // spans the whole tile.
     function automatic signed [15:0] f2i_floor(input [31:0] f);
-        integer e, sh; reg signed [31:0] mag;
+        integer e, sh; reg [31:0] mag; reg [11:0] sat;
         begin
             e = f[30:23] - 127;
             if (f[30:23] == 8'd0 || e < 0) mag = 0;         // |v| < 1 -> 0
+            else if (e >= 11) mag = 32'h7FFFFFFF;           // |v| >= 2048 -> saturate
             else begin
-                sh = 23 - e;
-                if (sh <= 0) mag = {8'b0, 1'b1, f[22:0]} <<< (-sh);
-                else         mag = {8'b0, 1'b1, f[22:0]} >>> sh;
+                sh = 23 - e;                                // e in 0..10 -> sh 23..13
+                mag = {8'b0, 1'b1, f[22:0]} >> sh;
             end
+            sat = (mag > 32'd2047) ? 12'd2047 : mag[11:0];  // clamp to max screen coord
             // floor toward -inf: a negative value with dropped fraction rounds down
-            f2i_floor = f[31] ? -mag[15:0] : mag[15:0];
+            f2i_floor = f[31] ? -{4'b0, sat} : {4'b0, sat};
         end
     endfunction
     function automatic [4:0] clamp5(input signed [15:0] v);
