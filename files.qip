@@ -24,6 +24,13 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_add3_24.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_rcp_fast.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_mul_i5.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/mac16.sv
+# Extended-precision setup FP (41-bit xf bus: full 32x32 mult / 32b-mant add /
+# 3-way add). Used by isp_setup_streamed + tsp_setup_min for triangle-setup precision;
+# interpolation and isp_setup_min stay on the reduced (mac16) units.
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_mul_full.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_add32.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/fp_add3_32.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/mac_full.sv
 set_global_assignment -name SYSTEMVERILOG_FILE rtl/isp_min/isp_setup_min.sv
 # 4-way interleaved streaming setup (isp_core): ~14 cyc/tri throughput, same 4 mac
 # lanes. isp_setup_min stays for peel_core + the setupstream unit test reference.

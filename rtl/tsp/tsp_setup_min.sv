@@ -45,28 +45,44 @@ module tsp_setup_min (
     output reg [3:0]  plane_idx,   // 0=U 1=V 2..5=Col RGBA 6..9=Ofs RGBA
     output reg [31:0] o_ddx, output reg [31:0] o_ddy, output reg [31:0] o_c
 );
-    localparam [31:0] ONE = 32'h3f800000, ZERO = 32'd0;
+    // ONE/ZERO as extended xf constants (41-bit {sign,exp[7:0],mant[31:0]}, hidden
+    // 1 at mant bit31). The plane algebra runs in xf for precision; only the final
+    // ddx/ddy/c outputs (and the reciprocal input) truncate to float32.
+    localparam [40:0] ONE = {1'b0, 8'd127, 32'h80000000}, ZERO = {1'b0, 8'd0, 32'd0};
 
-    // ---------------- vertices / geometry ----------------
-    reg [31:0] X1,Y1,Z1,X2,Y2,Z2,X3,Y3,Z3,XB,YB;
+    // ---------------- vertices / geometry (extended xf) ----------------
+    reg [40:0] X1,Y1,Z1,X2,Y2,Z2,X3,Y3,Z3,XB,YB;
     reg [31:0] U1,V1,U2,V2,U3,V3, COL1,COL2,COL3, OFS1,OFS2,OFS3;
     reg        g_r, tex_r, ofs_en_r;
-    reg [31:0] Y2Y1,Y3Y1,X3X1,X2X1, XL1,YT1, area;
+    reg [40:0] Y2Y1,Y3Y1,X3X1,X2X1, XL1,YT1, area;
+    // per-vertex tile-local offsets for the NEAREST-VERTEX c anchor (see below).
+    reg [40:0] XL2,YT2,XL3,YT3;
 
-    // ---------------- 4 MAC lanes: {0,1}=ctxA, {2,3}=ctxB ----------------
-    reg  [31:0] l0a,l0b,l0c; reg l0s; wire [31:0] l0q;
-    reg  [31:0] l1a,l1b,l1c; reg l1s; wire [31:0] l1q;
-    reg  [31:0] l2a,l2b,l2c; reg l2s; wire [31:0] l2q;
-    reg  [31:0] l3a,l3b,l3c; reg l3s; wire [31:0] l3q;
-    mac16 ml0 (.clk(clk),.reset(reset),.a(l0a),.b(l0b),.c(l0c),.sub(l0s),.q(l0q));
-    mac16 ml1 (.clk(clk),.reset(reset),.a(l1a),.b(l1b),.c(l1c),.sub(l1s),.q(l1q));
-    mac16 ml2 (.clk(clk),.reset(reset),.a(l2a),.b(l2b),.c(l2c),.sub(l2s),.q(l2q));
-    mac16 ml3 (.clk(clk),.reset(reset),.a(l3a),.b(l3b),.c(l3c),.sub(l3s),.q(l3q));
+    // ---------------- float32 <-> extended xf conversions ----------------
+    function [40:0] f32_to_xf(input [31:0] f);
+        f32_to_xf = (f[30:23]==8'd0) ? {f[31], 8'd0, 32'd0}
+                                     : {f[31], f[30:23], 1'b1, f[22:0], 8'b0};
+    endfunction
+    function [31:0] xf_to_f32(input [40:0] x);   // truncate low 8 mantissa bits
+        xf_to_f32 = (x[39:32]==8'd0) ? {x[40], 31'd0}
+                                     : {x[40], x[39:32], x[30:8]};
+    endfunction
 
-    // ---------------- reciprocal ----------------
+    // ---------------- 4 extended MAC lanes: {0,1}=ctxA, {2,3}=ctxB ----------------
+    reg  [40:0] l0a,l0b,l0c; reg l0s; wire [40:0] l0q;
+    reg  [40:0] l1a,l1b,l1c; reg l1s; wire [40:0] l1q;
+    reg  [40:0] l2a,l2b,l2c; reg l2s; wire [40:0] l2q;
+    reg  [40:0] l3a,l3b,l3c; reg l3s; wire [40:0] l3q;
+    mac_full ml0 (.clk(clk),.reset(reset),.a(l0a),.b(l0b),.c(l0c),.sub(l0s),.q(l0q));
+    mac_full ml1 (.clk(clk),.reset(reset),.a(l1a),.b(l1b),.c(l1c),.sub(l1s),.q(l1q));
+    mac_full ml2 (.clk(clk),.reset(reset),.a(l2a),.b(l2b),.c(l2c),.sub(l2s),.q(l2q));
+    mac_full ml3 (.clk(clk),.reset(reset),.a(l3a),.b(l3b),.c(l3c),.sub(l3s),.q(l3q));
+
+    // ---------------- reciprocal (float32-native) ----------------
     reg        rc_req; reg [31:0] rc_in; wire rc_ack; wire [31:0] rc_y;
     fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(rc_req),.x(rc_in),
                        .out_valid(rc_ack),.y(rc_y));
+    wire [40:0] rc_y_xf = f32_to_xf(rc_y);   // reciprocal result on the xf bus
 
     // ---------------- SHARED attribute multipliers: ONE per kind ----------------
     // The attribute "prime" (z*attr for the 3 vertices of a plane) previously used 6
@@ -81,16 +97,19 @@ module tsp_setup_min (
     reg  signed [8:0] pm_k;             // colour channel (c9 path)
     reg  [31:0]       pm_u;             // uv float (mul16 path)
     reg               pm_uv;            // 1 = uv plane (use mul16), 0 = colour (c9)
+    // Attribute muls stay float32-native (colour k is a 9-bit int, uv the source
+    // floats); the product is widened to xf when latched so the plane algebra runs
+    // full-width. pm_z holds a float32 z (converted from the xf Z holder).
     wire [31:0] pm_c9, pm_mul;
     fp_mul_c9 u_amc (.f(pm_z), .k(pm_k), .y(pm_c9));
     fp_mul16  u_amu (.a(pm_z), .b(pm_u), .y(pm_mul));
-    wire [31:0] pm_prod = pm_uv ? pm_mul : pm_c9;   // this cycle's z*attr product
+    wire [40:0] pm_prod = f32_to_xf(pm_uv ? pm_mul : pm_c9);  // z*attr product on the xf bus
 
-    // per-context primed vertex products (filled by the serial prime sequencer)
-    reg  [31:0] Apa1,Apa2,Apa3;
-    reg  [31:0] Bpa1,Bpa2,Bpa3;
+    // per-context primed vertex products (filled by the serial prime sequencer, xf)
+    reg  [40:0] Apa1,Apa2,Apa3;
+    reg  [40:0] Bpa1,Bpa2,Bpa3;
 
-    function [31:0] fneg32(input [31:0] f); fneg32={~f[31],f[30:0]}; endfunction
+    function [40:0] fneg32(input [40:0] f); fneg32={~f[40],f[39:0]}; endfunction
     function signed [8:0] chan(input [31:0] c, input [1:0] ch);
         case (ch) 0:chan=$signed({1'b0,c[7:0]}); 1:chan=$signed({1'b0,c[15:8]});
                   2:chan=$signed({1'b0,c[23:16]}); 3:chan=$signed({1'b0,c[31:24]}); endcase
@@ -102,14 +121,14 @@ module tsp_setup_min (
     // A prime request stages the 3 per-vertex operands for plane `pl` (uv floats or
     // colour channels), then the sequencer feeds them one-per-cycle through the shared
     // mul and latches the 3 products into the requesting context's Apa/Bpa regs.
-    reg [31:0] pz1,pz2,pz3;             // vertex z (always Z1..Z3)
+    reg [31:0] pz1,pz2,pz3;             // vertex z as float32 (attr muls are f32)
     reg        p_isuv;                  // plane kind
     reg [31:0] pu1,pu2,pu3;             // uv floats (uv plane)
     reg signed [8:0] pk1,pk2,pk3;       // colour channels (colour plane)
     // stage the operands for plane pl into the prime holding regs (combinational
     // select of the sources; done the cycle a prime is requested).
     task load_prime(input [3:0] pl); reg [31:0]c1r,c2r,c3r; reg[1:0]chn; begin
-        pz1<=Z1; pz2<=Z2; pz3<=Z3;
+        pz1<=xf_to_f32(Z1); pz2<=xf_to_f32(Z2); pz3<=xf_to_f32(Z3);  // xf z -> f32 for attr mul
         if (pl<=1) begin p_isuv<=1'b1;
             if (pl==0) begin pu1<=U1;pu2<=U2;pu3<=U3; end
             else       begin pu1<=V1;pu2<=V2;pu3<=V3; end
@@ -123,8 +142,36 @@ module tsp_setup_min (
     // ---------------- per-context pipeline state ----------------
     // stage 0..6 active, 7=idle. Each plane's serial op chain (uses its 2 lanes).
     reg [3:0] Ast,Bst; reg [3:0] Api,Bpi;
-    reg [31:0] Aa1,Ada2,Ada3,Aaa,Aba,Addx,Addy,At;
-    reg [31:0] Ba1,Bda2,Bda3,Baa,Bba,Bddx,Bddy,Bt;
+    reg [40:0] Aa1,Ada2,Ada3,Aaa,Aba,Addx,Addy;   // extended xf plane state
+    reg [40:0] Ba1,Bda2,Bda3,Baa,Bba,Bddx,Bddy;
+
+    // ---- per-context 3-way adder for the plane constant c = a1 - ddx*XL - ddy*YT ----
+    // Fusing the two dependent subtracts (was: t=a1-ddx*XL, then c=t-ddy*YT) into a
+    // SINGLE align+normalize removes an intermediate truncation - the same win
+    // fp_add3_24 gives the interpolator. One combinational unit per context so the
+    // two plane chains never contend regardless of stage alignment.
+    reg  [40:0] Ac3_a, Ac3_b, Ac3_c; wire [40:0] Ac3_y;
+    reg  [40:0] Bc3_a, Bc3_b, Bc3_c; wire [40:0] Bc3_y;
+    fp_add3_32 u_Ac3 (.a(Ac3_a), .b(Ac3_b), .c(Ac3_c), .y(Ac3_y));
+    fp_add3_32 u_Bc3 (.a(Bc3_a), .b(Bc3_b), .c(Bc3_c), .y(Bc3_y));
+
+    // NEAREST-VERTEX c ANCHOR (same rationale as isp_setup_min): c = a_k - ddx*XL_k
+    // - ddy*YT_k is anchor-independent, but anchoring at a far v1 (strip triangle to
+    // the horizon) causes ~12 bits of catastrophic cancellation and corrupts the
+    // tile. Pick the vertex nearest the tile origin (min max(exp XL,exp YT)) and use
+    // its XL/YT for BOTH contexts; the per-context attribute anchor a_k is Apa/Bpa[near].
+    function [7:0] xf_emax(input [40:0] p, input [40:0] q);
+        xf_emax = (p[39:32] >= q[39:32]) ? p[39:32] : q[39:32];
+    endfunction
+    wire [7:0] nd1 = xf_emax(XL1, YT1);
+    wire [7:0] nd2 = xf_emax(XL2, YT2);
+    wire [7:0] nd3 = xf_emax(XL3, YT3);
+    wire [1:0] near_idx = (nd1 <= nd2) ? ((nd1 <= nd3) ? 2'd0 : 2'd2)
+                                       : ((nd2 <= nd3) ? 2'd1 : 2'd2);
+    wire [40:0] XL_near = (near_idx==2'd0) ? XL1 : (near_idx==2'd1) ? XL2 : XL3;
+    wire [40:0] YT_near = (near_idx==2'd0) ? YT1 : (near_idx==2'd1) ? YT2 : YT3;
+    wire [40:0] Apa_near = (near_idx==2'd0) ? Apa1 : (near_idx==2'd1) ? Apa2 : Apa3;
+    wire [40:0] Bpa_near = (near_idx==2'd0) ? Bpa1 : (near_idx==2'd1) ? Bpa2 : Bpa3;
 
     localparam LOAD=0,GEO=1,RUN=2,FIN=3;
     reg [1:0] fsm; reg [3:0] gc; reg [3:0] nextp;
@@ -186,8 +233,12 @@ module tsp_setup_min (
             if (fsm==LOAD || body)
             case (fsm)
             LOAD: if (start) begin
-                X1<=x1;Y1<=y1;Z1<=z1;X2<=x2;Y2<=y2;Z2<=z2;X3<=x3;Y3<=y3;Z3<=z3;
-                XB<=xbase;YB<=ybase; U1<=u1;V1<=v1;U2<=u2;V2<=v2;U3<=u3;V3<=v3;
+                // widen x/y/z/base geometry to xf; U/V/COL/OFS stay float32 (attr muls).
+                X1<=f32_to_xf(x1);Y1<=f32_to_xf(y1);Z1<=f32_to_xf(z1);
+                X2<=f32_to_xf(x2);Y2<=f32_to_xf(y2);Z2<=f32_to_xf(z2);
+                X3<=f32_to_xf(x3);Y3<=f32_to_xf(y3);Z3<=f32_to_xf(z3);
+                XB<=f32_to_xf(xbase);YB<=f32_to_xf(ybase);
+                U1<=u1;V1<=v1;U2<=u2;V2<=v2;U3<=u3;V3<=v3;
                 COL1<=col1;COL2<=col2;COL3<=col3;OFS1<=ofs1;OFS2<=ofs2;OFS3<=ofs3;
                 g_r<=gouraud;tex_r<=texture;ofs_en_r<=offset; gc<=0; fsm<=GEO;
             end
@@ -197,11 +248,14 @@ module tsp_setup_min (
                 case (gc)
                 0: begin L0(Y2,ONE,Y1,1);L1(Y3,ONE,Y1,1);L2(X3,ONE,X1,1);L3(X2,ONE,X1,1); end
                 1: begin Y2Y1<=l0q;Y3Y1<=l1q;X3X1<=l2q;X2X1<=l3q;
-                         L0(X1,ONE,XB,1);L1(Y1,ONE,YB,1); end
-                2: begin XL1<=l0q;YT1<=l1q;
-                         L0(X2X1,Y3Y1,ZERO,0);L1(X3X1,Y2Y1,ZERO,0); end
-                3: begin L0(l0q,ONE,l1q,1); end                     // area
-                4: begin area<=l0q; rc_in<=l0q; rc_req<=1;
+                         // tile-local offsets for all 3 verts (nearest-anchor c).
+                         L0(X1,ONE,XB,1);L1(Y1,ONE,YB,1);L2(X2,ONE,XB,1);L3(Y2,ONE,YB,1); end
+                2: begin XL1<=l0q;YT1<=l1q;XL2<=l2q;YT2<=l3q;
+                         L0(X2X1,Y3Y1,ZERO,0);L1(X3X1,Y2Y1,ZERO,0);
+                         L2(X3,ONE,XB,1);L3(Y3,ONE,YB,1); end
+                3: begin XL3<=l2q;YT3<=l3q;
+                         L0(l0q,ONE,l1q,1); end                     // area
+                4: begin area<=l0q; rc_in<=xf_to_f32(l0q); rc_req<=1;   // recip(area) in f32
                          nextp<=0; Ast<=7; Bst<=7; fsm<=RUN; end
                 endcase
             end
@@ -209,7 +263,7 @@ module tsp_setup_min (
             RUN: begin
                 // ---- context A (lanes 0,1) ----
                 case (Ast)
-                0: begin Aa1<=Apa1;
+                0: begin Aa1<=Apa_near;   // attribute anchor at the nearest vertex
                          L0(Apa2,ONE,Apa1,1); L1(Apa3,ONE,Apa1,1); Ast<=1; end   // da2,da3
                 1: begin Ada2<=l0q; Ada3<=l1q;
                          L0(l1q,Y2Y1,ZERO,0); L1(l0q,Y3Y1,ZERO,0); Ast<=2; end   // Aa products
@@ -219,17 +273,20 @@ module tsp_setup_min (
                          // Ba = X3X1*da2 - X2X1*da3 = l1q + (-X2X1)*da3
                          L1(fneg32(X2X1),Ada3,l1q,0); Ast<=4; end
                 4: begin Aba<=l1q;
-                         L0(fneg32(Aaa),rc_y,ZERO,0); L1(fneg32(l1q),rc_y,ZERO,0); Ast<=5; end // ddx,ddy
+                         L0(fneg32(Aaa),rc_y_xf,ZERO,0); L1(fneg32(l1q),rc_y_xf,ZERO,0); Ast<=5; end // ddx,ddy
                 5: begin Addx<=l0q; Addy<=l1q;
-                         L0(fneg32(l0q),XL1,Aa1,0); Ast<=6; end       // t=a1-ddx*XL1
-                6: begin At<=l0q;
-                         L1(fneg32(Addy),YT1,l0q,0); Ast<=8; end      // c=t-ddy*YT1 (stage8=emit-pending)
-                8: begin emitA=1; Ast<=7; end                        // result in l1q now
+                         // products for the nearest-vertex c anchor:
+                         L0(l0q,XL_near,ZERO,0);      // ddx*XL_near
+                         L1(l1q,YT_near,ZERO,0); Ast<=6; end   // ddy*YT_near
+                6: begin // feed the 3-way adder: a1 + (-ddx*XL1) + (-ddy*YT1). Its
+                         // combinational result Ac3_y is stable by the emit stage.
+                         Ac3_a<=Aa1; Ac3_b<=fneg32(l0q); Ac3_c<=fneg32(l1q); Ast<=8; end
+                8: begin emitA=1; Ast<=7; end                        // c = Ac3_y (read in emit)
                 endcase
 
                 // ---- context B (lanes 2,3) ----
                 case (Bst)
-                0: begin Ba1<=Bpa1;
+                0: begin Ba1<=Bpa_near;   // attribute anchor at the nearest vertex
                          L2(Bpa2,ONE,Bpa1,1); L3(Bpa3,ONE,Bpa1,1); Bst<=1; end
                 1: begin Bda2<=l2q; Bda3<=l3q;
                          L2(l3q,Y2Y1,ZERO,0); L3(l2q,Y3Y1,ZERO,0); Bst<=2; end
@@ -237,17 +294,18 @@ module tsp_setup_min (
                 3: begin Baa<=l2q;
                          L3(fneg32(X2X1),Bda3,l3q,0); Bst<=4; end
                 4: begin Bba<=l3q;
-                         L2(fneg32(Baa),rc_y,ZERO,0); L3(fneg32(l3q),rc_y,ZERO,0); Bst<=5; end
+                         L2(fneg32(Baa),rc_y_xf,ZERO,0); L3(fneg32(l3q),rc_y_xf,ZERO,0); Bst<=5; end
                 5: begin Bddx<=l2q; Bddy<=l3q;
-                         L2(fneg32(l2q),XL1,Ba1,0); Bst<=6; end
-                6: begin Bt<=l2q;
-                         L3(fneg32(Bddy),YT1,l2q,0); Bst<=8; end
-                8: begin emitB=1; Bst<=7; end
+                         L2(l2q,XL_near,ZERO,0);      // ddx*XL_near
+                         L3(l3q,YT_near,ZERO,0); Bst<=6; end   // ddy*YT_near
+                6: begin Bc3_a<=Ba1; Bc3_b<=fneg32(l2q); Bc3_c<=fneg32(l3q); Bst<=8; end
+                8: begin emitB=1; Bst<=7; end                        // c = Bc3_y (read in emit)
                 endcase
 
                 // ---- emit (only one can retire per cycle; stagger guarantees it) ----
-                if (emitA) begin o_ddx<=Addx;o_ddy<=Addy;o_c<=l1q; plane_idx<=Api; plane_valid<=1; end
-                else if (emitB) begin o_ddx<=Bddx;o_ddy<=Bddy;o_c<=l3q; plane_idx<=Bpi; plane_valid<=1; end
+                // outputs are float32 PlaneStepper coefficients; narrow from xf here.
+                if (emitA) begin o_ddx<=xf_to_f32(Addx);o_ddy<=xf_to_f32(Addy);o_c<=xf_to_f32(Ac3_y); plane_idx<=Api; plane_valid<=1; end
+                else if (emitB) begin o_ddx<=xf_to_f32(Bddx);o_ddy<=xf_to_f32(Bddy);o_c<=xf_to_f32(Bc3_y); plane_idx<=Bpi; plane_valid<=1; end
 
                 // ---- launcher: prime the next enabled plane on the shared muls, then
                 // launch it into an idle context.
@@ -280,8 +338,8 @@ module tsp_setup_min (
     end
 
     // lane driver tasks
-    task L0(input [31:0]a,b,c,input s); begin l0a<=a;l0b<=b;l0c<=c;l0s<=s; end endtask
-    task L1(input [31:0]a,b,c,input s); begin l1a<=a;l1b<=b;l1c<=c;l1s<=s; end endtask
-    task L2(input [31:0]a,b,c,input s); begin l2a<=a;l2b<=b;l2c<=c;l2s<=s; end endtask
-    task L3(input [31:0]a,b,c,input s); begin l3a<=a;l3b<=b;l3c<=c;l3s<=s; end endtask
+    task L0(input [40:0]a,b,c,input s); begin l0a<=a;l0b<=b;l0c<=c;l0s<=s; end endtask
+    task L1(input [40:0]a,b,c,input s); begin l1a<=a;l1b<=b;l1c<=c;l1s<=s; end endtask
+    task L2(input [40:0]a,b,c,input s); begin l2a<=a;l2b<=b;l2c<=c;l2s<=s; end endtask
+    task L3(input [40:0]a,b,c,input s); begin l3a<=a;l3b<=b;l3c<=c;l3s<=s; end endtask
 endmodule

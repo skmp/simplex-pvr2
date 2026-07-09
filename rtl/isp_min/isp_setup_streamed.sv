@@ -56,7 +56,13 @@ module isp_setup_streamed (
     output reg [31:0] ddx_invw, output reg [31:0] ddy_invw, output reg [31:0] c_invw,
     output reg [4:0]  bx0, output reg [4:0] bx1, output reg [4:0] by0, output reg [4:0] by1
 );
-    localparam [31:0] ONE = 32'h3f800000, ZERO = 32'd0, NEG1 = 32'hbf800000;
+    // Extended-precision setup float (xf) constants: 41-bit {sign,exp[7:0],mant[31:0]},
+    // hidden-1 at mant bit31. The whole setup datapath runs in xf and only the final
+    // ddx/ddy/c (and edge/plane) outputs truncate to float32 - identical treatment to
+    // isp_setup_min. See fp_mul_full / fp_add32 / fp_add3_32.
+    localparam [40:0] ONE  = {1'b0, 8'd127, 32'h80000000};   // +1.0
+    localparam [40:0] ZERO = {1'b0, 8'd0,   32'd0};          // +0.0 (exp==0 -> zero)
+    localparam [40:0] NEG1 = {1'b1, 8'd127, 32'h80000000};   // -1.0
     localparam integer NS = 4;    // interleave depth = MAC_PH
 
     // ---------------- per-slot vertex holders ----------------
@@ -65,25 +71,26 @@ module isp_setup_streamed (
     // combinational bbox cloud (f2i_floor barrel-shift -> min/max -> clamp5) and
     // blows the 100 MHz path by ~11 ns. Keeping them as registers removes the RAM
     // read delay; the bbox itself is additionally pipelined below.
-    reg [31:0] X1[0:NS-1],Y1[0:NS-1],Z1[0:NS-1]  /* synthesis ramstyle = "logic" */;
-    reg [31:0] X2[0:NS-1],Y2[0:NS-1],Z2[0:NS-1]  /* synthesis ramstyle = "logic" */;
-    reg [31:0] X3[0:NS-1],Y3[0:NS-1],Z3[0:NS-1]  /* synthesis ramstyle = "logic" */;
-    reg [31:0] XB[0:NS-1],YB[0:NS-1]             /* synthesis ramstyle = "logic" */;
+    // vertices/scratchpad are all extended xf ([40:0]); only ISPW/TAG stay 32-bit.
+    reg [40:0] X1[0:NS-1],Y1[0:NS-1],Z1[0:NS-1]  /* synthesis ramstyle = "logic" */;
+    reg [40:0] X2[0:NS-1],Y2[0:NS-1],Z2[0:NS-1]  /* synthesis ramstyle = "logic" */;
+    reg [40:0] X3[0:NS-1],Y3[0:NS-1],Z3[0:NS-1]  /* synthesis ramstyle = "logic" */;
+    reg [40:0] XB[0:NS-1],YB[0:NS-1]             /* synthesis ramstyle = "logic" */;
     reg [31:0] ISPW[0:NS-1];
     reg [31:0] TAG[0:NS-1];       // opaque payload carried through
 
-    // ---------------- per-slot scratchpad ----------------
-    reg [31:0] d_X1X3[0:NS-1],d_Y2Y3[0:NS-1],d_Y1Y3[0:NS-1],d_X2X3[0:NS-1];
-    reg [31:0] d_X1X2[0:NS-1],d_Y1Y2[0:NS-1],d_X2X1[0:NS-1],d_Y2Y1[0:NS-1];
-    reg [31:0] d_X3X1[0:NS-1],d_Y3Y1[0:NS-1],d_Z2Z1[0:NS-1],d_Z3Z1[0:NS-1];
-    reg [31:0] XL1[0:NS-1],YT1[0:NS-1],XL2[0:NS-1],YT2[0:NS-1],XL3[0:NS-1],YT3[0:NS-1];
-    reg [31:0] P_a0[0:NS-1],P_a1[0:NS-1];
-    reg [31:0] tri_area[0:NS-1],inv_area[0:NS-1],sgn[0:NS-1];
-    reg [31:0] Aa0[0:NS-1],Ba0[0:NS-1],Aa[0:NS-1],Ba[0:NS-1];
-    reg [31:0] ddx[0:NS-1],ddy[0:NS-1];
-    reg [31:0] DX12[0:NS-1],DX23[0:NS-1],DX31[0:NS-1],DY12[0:NS-1],DY23[0:NS-1],DY31[0:NS-1];
-    reg [31:0] C1a[0:NS-1],C2a[0:NS-1],C3a[0:NS-1];
-    reg [31:0] ddxXL1[0:NS-1],ddyYT1[0:NS-1],zc0[0:NS-1];
+    // ---------------- per-slot scratchpad (extended xf) ----------------
+    reg [40:0] d_X1X3[0:NS-1],d_Y2Y3[0:NS-1],d_Y1Y3[0:NS-1],d_X2X3[0:NS-1];
+    reg [40:0] d_X1X2[0:NS-1],d_Y1Y2[0:NS-1],d_X2X1[0:NS-1],d_Y2Y1[0:NS-1];
+    reg [40:0] d_X3X1[0:NS-1],d_Y3Y1[0:NS-1],d_Z2Z1[0:NS-1],d_Z3Z1[0:NS-1];
+    reg [40:0] XL1[0:NS-1],YT1[0:NS-1],XL2[0:NS-1],YT2[0:NS-1],XL3[0:NS-1],YT3[0:NS-1];
+    reg [40:0] P_a0[0:NS-1],P_a1[0:NS-1];
+    reg [40:0] tri_area[0:NS-1],inv_area[0:NS-1],sgn[0:NS-1];
+    reg [40:0] Aa0[0:NS-1],Ba0[0:NS-1],Aa[0:NS-1],Ba[0:NS-1];
+    reg [40:0] ddx[0:NS-1],ddy[0:NS-1];
+    reg [40:0] DX12[0:NS-1],DX23[0:NS-1],DX31[0:NS-1],DY12[0:NS-1],DY23[0:NS-1],DY31[0:NS-1];
+    reg [40:0] C1a[0:NS-1],C2a[0:NS-1],C3a[0:NS-1];
+    reg [40:0] ddxXL1[0:NS-1];    // ddx*XL1 (ddy*YT1 feeds the 3-way adder directly)
     reg        tl1[0:NS-1],tl2[0:NS-1],tl3[0:NS-1];
     // per-slot outputs accumulated during the schedule (copied out at retire).
     // NOTE: dx12/23/31, dy12/23/31, ddx, ddy are NOT mirrored here - the working
@@ -113,20 +120,58 @@ module isp_setup_streamed (
     reg [4:0]  cyc[0:NS-1];        // logical step 0..14 for each slot
     assign busy = slot_busy[0] | slot_busy[1] | slot_busy[2] | slot_busy[3];
 
-    // ---------------- 4 combinational MAC lanes (shared) ----------------
-    reg  [31:0] la_a,la_b,la_c; reg la_s;  wire [31:0] la_q;
-    reg  [31:0] lb_a,lb_b,lb_c; reg lb_s;  wire [31:0] lb_q;
-    reg  [31:0] lc_a,lc_b,lc_c; reg lc_s;  wire [31:0] lc_q;
-    reg  [31:0] ld_a,ld_b,ld_c; reg ld_s;  wire [31:0] ld_q;
-    mac16 u_la (.clk(clk),.reset(reset),.a(la_a),.b(la_b),.c(la_c),.sub(la_s),.q(la_q));
-    mac16 u_lb (.clk(clk),.reset(reset),.a(lb_a),.b(lb_b),.c(lb_c),.sub(lb_s),.q(lb_q));
-    mac16 u_lc (.clk(clk),.reset(reset),.a(lc_a),.b(lc_b),.c(lc_c),.sub(lc_s),.q(lc_q));
-    mac16 u_ld (.clk(clk),.reset(reset),.a(ld_a),.b(ld_b),.c(ld_c),.sub(ld_s),.q(ld_q));
+    // ---------------- float32 <-> extended xf conversions ----------------
+    function [40:0] f32_to_xf(input [31:0] f);
+        f32_to_xf = (f[30:23]==8'd0) ? {f[31], 8'd0, 32'd0}          // DaZ -> zero
+                                     : {f[31], f[30:23], 1'b1, f[22:0], 8'b0};
+    endfunction
+    function [31:0] xf_to_f32(input [40:0] x);   // truncate low 8 mantissa bits
+        xf_to_f32 = (x[39:32]==8'd0) ? {x[40], 31'd0}
+                                     : {x[40], x[39:32], x[30:8]};
+    endfunction
 
-    // mac16 latency = 4 clocks (input-reg -> comb mul -> p_r -> sum_r -> q_r), and
-    // NS=4, so the slot serviced THIS clock reads la_q..ld_q DIRECTLY: la_q now
-    // holds the result of the op this same slot issued exactly 4 clocks ago. No
-    // per-slot result latch is needed (the interleave self-aligns, L==NS).
+    // ---------------- 4 extended MAC lanes (fp_mul_full + fp_add32), shared ----------
+    reg  [40:0] la_a,la_b,la_c; reg la_s;  wire [40:0] la_q;
+    reg  [40:0] lb_a,lb_b,lb_c; reg lb_s;  wire [40:0] lb_q;
+    reg  [40:0] lc_a,lc_b,lc_c; reg lc_s;  wire [40:0] lc_q;
+    reg  [40:0] ld_a,ld_b,ld_c; reg ld_s;  wire [40:0] ld_q;
+    mac_full u_la (.clk(clk),.reset(reset),.a(la_a),.b(la_b),.c(la_c),.sub(la_s),.q(la_q));
+    mac_full u_lb (.clk(clk),.reset(reset),.a(lb_a),.b(lb_b),.c(lb_c),.sub(lb_s),.q(lb_q));
+    mac_full u_lc (.clk(clk),.reset(reset),.a(lc_a),.b(lc_b),.c(lc_c),.sub(lc_s),.q(lc_q));
+    mac_full u_ld (.clk(clk),.reset(reset),.a(ld_a),.b(ld_b),.c(ld_c),.sub(ld_s),.q(ld_q));
+
+    // mac_full latency = 4 clocks (input-reg -> comb mul -> p_r -> sum_r -> q_r), SAME
+    // as mac16, and NS=4, so the slot serviced THIS clock reads la_q..ld_q DIRECTLY:
+    // la_q now holds the result of the op this same slot issued exactly 4 clocks ago.
+    // No per-slot result latch is needed (the interleave self-aligns, L==NS).
+
+    // ---- per-slot 3-way adder for c_invw = z1 - ddx*XL1 - ddy*YT1 ----
+    // Fuses the two dependent MAC subtracts (was zc0=z1-ddx*XL1, then -ddy*YT1) into
+    // ONE align+normalize, dropping an intermediate truncation - same as isp_setup_min.
+    // Inputs are per-slot regs; a mux selects the serviced slot for the combinational
+    // adder, whose result is captured one service turn later.
+    // One combinational adder PER SLOT so slot `sl` reads ci3_y[sl] with no shared
+    // mux / attribution race across the 4-way interleave. Inputs registered at c11,
+    // read at c12 (one service turn later, when they are visible).
+    reg  [40:0] ci3_a[0:NS-1], ci3_b[0:NS-1], ci3_c[0:NS-1];
+    wire [40:0] ci3_y[0:NS-1];
+    genvar gci;
+    generate for (gci=0; gci<NS; gci=gci+1) begin : g_cinvw_add3
+        fp_add3_32 u_ci3 (.a(ci3_a[gci]), .b(ci3_b[gci]), .c(ci3_c[gci]), .y(ci3_y[gci]));
+    end endgenerate
+
+    // NEAREST-VERTEX c ANCHOR (same rationale as isp_setup_min): anchor c at the
+    // vertex nearest the tile origin (min max(exp XL,exp YT)) to avoid the ~12-bit
+    // catastrophic cancellation a far v1 causes (strip triangle to the horizon).
+    // Per-slot combinational select off that slot's XL/YT registers.
+    function [7:0] xf_emax(input [40:0] p, input [40:0] q);
+        xf_emax = (p[39:32] >= q[39:32]) ? p[39:32] : q[39:32];
+    endfunction
+    function [1:0] near_of(input [40:0] xl1,yt1,xl2,yt2,xl3,yt3);
+        reg [7:0] d1,d2,d3;
+        begin d1=xf_emax(xl1,yt1); d2=xf_emax(xl2,yt2); d3=xf_emax(xl3,yt3);
+              near_of = (d1<=d2) ? ((d1<=d3)?2'd0:2'd2) : ((d2<=d3)?2'd1:2'd2); end
+    endfunction
 
     // ---------------- 1 SHARED reciprocal (pipelined 3-cycle) ----------------
     // The FSM services exactly one slot per clock (sl == phase) and requests a
@@ -137,8 +182,10 @@ module isp_setup_streamed (
     // back to the requesting slot via a 3-stage {valid,slot} shift register matching
     // the pipe latency; back-to-back requests from different slots are handled since
     // each stage carries its own slot id.
+    // rc_in holds the float32 tri_area to reciprocate (fp_rcp_fast is float32-native);
+    // inv_reg holds the reciprocal widened to xf for the mac lanes.
     reg        rc_req[0:NS-1]; reg [31:0] rc_in[0:NS-1];
-    reg        rc_done[0:NS-1]; reg [31:0] inv_reg[0:NS-1];
+    reg        rc_done[0:NS-1]; reg [40:0] inv_reg[0:NS-1];
 
     // one-hot -> shared request: only one rc_req is ever high, so OR/mux is safe.
     wire        rc_req_any = rc_req[0] | rc_req[1] | rc_req[2] | rc_req[3];
@@ -167,35 +214,35 @@ module isp_setup_streamed (
         for (gsq=0; gsq<NS; gsq=gsq+1) begin
             if (reset || rc_req[gsq]) rc_done[gsq] <= 1'b0;
             else if (rc_ack && rc_slot_p[2]==gsq[1:0]) begin
-                rc_done[gsq] <= 1'b1; inv_reg[gsq] <= rc_y;
+                rc_done[gsq] <= 1'b1; inv_reg[gsq] <= f32_to_xf(rc_y);   // widen 1/area to xf
             end
         end
     end
 
-    // ---------------- sign / helper functions (identical to isp_setup_min) --------
-    function fzero(input [31:0] f); fzero=(f[30:0]==31'd0); endfunction
-    function fneg (input [31:0] f); fneg = f[31]&&(f[30:0]!=31'd0); endfunction
-    function fpos (input [31:0] f); fpos = !f[31]&&(f[30:0]!=31'd0); endfunction
-    function istl(input [31:0] fdx, input [31:0] fdy);
+    // --------- sign / helper functions (xf: sign[40], exp[39:32], mant[31:0]) ------
+    function fzero(input [40:0] f); fzero=(f[39:0]==40'd0); endfunction
+    function fneg (input [40:0] f); fneg = f[40]&&(f[39:0]!=40'd0); endfunction
+    function fpos (input [40:0] f); fpos = !f[40]&&(f[39:0]!=40'd0); endfunction
+    function istl(input [40:0] fdx, input [40:0] fdy);
         istl=(fzero(fdy)&&fpos(fdx))||fneg(fdy); endfunction
-    function [31:0] fneg32(input [31:0] f); fneg32={~f[31],f[30:0]}; endfunction
+    function [40:0] fneg32(input [40:0] f); fneg32={~f[40],f[39:0]}; endfunction
 
-    // ---------------- tile-local bbox (float->int floor), per retiring slot -------
+    // ---------------- tile-local bbox (xf-float->int floor), per retiring slot -----
     // SATURATED to [0,2047] - see isp_setup_min for the rationale (a plain 16-bit
     // truncation of a millions-scale off-screen vertex wraps to garbage, collapsing
     // the bbox to a corner so the whole tile below its first row goes black).
-    function automatic signed [15:0] f2i_floor(input [31:0] f);
+    function automatic signed [15:0] f2i_floor(input [40:0] f);
         integer e, sh; reg [31:0] mag; reg [11:0] sat;
         begin
-            e = f[30:23] - 127;
-            if (f[30:23] == 8'd0 || e < 0) mag = 0;
+            e = f[39:32] - 127;
+            if (f[39:32] == 8'd0 || e < 0) mag = 0;
             else if (e >= 11) mag = 32'h7FFFFFFF;           // |v| >= 2048 -> saturate
             else begin
-                sh = 23 - e;                                // e in 0..10 -> sh 23..13
-                mag = {8'b0, 1'b1, f[22:0]} >> sh;
+                sh = 31 - e;                                // 31 frac bits in xf (e 0..10)
+                mag = f[31:0] >> sh;
             end
-            sat = (mag > 32'd2047) ? 12'd2047 : mag[11:0];
-            f2i_floor = f[31] ? -{4'b0, sat} : {4'b0, sat};
+            sat = (mag > 32'd2047) ? 12'd2047 : mag[11:0];  // clamp to max screen coord
+            f2i_floor = f[40] ? -{{4{1'b0}}, sat} : {{4{1'b0}}, sat};
         end
     endfunction
     function automatic [4:0] clamp5(input signed [15:0] v);
@@ -212,16 +259,19 @@ module isp_setup_streamed (
     wire       accept = in_valid && !slot_busy[phase];
     assign in_ready = !slot_busy[phase];
 
-    // lane driver tasks
-    task L0(input [31:0]a,b,c,input s); begin la_a<=a;la_b<=b;la_c<=c;la_s<=s; end endtask
-    task L1(input [31:0]a,b,c,input s); begin lb_a<=a;lb_b<=b;lb_c<=c;lb_s<=s; end endtask
-    task L2(input [31:0]a,b,c,input s); begin lc_a<=a;lc_b<=b;lc_c<=c;lc_s<=s; end endtask
-    task L3(input [31:0]a,b,c,input s); begin ld_a<=a;ld_b<=b;ld_c<=c;ld_s<=s; end endtask
+    // lane driver tasks (extended xf)
+    task L0(input [40:0]a,b,c,input s); begin la_a<=a;la_b<=b;la_c<=c;la_s<=s; end endtask
+    task L1(input [40:0]a,b,c,input s); begin lb_a<=a;lb_b<=b;lb_c<=c;lb_s<=s; end endtask
+    task L2(input [40:0]a,b,c,input s); begin lc_a<=a;lc_b<=b;lc_c<=c;lc_s<=s; end endtask
+    task L3(input [40:0]a,b,c,input s); begin ld_a<=a;ld_b<=b;ld_c<=c;ld_s<=s; end endtask
 
     integer k;
     reg [1:0] sl;                 // slot serviced this clock (= phase)
-    reg [31:0] qa,qb,qc,qd;       // this slot's latched mac results
+    reg [40:0] qa,qb,qc,qd;       // this slot's latched mac results (xf)
     reg [1:0] cm; reg tapos,taneg,wrong;
+    // nearest-vertex c anchor for the serviced slot (combinational off its XL/YT).
+    reg [1:0]  nrsl;
+    reg [40:0] XLn, YTn, Zn;
 
     always @(posedge clk) begin
         if (reset) begin
@@ -236,6 +286,11 @@ module isp_setup_streamed (
             // the op this same slot issued 4 clocks ago -> read them directly.
             sl = phase;                 // slot serviced this clock
             qa = la_q; qb = lb_q; qc = lc_q; qd = ld_q;
+            // nearest-vertex c anchor for this slot (XL/YT stable from c7 onward).
+            nrsl = near_of(XL1[sl],YT1[sl],XL2[sl],YT2[sl],XL3[sl],YT3[sl]);
+            XLn = (nrsl==2'd0)?XL1[sl]:(nrsl==2'd1)?XL2[sl]:XL3[sl];
+            YTn = (nrsl==2'd0)?YT1[sl]:(nrsl==2'd1)?YT2[sl]:YT3[sl];
+            Zn  = (nrsl==2'd0)?Z1[sl] :(nrsl==2'd1)?Z2[sl] :Z3[sl];
 
             // EVERY lane must issue an op EVERY clock: with mac latency == NS == 4,
             // each lane holds exactly one in-flight op per slot; a clock that leaves
@@ -248,11 +303,15 @@ module isp_setup_streamed (
             if (!slot_busy[sl]) begin
                 // slot is free: accept a new triangle and issue its c0 ops
                 if (accept) begin
-                    X1[sl]<=x1;Y1[sl]<=y1;Z1[sl]<=z1; X2[sl]<=x2;Y2[sl]<=y2;Z2[sl]<=z2;
-                    X3[sl]<=x3;Y3[sl]<=y3;Z3[sl]<=z3; XB[sl]<=xbase; YB[sl]<=ybase;
+                    // widen the float32 vertex/base inputs into the xf holders.
+                    X1[sl]<=f32_to_xf(x1);Y1[sl]<=f32_to_xf(y1);Z1[sl]<=f32_to_xf(z1);
+                    X2[sl]<=f32_to_xf(x2);Y2[sl]<=f32_to_xf(y2);Z2[sl]<=f32_to_xf(z2);
+                    X3[sl]<=f32_to_xf(x3);Y3[sl]<=f32_to_xf(y3);Z3[sl]<=f32_to_xf(z3);
+                    XB[sl]<=f32_to_xf(xbase); YB[sl]<=f32_to_xf(ybase);
                     ISPW[sl]<=isp_word; TAG[sl]<=in_tag;
-                    // c0: area diffs (a - c via sub, b=ONE)
-                    L0(x1,ONE,x3,1); L1(y2,ONE,y3,1); L2(y1,ONE,y3,1); L3(x2,ONE,x3,1);
+                    // c0: area diffs (a - c via sub, b=ONE). Widen the port inputs.
+                    L0(f32_to_xf(x1),ONE,f32_to_xf(x3),1); L1(f32_to_xf(y2),ONE,f32_to_xf(y3),1);
+                    L2(f32_to_xf(y1),ONE,f32_to_xf(y3),1); L3(f32_to_xf(x2),ONE,f32_to_xf(x3),1);
                     cyc[sl] <= 5'd1; slot_busy[sl] <= 1'b1;
                 end
             end else begin
@@ -309,7 +368,7 @@ module isp_setup_streamed (
                         cyc[sl]<=5'd14;               // -> retire
                     end else begin
                         Aa0[sl]<=qb; Ba0[sl]<=qc; XL2[sl]<=qd;
-                        rc_in[sl]<=qa; rc_req[sl]<=1'b1;
+                        rc_in[sl]<=xf_to_f32(qa); rc_req[sl]<=1'b1;   // recip(tri_area) in f32
                         L1(fneg32(d_Z2Z1[sl]),d_Y3Y1[sl],qb,0);  // Aa (L0 = default dummy)
                         L2(fneg32(d_X2X1[sl]),d_Z3Z1[sl],qc,0);  // Ba
                         L3(Y2[sl],ONE,YB[sl],1);                 // YT2
@@ -349,7 +408,7 @@ module isp_setup_streamed (
                     L0(qb,XL1[sl],ZERO,0);            // C1a = DY12*XL1
                     L1(qc,XL2[sl],ZERO,0);            // C2a = DY23*XL2
                     L2(qd,XL3[sl],ZERO,0);            // C3a = DY31*XL3
-                    L3(ddx[sl],XL1[sl],ZERO,0);        // ddx*XL1
+                    L3(ddx[sl],XLn,ZERO,0);            // ddx*XL_near (nearest-vertex c anchor)
                     cyc[sl]<=5'd10;
                 end
                 10: begin
@@ -360,24 +419,28 @@ module isp_setup_streamed (
                     L0(fneg32(DX12[sl]),YT1[sl],qa,0); // C1raw
                     L1(fneg32(DX23[sl]),YT2[sl],qb,0); // C2raw
                     L2(fneg32(DX31[sl]),YT3[sl],qc,0); // C3raw
-                    L3(ddy[sl],YT1[sl],ZERO,0);        // ddy*YT1
+                    L3(ddy[sl],YTn,ZERO,0);            // ddy*YT_near (nearest-vertex c anchor)
                     cyc[sl]<=5'd11;
                 end
                 11: begin
-                    ddyYT1[sl]<=qd;
-                    o_c1[sl]<= tl1[sl] ? qa : (qa - 32'd1);
-                    o_c2[sl]<= tl2[sl] ? qb : (qb - 32'd1);
-                    o_c3[sl]<= tl3[sl] ? qc : (qc - 32'd1);
-                    L3(Z1[sl],ONE,ddxXL1[sl],1);       // zc0 = z1 - ddx*XL1
+                    // Top-left bias is -1 ULP of the FLOAT32 edge constant, so narrow
+                    // FIRST then integer-decrement the float32 bit pattern.
+                    o_c1[sl]<= tl1[sl] ? xf_to_f32(qa) : (xf_to_f32(qa) - 32'd1);
+                    o_c2[sl]<= tl2[sl] ? xf_to_f32(qb) : (xf_to_f32(qb) - 32'd1);
+                    o_c3[sl]<= tl3[sl] ? xf_to_f32(qc) : (xf_to_f32(qc) - 32'd1);
+                    // c_invw = z_near - ddx*XL_near - ddy*YT_near, fused in ONE
+                    // align+normalize (nearest-vertex anchor avoids far-v1 cancellation).
+                    // ddxXL1[sl] holds ddx*XL_near (c10); qd is ddy*YT_near (c10 L3).
+                    ci3_a[sl]<=Zn; ci3_b[sl]<=fneg32(ddxXL1[sl]); ci3_c[sl]<=fneg32(qd);
                     cyc[sl]<=5'd12;
                 end
                 12: begin
-                    zc0[sl]<=qd;
-                    L0(qd,ONE,ddyYT1[sl],1);          // c_invw = zc0 - ddy*YT1
+                    // The c11-registered ci3_*[sl] are now visible, so this slot's
+                    // combinational adder result ci3_y[sl] is valid NOW.
+                    o_cinvw[sl]<=xf_to_f32(ci3_y[sl]);
                     cyc[sl]<=5'd13;
                 end
                 13: begin
-                    o_cinvw[sl]<=qa;
                     cm=ISPW[sl][28:27]; tapos=fpos(tri_area[sl]); taneg=fneg(tri_area[sl]);
                     wrong=(cm[0]==0&&taneg)||(cm[0]==1&&tapos);
                     o_cull[sl]<=(cm>=2)&&wrong;
@@ -393,12 +456,13 @@ module isp_setup_streamed (
                         out_isp   <= ISPW[sl];
                         sgn_neg   <= o_sgnneg[sl];
                         cull      <= o_cull[sl];
-                        // read the working regs directly (they survive un-clobbered
-                        // to retire); no separate o_* mirrors needed for these.
-                        dx12<=DX12[sl]; dx23<=DX23[sl]; dx31<=DX31[sl]; dx41<=ZERO;
-                        dy12<=DY12[sl]; dy23<=DY23[sl]; dy31<=DY31[sl]; dy41<=ZERO;
-                        c1<=o_c1[sl]; c2<=o_c2[sl]; c3<=o_c3[sl]; c4<=ONE;
-                        ddx_invw<=ddx[sl]; ddy_invw<=ddy[sl]; c_invw<=o_cinvw[sl];
+                        // read the xf working regs directly (they survive un-clobbered
+                        // to retire) and narrow to the float32 outputs. dx41/dy41/c4
+                        // use plain float32 literals (0,0,+1.0).
+                        dx12<=xf_to_f32(DX12[sl]); dx23<=xf_to_f32(DX23[sl]); dx31<=xf_to_f32(DX31[sl]); dx41<=32'd0;
+                        dy12<=xf_to_f32(DY12[sl]); dy23<=xf_to_f32(DY23[sl]); dy31<=xf_to_f32(DY31[sl]); dy41<=32'd0;
+                        c1<=o_c1[sl]; c2<=o_c2[sl]; c3<=o_c3[sl]; c4<=32'h3f800000;
+                        ddx_invw<=xf_to_f32(ddx[sl]); ddy_invw<=xf_to_f32(ddy[sl]); c_invw<=o_cinvw[sl];
                         bx0<=o_bx0[sl]; bx1<=o_bx1[sl];
                         by0<=o_by0[sl]; by1<=o_by1[sl];
                         slot_busy[sl] <= 1'b0;
