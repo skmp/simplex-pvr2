@@ -137,10 +137,23 @@ module tex_fetch4_ob import tsp_pkg::*; (
     end endgenerate
 
     // ---- output ----
+    // t2_word holds the RESOLVED word ONLY once t2_dv is set (non-VQ on T2 entry; VQ after
+    // its codebook read is captured). But a VQ pixel drains from T2 the SAME cycle its
+    // codebook word lands (t2_adv && vq_ack, still !t2_dv) - the register-capture below is
+    // guarded by !t2_adv and never runs on that cycle, so the register still holds the
+    // INDEX word (t1_mem). Combinationally bypass to vq_resp.rdata for that drain cycle,
+    // exactly as the legacy tex_fetch_core's combinational t2_word did. Without this the
+    // codebook lookup is skipped and VQ textures fetch the raw index word.
     generate for (gi=0; gi<4; gi=gi+1) begin : out
-        assign texel[gi] = t2_word[gi];
+        assign texel[gi] = (t2_v && t2_vq && !t2_dv) ? vq_resp[gi].rdata : t2_word[gi];
     end endgenerate
-    assign out_valid = t2_v;
+    // out_valid is the DRAIN PULSE (t2_adv), NOT the T2-occupied level (t2_v). A VQ pixel
+    // whose codebook read MISSES the cache lingers in T2 for the fill (t2_v stays high, but
+    // t2_adv waits for vq_ack). The downstream decode has no stall - it fires on every
+    // out_valid cycle - so a stretched level would re-decode the same (frozen) payload each
+    // fill cycle and desync the pipe. t2_adv pulses exactly once, on the cycle texel resolves
+    // (matching the legacy tex_fetch_core, which registered its out_valid off t2_adv).
+    assign out_valid = t2_adv;
 
     // ---- data words to carry/capture (held or just-landed) ----
     wire [63:0] t0_word [0:3];
@@ -183,7 +196,12 @@ module tex_fetch4_ob import tsp_pkg::*; (
                 for (i=0;i<4;i=i+1) t2_word[i] <= t1_mem[i];   // data word (VQ overwrites below)
             end else if (t2_adv) t2_v <= 1'b0;
 
-            // ---- T2 VQ capture: codebook word lands cycle after its read accepted ----
+            // ---- T2 VQ capture: codebook word lands cycle after its read accepted. Guarded
+            //      by !t2_adv, but vq_ack now implies t2_adv (out_ready tied high -> the pixel
+            //      drains the moment its word arrives), so this branch never fires - the
+            //      combinational texel bypass above forwards vq_resp.rdata on that drain cycle
+            //      instead. Kept for symmetry with the T0 capture / in case out_ready ever
+            //      gates T2 (then a held VQ pixel would latch its word here).
             if (t2_v && t2_vq && !t2_dv && vq_ack && !t2_adv) begin
                 for (i=0;i<4;i=i+1) t2_word[i] <= vq_resp[i].rdata;
                 t2_dv <= 1'b1;
