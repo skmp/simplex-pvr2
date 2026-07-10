@@ -19,8 +19,11 @@
 // keep a single accumulation buffer); they are passed through for completeness
 // but treated as selecting the single dst buffer.
 //
-// AlphaTest (punch-through) is applied when `alpha_test` is set: if src.a <
-// alpha_ref, the fragment is killed (blend is a no-op, out=dst) and `at_pass`=0.
+// AlphaTest (punch-through) is applied when `alpha_test` is set: per refsw2 BlendingUnit,
+// col.a is clamped to 0 (src.a < PT_ALPHA_REF, at_pass=0) or 255 (>= ref) BEFORE the blend,
+// so the SRC_ALPHA coefficient of a PT fragment is all-or-nothing. This must ONLY be enabled
+// for PUNCH-THROUGH fragments - refsw2 passes pp_AlphaTest=1 solely for RM_PUNCHTHROUGH.
+// Enabling it on a translucent fragment zeroes low-alpha layers -> faint translucent.
 //
 module tsp_blend (
     input      [31:0] src,        // shaded source color (ARGB)

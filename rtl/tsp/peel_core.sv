@@ -416,7 +416,7 @@ module peel_core import tsp_pkg::*; (
             // stage-B accept duplicate (producer half only)
             .wr_valid(ti_prod && b_valid), .wr_we(b_we),
             .wr_y(b_oy), .wr_x(b_ox), .wr_tag(b_tag), .wr_invw(b_invw),
-            .wr_pt(b_peeling && (b_which==1'b0)),   // PT alpha-test enable (peel + PT list)
+            .wr_pt(b_peeling && b_which),   // PT alpha-test enable (peel + PT list; is_pt=1 => PT)
             // CLEAR (producer half only)
             .clr_valid(ti_prod && pb_clr_valid), .clr_addr(pb_clr_addr),
             .clr_depth(regs.isp_backgnd_d), .clr_tag(regs.isp_backgnd_t),
@@ -1365,13 +1365,13 @@ module peel_core import tsp_pkg::*; (
             end
             // Stage B side effects on peel_core state, from u_peel's echoed results
             // (b_pass_lp / b_more are already masked by inside & peeling in u_peel):
-            //   dt_pt (reg) <- winning fragment came from the PT list (b_which==0),
+            //   dt_pt (reg) <- winning fragment came from the PT list (b_which==1 => PT),
             //   more_to_draw <- any lane wants another peel pass (refsw do..while).
             if (b_valid) begin
                 for (l = 0; l < RAS_LANES; l = l + 1) begin
                     /* verilator lint_off WIDTH */
                     if (b_pass_lp[l])
-                        dt_pt[{27'd0,b_oy}*TILE_W + {27'd0,b_ox} + l] = (b_which==1'b0);
+                        dt_pt[{27'd0,b_oy}*TILE_W + {27'd0,b_ox} + l] = b_which;
                     if (b_more[l]) more_to_draw <= 1'b1;
                     /* verilator lint_on WIDTH */
                 end
