@@ -52,6 +52,16 @@ module tsp_setup_min (
     reg [31:0] U1,V1,U2,V2,U3,V3, COL1,COL2,COL3, OFS1,OFS2,OFS3;
     reg        g_r, tex_r, ofs_en_r;
     reg [31:0] Y2Y1,Y3Y1,X3X1,X2X1, XL1,YT1, area;
+    reg [31:0] XL2,YT2,XL3,YT3;        // anchor offsets for v2,v3 (for min-mag anchor)
+    // min-magnitude anchor for the per-plane constant c: pick the vertex k minimising
+    // max(|XLk|,|YTk|) so ddx*XLk / ddy*YTk stay small (no huge-anchor cancellation
+    // for guard-band verts). Selected offsets aXL/aYT and index anchor (0/1/2) drive
+    // the c chain (RUN stage5/6); the anchor's z*attr product is Apa[anchor]/Bpa[anchor].
+    reg [1:0]  anchor;
+    reg [31:0] aXL, aYT;
+    // anchor magnitude: max(|XL|,|YT|) reduced to biased exponent (bits[30:23]).
+    function [7:0] amag(input [31:0] xl, input [31:0] yt);
+        amag = (xl[30:23] > yt[30:23]) ? xl[30:23] : yt[30:23]; endfunction
 
     // ---------------- 4 MAC lanes: {0,1}=ctxA, {2,3}=ctxB ----------------
     reg  [31:0] l0a,l0b,l0c; reg l0s; wire [31:0] l0q;
@@ -89,6 +99,9 @@ module tsp_setup_min (
     // per-context primed vertex products (filled by the serial prime sequencer)
     reg  [31:0] Apa1,Apa2,Apa3;
     reg  [31:0] Bpa1,Bpa2,Bpa3;
+    // the anchor vertex's z*attr product (min-magnitude anchor for c)
+    wire [31:0] Apa_anch = (anchor==2'd2)?Apa3:(anchor==2'd1)?Apa2:Apa1;
+    wire [31:0] Bpa_anch = (anchor==2'd2)?Bpa3:(anchor==2'd1)?Bpa2:Bpa1;
 
     function [31:0] fneg32(input [31:0] f); fneg32={~f[31],f[30:0]}; endfunction
     function signed [8:0] chan(input [31:0] c, input [1:0] ch);
@@ -197,10 +210,23 @@ module tsp_setup_min (
                 case (gc)
                 0: begin L0(Y2,ONE,Y1,1);L1(Y3,ONE,Y1,1);L2(X3,ONE,X1,1);L3(X2,ONE,X1,1); end
                 1: begin Y2Y1<=l0q;Y3Y1<=l1q;X3X1<=l2q;X2X1<=l3q;
-                         L0(X1,ONE,XB,1);L1(Y1,ONE,YB,1); end
-                2: begin XL1<=l0q;YT1<=l1q;
-                         L0(X2X1,Y3Y1,ZERO,0);L1(X3X1,Y2Y1,ZERO,0); end
-                3: begin L0(l0q,ONE,l1q,1); end                     // area
+                         // XL1/YT1 (v1) and XL2/YT2 (v2) anchor offsets
+                         L0(X1,ONE,XB,1);L1(Y1,ONE,YB,1);L2(X2,ONE,XB,1);L3(Y2,ONE,YB,1); end
+                2: begin XL1<=l0q;YT1<=l1q;XL2<=l2q;YT2<=l3q;
+                         // area products (L0/L1) + XL3/YT3 (v3) anchor offsets (L2/L3)
+                         L0(X2X1,Y3Y1,ZERO,0);L1(X3X1,Y2Y1,ZERO,0);
+                         L2(X3,ONE,XB,1);L3(Y3,ONE,YB,1); end
+                3: begin XL3<=l2q;YT3<=l3q;
+                         L0(l0q,ONE,l1q,1);                        // area
+                         // select the min-magnitude anchor vertex (all 6 offsets ready).
+                         if (amag(l2q,l3q) < amag(XL1,YT1) && amag(l2q,l3q) < amag(XL2,YT2)) begin
+                             anchor<=2'd2; aXL<=l2q; aYT<=l3q;      // v3
+                         end else if (amag(XL2,YT2) < amag(XL1,YT1)) begin
+                             anchor<=2'd1; aXL<=XL2;  aYT<=YT2;     // v2
+                         end else begin
+                             anchor<=2'd0; aXL<=XL1;  aYT<=YT1;     // v1
+                         end
+                    end
                 4: begin area<=l0q; rc_in<=l0q; rc_req<=1;
                          nextp<=0; Ast<=7; Bst<=7; fsm<=RUN; end
                 endcase
@@ -209,7 +235,7 @@ module tsp_setup_min (
             RUN: begin
                 // ---- context A (lanes 0,1) ----
                 case (Ast)
-                0: begin Aa1<=Apa1;
+                0: begin Aa1<=Apa_anch;   // anchor vertex's z*attr (min-mag anchor)
                          L0(Apa2,ONE,Apa1,1); L1(Apa3,ONE,Apa1,1); Ast<=1; end   // da2,da3
                 1: begin Ada2<=l0q; Ada3<=l1q;
                          L0(l1q,Y2Y1,ZERO,0); L1(l0q,Y3Y1,ZERO,0); Ast<=2; end   // Aa products
@@ -221,15 +247,15 @@ module tsp_setup_min (
                 4: begin Aba<=l1q;
                          L0(fneg32(Aaa),rc_y,ZERO,0); L1(fneg32(l1q),rc_y,ZERO,0); Ast<=5; end // ddx,ddy
                 5: begin Addx<=l0q; Addy<=l1q;
-                         L0(fneg32(l0q),XL1,Aa1,0); Ast<=6; end       // t=a1-ddx*XL1
+                         L0(fneg32(l0q),aXL,Aa1,0); Ast<=6; end       // t=a_anch-ddx*XL_anch
                 6: begin At<=l0q;
-                         L1(fneg32(Addy),YT1,l0q,0); Ast<=8; end      // c=t-ddy*YT1 (stage8=emit-pending)
+                         L1(fneg32(Addy),aYT,l0q,0); Ast<=8; end      // c=t-ddy*YT_anch (stage8=emit-pending)
                 8: begin emitA=1; Ast<=7; end                        // result in l1q now
                 endcase
 
                 // ---- context B (lanes 2,3) ----
                 case (Bst)
-                0: begin Ba1<=Bpa1;
+                0: begin Ba1<=Bpa_anch;   // anchor vertex's z*attr (min-mag anchor)
                          L2(Bpa2,ONE,Bpa1,1); L3(Bpa3,ONE,Bpa1,1); Bst<=1; end
                 1: begin Bda2<=l2q; Bda3<=l3q;
                          L2(l3q,Y2Y1,ZERO,0); L3(l2q,Y3Y1,ZERO,0); Bst<=2; end
@@ -239,9 +265,9 @@ module tsp_setup_min (
                 4: begin Bba<=l3q;
                          L2(fneg32(Baa),rc_y,ZERO,0); L3(fneg32(l3q),rc_y,ZERO,0); Bst<=5; end
                 5: begin Bddx<=l2q; Bddy<=l3q;
-                         L2(fneg32(l2q),XL1,Ba1,0); Bst<=6; end
+                         L2(fneg32(l2q),aXL,Ba1,0); Bst<=6; end
                 6: begin Bt<=l2q;
-                         L3(fneg32(Bddy),YT1,l2q,0); Bst<=8; end
+                         L3(fneg32(Bddy),aYT,l2q,0); Bst<=8; end
                 8: begin emitB=1; Bst<=7; end
                 endcase
 

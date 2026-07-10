@@ -85,6 +85,16 @@ module isp_setup_streamed (
     reg [31:0] C1a[0:NS-1],C2a[0:NS-1],C3a[0:NS-1];
     reg [31:0] ddxXL1[0:NS-1],ddyYT1[0:NS-1],zc0[0:NS-1];
     reg        tl1[0:NS-1],tl2[0:NS-1],tl3[0:NS-1];
+    // min-magnitude anchor for the invW plane constant: pick the vertex k in {1,2,3}
+    // minimising max(|XLk|,|YTk|) so ddx*XLk / ddy*YTk stay small (no huge-anchor
+    // cancellation for guard-band verts). The anchor's Z/XL/YT are muxed into the
+    // c_invw chain (cyc 9..12) instead of always using vertex 1.
+    reg [31:0] aZ[0:NS-1], aXL[0:NS-1], aYT[0:NS-1];  // selected anchor Z, XL, YT
+    // PER-EDGE min-magnitude anchor for the edge constants C1/C2/C3: each edge is
+    // anchored at the smaller-magnitude of its TWO endpoints (edge1=v1..v2,
+    // edge2=v2..v3, edge3=v3..v1). Guard-band edges otherwise get a huge anchor and
+    // the coverage test goes wrong (black slivers along long edges).
+    reg [31:0] e1XL[0:NS-1],e1YT[0:NS-1], e2XL[0:NS-1],e2YT[0:NS-1], e3XL[0:NS-1],e3YT[0:NS-1];
     // per-slot outputs accumulated during the schedule (copied out at retire).
     // NOTE: dx12/23/31, dy12/23/31, ddx, ddy are NOT mirrored here - the working
     // regs DX*/DY*/ddx/ddy are each written once (cyc 8/9), last read at cyc 10/11,
@@ -179,6 +189,11 @@ module isp_setup_streamed (
     function istl(input [31:0] fdx, input [31:0] fdy);
         istl=(fzero(fdy)&&fpos(fdx))||fneg(fdy); endfunction
     function [31:0] fneg32(input [31:0] f); fneg32={~f[31],f[30:0]}; endfunction
+
+    // anchor magnitude: max(|XL|,|YT|) reduced to its biased exponent (bits[30:23]).
+    // Comparing exponents orders float magnitudes; a zero (exp 0) reads as smallest.
+    function [7:0] amag(input [31:0] xl, input [31:0] yt);
+        amag = (xl[30:23] > yt[30:23]) ? xl[30:23] : yt[30:23]; endfunction
 
     // ---------------- tile-local bbox (float->int floor), per retiring slot -------
     // SATURATED to [0,2047] - see isp_setup_min for the rationale (a plain 16-bit
@@ -342,14 +357,38 @@ module isp_setup_streamed (
                     L1(sgn[sl],d_Y1Y2[sl],ZERO,0);     // DY12
                     L2(sgn[sl],d_Y2Y3[sl],ZERO,0);     // DY23
                     L3(sgn[sl],d_Y3Y1[sl],ZERO,0);     // DY31
+                    // ---- select min-magnitude anchor vertex for the invW plane c.
+                    // All XL1..3/YT1..3 are in registers now; pick the vertex whose
+                    // max(|XL|,|YT|) exponent is smallest, mux its Z/XL/YT.
+                    if (amag(XL2[sl],YT2[sl]) < amag(XL1[sl],YT1[sl]) &&
+                        amag(XL2[sl],YT2[sl]) <= amag(XL3[sl],YT3[sl])) begin
+                        aZ[sl]<=Z2[sl]; aXL[sl]<=XL2[sl]; aYT[sl]<=YT2[sl];
+                    end else if (amag(XL3[sl],YT3[sl]) < amag(XL1[sl],YT1[sl])) begin
+                        aZ[sl]<=Z3[sl]; aXL[sl]<=XL3[sl]; aYT[sl]<=YT3[sl];
+                    end else begin
+                        aZ[sl]<=Z1[sl]; aXL[sl]<=XL1[sl]; aYT[sl]<=YT1[sl];
+                    end
+                    // ---- PER-EDGE anchor: smaller-magnitude of each edge's 2 verts.
+                    // edge1 = v1..v2 : anchor v1 or v2
+                    if (amag(XL2[sl],YT2[sl]) < amag(XL1[sl],YT1[sl]))
+                         begin e1XL[sl]<=XL2[sl]; e1YT[sl]<=YT2[sl]; end
+                    else begin e1XL[sl]<=XL1[sl]; e1YT[sl]<=YT1[sl]; end
+                    // edge2 = v2..v3 : anchor v2 or v3
+                    if (amag(XL3[sl],YT3[sl]) < amag(XL2[sl],YT2[sl]))
+                         begin e2XL[sl]<=XL3[sl]; e2YT[sl]<=YT3[sl]; end
+                    else begin e2XL[sl]<=XL2[sl]; e2YT[sl]<=YT2[sl]; end
+                    // edge3 = v3..v1 : anchor v3 or v1
+                    if (amag(XL1[sl],YT1[sl]) < amag(XL3[sl],YT3[sl]))
+                         begin e3XL[sl]<=XL1[sl]; e3YT[sl]<=YT1[sl]; end
+                    else begin e3XL[sl]<=XL3[sl]; e3YT[sl]<=YT3[sl]; end
                     cyc[sl]<=5'd9;
                 end
                 9: begin
                     DX31[sl]<=qa; DY12[sl]<=qb; DY23[sl]<=qc; DY31[sl]<=qd;
-                    L0(qb,XL1[sl],ZERO,0);            // C1a = DY12*XL1
-                    L1(qc,XL2[sl],ZERO,0);            // C2a = DY23*XL2
-                    L2(qd,XL3[sl],ZERO,0);            // C3a = DY31*XL3
-                    L3(ddx[sl],XL1[sl],ZERO,0);        // ddx*XL1
+                    L0(qb,e1XL[sl],ZERO,0);           // C1a = DY12*XL (edge1 min-mag anchor)
+                    L1(qc,e2XL[sl],ZERO,0);           // C2a = DY23*XL (edge2)
+                    L2(qd,e3XL[sl],ZERO,0);           // C3a = DY31*XL (edge3)
+                    L3(ddx[sl],aXL[sl],ZERO,0);        // ddx*XL_anchor (invW plane)
                     cyc[sl]<=5'd10;
                 end
                 10: begin
@@ -357,10 +396,10 @@ module isp_setup_streamed (
                     tl1[sl]<=istl(DX12[sl],DY12[sl]);
                     tl2[sl]<=istl(DX23[sl],DY23[sl]);
                     tl3[sl]<=istl(DX31[sl],DY31[sl]);
-                    L0(fneg32(DX12[sl]),YT1[sl],qa,0); // C1raw
-                    L1(fneg32(DX23[sl]),YT2[sl],qb,0); // C2raw
-                    L2(fneg32(DX31[sl]),YT3[sl],qc,0); // C3raw
-                    L3(ddy[sl],YT1[sl],ZERO,0);        // ddy*YT1
+                    L0(fneg32(DX12[sl]),e1YT[sl],qa,0); // C1raw (edge1 min-mag anchor)
+                    L1(fneg32(DX23[sl]),e2YT[sl],qb,0); // C2raw (edge2)
+                    L2(fneg32(DX31[sl]),e3YT[sl],qc,0); // C3raw (edge3)
+                    L3(ddy[sl],aYT[sl],ZERO,0);        // ddy*YT_anchor (invW plane)
                     cyc[sl]<=5'd11;
                 end
                 11: begin
@@ -368,7 +407,7 @@ module isp_setup_streamed (
                     o_c1[sl]<= tl1[sl] ? qa : (qa - 32'd1);
                     o_c2[sl]<= tl2[sl] ? qb : (qb - 32'd1);
                     o_c3[sl]<= tl3[sl] ? qc : (qc - 32'd1);
-                    L3(Z1[sl],ONE,ddxXL1[sl],1);       // zc0 = z1 - ddx*XL1
+                    L3(aZ[sl],ONE,ddxXL1[sl],1);       // zc0 = z_anchor - ddx*XL_anchor
                     cyc[sl]<=5'd12;
                 end
                 12: begin

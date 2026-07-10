@@ -9,6 +9,12 @@
 //   - DaZ: a zero biased-exponent operand is flushed to zero.
 //   - No inf/NaN handling. No rounding (truncate). Overflow saturates the
 //     exponent to 0xFE (max finite-ish), underflow flushes to signed zero.
+//   - x1.0 EXACT PASSTHROUGH: if an operand is exactly +1.0 (0x3F800000) the
+//     other operand passes through UNTRUNCATED (full 23-bit mantissa), just XORing
+//     the +1.0's sign (always +, so no-op) - this keeps `mac16 = a*1 +/- c` used as
+//     a plain add/sub full-precision on the multiplicand, which the difference-term
+//     accuracy relies on. (1.0 has mantissa 0, so 16-bit-truncating it is exact
+//     anyway; the win is NOT truncating the OTHER operand.)
 //
 // Combinational; the setup datapath registers the result.
 //
@@ -24,6 +30,10 @@ module fp_mul16 (
 
     wire a_zero = (ea == 8'd0);   // DaZ: subnormal/zero -> 0
     wire b_zero = (eb == 8'd0);
+
+    // exact +1.0 passthrough: |operand| == 1.0 (exp 127, mant 0).
+    wire a_one = (a[30:0] == 31'h3F800000);
+    wire b_one = (b[30:0] == 31'h3F800000);
 
     // 16-bit significands: hidden 1 + top 15 mantissa bits (truncate the rest).
     wire [15:0] sig_a = {1'b1, a[22:8]};
@@ -49,7 +59,14 @@ module fp_mul16 (
     wire underflow = (e_adj <= 0);
     wire overflow  = (e_adj >= 255);
 
+    // pass the OTHER operand through untruncated when this one is exactly |1.0|.
+    // (magnitude of the passed operand, with the combined sign.)
+    wire [31:0] pass_b = {res_sign, b[30:0]};   // a==1.0 -> y = +/- b
+    wire [31:0] pass_a = {res_sign, a[30:0]};   // b==1.0 -> y = +/- a
+
     assign y = is_zero   ? {res_sign, 31'd0}
+             : a_one     ? pass_b
+             : b_one     ? pass_a
              : underflow ? {res_sign, 31'd0}
              : overflow  ? {res_sign, 8'hFE, 23'h7FFFFF}   // saturate finite
                          : {res_sign, e_adj[7:0], mant};
