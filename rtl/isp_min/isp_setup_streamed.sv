@@ -128,10 +128,10 @@ module isp_setup_streamed (
     reg  [31:0] lb_a,lb_b,lb_c; reg lb_s;  wire [31:0] lb_q;
     reg  [31:0] lc_a,lc_b,lc_c; reg lc_s;  wire [31:0] lc_q;
     reg  [31:0] ld_a,ld_b,ld_c; reg ld_s;  wire [31:0] ld_q;
-    mac16 u_la (.clk(clk),.reset(reset),.a(la_a),.b(la_b),.c(la_c),.sub(la_s),.q(la_q));
-    mac16 u_lb (.clk(clk),.reset(reset),.a(lb_a),.b(lb_b),.c(lb_c),.sub(lb_s),.q(lb_q));
-    mac16 u_lc (.clk(clk),.reset(reset),.a(lc_a),.b(lc_b),.c(lc_c),.sub(lc_s),.q(lc_q));
-    mac16 u_ld (.clk(clk),.reset(reset),.a(ld_a),.b(ld_b),.c(ld_c),.sub(ld_s),.q(ld_q));
+    mac24 u_la (.clk(clk),.reset(reset),.a(la_a),.b(la_b),.c(la_c),.sub(la_s),.q(la_q));
+    mac24 u_lb (.clk(clk),.reset(reset),.a(lb_a),.b(lb_b),.c(lb_c),.sub(lb_s),.q(lb_q));
+    mac24 u_lc (.clk(clk),.reset(reset),.a(lc_a),.b(lc_b),.c(lc_c),.sub(lc_s),.q(lc_q));
+    mac24 u_ld (.clk(clk),.reset(reset),.a(ld_a),.b(ld_b),.c(ld_c),.sub(ld_s),.q(ld_q));
 
     // mac16 latency = 4 clocks (input-reg -> comb mul -> p_r -> sum_r -> q_r), and
     // NS=4, so the slot serviced THIS clock reads la_q..ld_q DIRECTLY: la_q now

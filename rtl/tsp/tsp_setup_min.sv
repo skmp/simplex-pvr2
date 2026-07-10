@@ -68,10 +68,10 @@ module tsp_setup_min (
     reg  [31:0] l1a,l1b,l1c; reg l1s; wire [31:0] l1q;
     reg  [31:0] l2a,l2b,l2c; reg l2s; wire [31:0] l2q;
     reg  [31:0] l3a,l3b,l3c; reg l3s; wire [31:0] l3q;
-    mac16 ml0 (.clk(clk),.reset(reset),.a(l0a),.b(l0b),.c(l0c),.sub(l0s),.q(l0q));
-    mac16 ml1 (.clk(clk),.reset(reset),.a(l1a),.b(l1b),.c(l1c),.sub(l1s),.q(l1q));
-    mac16 ml2 (.clk(clk),.reset(reset),.a(l2a),.b(l2b),.c(l2c),.sub(l2s),.q(l2q));
-    mac16 ml3 (.clk(clk),.reset(reset),.a(l3a),.b(l3b),.c(l3c),.sub(l3s),.q(l3q));
+    mac24 ml0 (.clk(clk),.reset(reset),.a(l0a),.b(l0b),.c(l0c),.sub(l0s),.q(l0q));
+    mac24 ml1 (.clk(clk),.reset(reset),.a(l1a),.b(l1b),.c(l1c),.sub(l1s),.q(l1q));
+    mac24 ml2 (.clk(clk),.reset(reset),.a(l2a),.b(l2b),.c(l2c),.sub(l2s),.q(l2q));
+    mac24 ml3 (.clk(clk),.reset(reset),.a(l3a),.b(l3b),.c(l3c),.sub(l3s),.q(l3q));
 
     // ---------------- reciprocal ----------------
     reg        rc_req; reg [31:0] rc_in; wire rc_ack; wire [31:0] rc_y;
@@ -93,7 +93,7 @@ module tsp_setup_min (
     reg               pm_uv;            // 1 = uv plane (use mul16), 0 = colour (c9)
     wire [31:0] pm_c9, pm_mul;
     fp_mul_c9 u_amc (.f(pm_z), .k(pm_k), .y(pm_c9));
-    fp_mul16  u_amu (.a(pm_z), .b(pm_u), .y(pm_mul));
+    fp_mul24  u_amu (.a(pm_z), .b(pm_u), .y(pm_mul));
     wire [31:0] pm_prod = pm_uv ? pm_mul : pm_c9;   // this cycle's z*attr product
 
     // per-context primed vertex products (filled by the serial prime sequencer)
