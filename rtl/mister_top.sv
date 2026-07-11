@@ -110,7 +110,8 @@ module mister_top import tsp_pkg::*; #(
         .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data),
         .go(go), .done(done),
         .ddr_req(ddr_req), .ddr_resp(ddr_resp),
-        .fbw_req(fbw_req), .fbw_resp(fbw_resp)
+        .fbw_req(fbw_req), .fbw_resp(fbw_resp),
+        .regs_out()                              // exposed PVR regs (unused on HW)
     );
 
     // ==================================================================
