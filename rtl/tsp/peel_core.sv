@@ -358,6 +358,7 @@ module peel_core import tsp_pkg::*; (
     reg                    b_zwdis;
     reg                    b_peeling;   // carry the peel/opaque select into stage B
     reg                    b_which;     // per-triangle is_pt (tri_is_pt) snapshot (PT => dt_pt=1)
+    wire [32*RAS_LANES-1:0] b_old_tag;  // per-lane OLD pending tag (pb) from u_peel stage B
 
     // ---- peel + color tile buffers (own the RAM ports + access-pattern enforcement) ----
     peel_tile_buffer #(.LANES(RAS_LANES)) u_peel (
@@ -369,6 +370,7 @@ module peel_core import tsp_pkg::*; (
         .b_y(b_oy), .b_x(b_ox), .b_tag(b_tag), .b_mode(b_mode),
         .b_zwdis(b_zwdis), .b_peeling(b_peeling),
         .b_pass_lp(b_pass_lp), .b_more(b_more), .b_we(b_we),
+        .b_old_tag(b_old_tag),
         // shade single-pixel read: MOVED to the split-out u_taginvw handoff buffer.
         // u_peel stays ISP-private (depth compare + PeelBuffers only); its shade port
         // is tied off.
@@ -435,6 +437,61 @@ module peel_core import tsp_pkg::*; (
         );
       end
     endgenerate
+
+    // ============ PING-PONG ISP SORT CACHE (PT/TL peel skip tracker) ==================
+    // Two isp_sort_cache copies. `sc_wr` selects the CURRENT (write) copy this pass; the
+    // OTHER copy holds the PREVIOUS pass's result (read for the before-fetch skip test).
+    // They swap each peel pass (S_PEEL_BUF_RUN completion) and both invalidate at the
+    // tile's peel start (S_PEEL_INIT). See isp_sort_cache.sv. VERILATOR-ONLY.
+`ifndef SYNTHESIS
+    reg          sc_wr;             // 0/1: which copy is the current (write) copy
+    reg  [1:0]   sc_clr;            // per-copy bulk-clear pulse
+    // before-fetch skip lookup (on the PREVIOUS copy = ~sc_wr)
+    wire [31:0]  sc_lk_tag = it_trio.tag;
+    wire [1:0]   sc_lk_hit, sc_lk_done;
+    wire         sc_prev_hit  = sc_lk_hit [~sc_wr];
+    wire         sc_prev_done = sc_lk_done[~sc_wr];
+    // a peel triangle already fully processed last pass -> skip fetch/setup/scan.
+    // +nosortskip disables the skip (still tracks/measures) to isolate wiring from policy.
+    reg          sc_skip_en;
+    initial      sc_skip_en = !$test$plusargs("nosortskip");
+    wire         sc_skip = sc_skip_en && peeling && sc_prev_hit && sc_prev_done;
+`ifndef SYNTHESIS
+    integer      sc_nskip = 0;
+`endif
+    // SET (done=1) into the CURRENT copy. Port A = skip-forward (iterator skip); port B =
+    // end-of-raster "zero accepts" (a triangle that rastered but won NO pixels this pass is
+    // fully behind the reference -> DONE). Two ports because a skip and an end-of-raster can
+    // fire the same cycle for DIFFERENT triangles.
+    reg          sc_set_v,   sc_setb_v;
+    reg  [31:0]  sc_set_tag, sc_setb_tag;
+    // per-triangle raster trackers: tri_acc = won >=1 pixel (any b_pass_lp); tri_more = any
+    // lane reported MoreToDraw (b_more) for this triangle -> it has FUTURE-pass work (it is
+    // in front of / nearer than the current reference and not yet reached). A triangle is
+    // DONE only if it produced NEITHER this pass (fully behind the reference, peeled).
+    reg          tri_acc, tri_more;
+    // CLR1 unused with the zero-accept policy (the fresh per-pass cache + only-SET-on-zero-
+    // accept fully expresses "done"); tie off.
+    wire [RAS_LANES-1:0]    sc_c1_v   = {RAS_LANES{1'b0}};
+    wire [32*RAS_LANES-1:0] sc_c1_tag = '0;
+    genvar scc;
+    generate
+        for (scc = 0; scc < 2; scc = scc + 1) begin : sortc
+            wire is_wr = (sc_wr == scc[0]);
+            isp_sort_cache #(.LANES(RAS_LANES)) u_sc (
+                .clk(clk), .reset(reset),
+                .clr(sc_clr[scc]),
+                .lk_tag(sc_lk_tag), .lk_hit(sc_lk_hit[scc]), .lk_done(sc_lk_done[scc]),
+                // SET / CLR1 only apply to the current (write) copy
+                .set_valid(is_wr && sc_set_v),     .set_tag(sc_set_tag),
+                .set_b_valid(is_wr && sc_setb_v),  .set_b_tag(sc_setb_tag),
+                .c1_valid(is_wr ? sc_c1_v : {RAS_LANES{1'b0}}), .c1_tag(sc_c1_tag)
+            );
+        end
+    endgenerate
+`else
+    wire sc_skip = 1'b0;   // synth: feature disabled (no sort cache)
+`endif
 
     // ---- PING-PONG color buffer (2 halves): TSP blend fills the half of the tile it
     // is shading (col_prod = tsp_half); the decoupled video-out engine drains col_vo.
@@ -1130,6 +1187,7 @@ module peel_core import tsp_pkg::*; (
     end
     final if (fbd_en && fbd_fd!=0) begin $fflush(fbd_fd); $fclose(fbd_fd);
         $display("[peel_core] framebuffer writes: %0d -> %0s", fbd_n, fbd_name); end
+    final $display("[peel_core] sort-cache: %0d triangle(s) skipped (peel fetch/setup/scan avoided)", sc_nskip);
 `endif
 
     // ============ COMBINATIONAL buffer request ports (valid THIS cycle) ============
@@ -1220,6 +1278,11 @@ module peel_core import tsp_pkg::*; (
             eq_head<=0; eq_tail<=0; eq_count<=0;
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
+`ifndef SYNTHESIS
+            sc_wr<=1'b0; sc_clr<=2'b11;
+            sc_set_v<=1'b0; sc_set_tag<=32'd0; sc_setb_v<=1'b0; sc_setb_tag<=32'd0;
+            tri_acc<=1'b0; tri_more<=1'b0;
+`endif
             b_valid<=1'b0; cb_valid<=1'b0;
             cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
             col_post<=1'b0;                   // color post-to-VO intent
@@ -1328,6 +1391,9 @@ module peel_core import tsp_pkg::*; (
 `endif
             done<=0; ra_start<=0; ol_start<=0;
             spv_start<=1'b0; spv_rd_done<=1'b0;  // 1-cyc spanner start / ring-free strobes
+`ifndef SYNTHESIS
+            sc_clr<=2'b00; sc_set_v<=1'b0; sc_setb_v<=1'b0;  // 1-cyc sort-cache strobes
+`endif
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             eq_push = 1'b0;
             col_post<=1'b0;                   // 1-cyc: color-buffer post-to-VO intent
@@ -1378,6 +1444,14 @@ module peel_core import tsp_pkg::*; (
                     if (b_more[l]) more_to_draw <= 1'b1;
                     /* verilator lint_on WIDTH */
                 end
+`ifndef SYNTHESIS
+                // SORT-CACHE: track the ACTIVE peel triangle (b_tag==tri_tag) this pass.
+                //   any accept  -> won a pixel now (not done)
+                //   any b_more  -> has future-pass work (nearer than ref / displaced staged)
+                // RS_DRAIN marks done only if BOTH stayed 0 (fully behind ref, peeled).
+                if (b_peeling && (|b_pass_lp)) tri_acc  <= 1'b1;
+                if (b_peeling && (|b_more))    tri_more <= 1'b1;
+`endif
             end
             ras_inflight <= ras_inflight + (ras_in_valid ? 1 : 0) - (ras_out_valid ? 1 : 0);
 
@@ -1656,6 +1730,12 @@ module peel_core import tsp_pkg::*; (
                 peel_pass  <= 8'd0;  // reset the pass counter for THIS tile's peel
                 first_peel <= 1'b1;  // fold SetTagToMax into the first PeelBuffers
                 st <= S_PEEL_BUF;    // S_PEEL_BUF gates on !ti_ready[htile]
+`ifndef SYNTHESIS
+                // new tile's peel: invalidate BOTH sort-cache copies + reset ping-pong so
+                // no cross-tile tag falsely hits. sc_wr=0 -> pass 1 writes copy 0, reads
+                // copy 1 (just-cleared -> every lookup MISS -> nothing skipped on pass 1).
+                sc_clr <= 2'b11; sc_wr <= 1'b0;
+`endif
             end
 
             // PeelBuffers(FLT_MAX, 0): per pixel depth2<-depth, tag2<-tag (or
@@ -1691,6 +1771,16 @@ module peel_core import tsp_pkg::*; (
                     // whole tile transformed -> issue the object list for this pass.
                     first_peel <= 1'b0;
                     peel_pass  <= peel_pass + 8'd1;
+`ifndef SYNTHESIS
+                    // SORT-CACHE ping-pong swap at the START of each pass AFTER the first
+                    // (peel_pass!=0 => this PeelBuffers precedes pass 2, 3, ...). The copy
+                    // just filled (sc_wr) becomes the PREV copy read for this pass's skip
+                    // test; the other becomes the new CURRENT (write) copy -> clear it.
+                    if (peel_pass != 8'd0) begin
+                        sc_wr        <= ~sc_wr;
+                        sc_clr[~sc_wr] <= 1'b1;    // clear the incoming write copy
+                    end
+`endif
                     // start with the PT list if present, else the TL list.
                     if (has_pt) begin
                         peel_which <= 1'b0;                 // rasterizing PT list
@@ -2121,6 +2211,18 @@ module peel_core import tsp_pkg::*; (
             end
 
             // push emitted triangles into the tri FIFO (hold-until-space handshake)
+`ifndef SYNTHESIS
+            // SORT-CACHE SKIP: on a peel pass, a triangle whose prev-pass cache entry is
+            // {hit, done=1} has no visible pixels left -> DON'T fetch/setup/scan it. Just
+            // ack the iterator and copy its done=1 forward into the current-pass cache so
+            // the skip propagates to later passes. No fq push, no fq_full gate needed.
+            if (it_trio.triangle_ready && !it_ack.triangle_done && sc_skip) begin
+                it_ack.triangle_done <= 1'b1;
+                sc_set_v   <= 1'b1;             // port A: copy-forward done=1 (current copy)
+                sc_set_tag <= it_trio.tag;
+                sc_nskip   <= sc_nskip + 1;
+            end else
+`endif
             if (it_trio.triangle_ready && !fq_full && !it_ack.triangle_done) begin
                 fq_ram[fq_tail[2:0]] <= fq_wrw;   // one packed M10K word
                 it_ack.triangle_done <= 1'b1;   // advance iterator to next tri
@@ -2207,6 +2309,12 @@ module peel_core import tsp_pkg::*; (
                 isp_word<=pq_rdw[QF_ISP +:32]; tri_tag<=pq_rdw[QF_TAG +:32];
                 tri_is_pt<=pq_rdw[QF_PT];
                 tri_count<=tri_count+1;
+`ifndef SYNTHESIS
+                // SORT-CACHE before-raster: clear the per-triangle accept/more trackers.
+                // If the raster produces ZERO accepts AND ZERO MoreToDraw, RS_DRAIN marks it
+                // done=1 (fully behind the reference, nothing left -> skip next pass).
+                tri_acc <= 1'b0; tri_more <= 1'b0;
+`endif
                 // chunk-aligned x range + row range from the bbox
                 rbx0 <= pq_rdw[QF_BX0 +:5] & 5'(~(RAS_LANES-1));
                 rbx1 <= pq_rdw[QF_BX1 +:5] & 5'(~(RAS_LANES-1));
@@ -2228,7 +2336,19 @@ module peel_core import tsp_pkg::*; (
             // the NEXT triangle's stage-A read races this triangle's last stage-B
             // write to the same peel-RAM word (RAW -> stale depth -> corruption).
             RS_DRAIN: if (ras_inflight==0 && !ras_in_valid && !ras_out_valid
-                          && !b_valid) rs_st<=RS_IDLE;
+                          && !b_valid) begin
+                rs_st<=RS_IDLE;
+`ifndef SYNTHESIS
+                // triangle fully rastered: DONE only if it won ZERO pixels AND requested no
+                // further pass (tri_acc==0 && tri_more==0) -> entirely behind the reference,
+                // peeled, nothing left -> skip next pass. A triangle with accepts OR more
+                // leaves no entry (fresh per-pass cache -> miss -> reprocessed), as needed.
+                if (peeling && !tri_acc && !tri_more) begin
+                    sc_setb_v   <= 1'b1;
+                    sc_setb_tag <= tri_tag;
+                end
+`endif
+            end
             endcase
 
             // ---- FIFO count maintenance (single update; push/pop may coincide) ----

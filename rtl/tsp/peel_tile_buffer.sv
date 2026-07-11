@@ -58,6 +58,11 @@ module peel_tile_buffer import tsp_pkg::*; #(
     // exactly the lanes this module writes back, so the split-out u_taginvw handoff
     // buffer can DUPLICATE the {valid,tag,invW} write with an identical mask.
     output     [LANES-1:0]      b_we,
+    // per-lane OLD PENDING TAG (pb = tagBufferA at that pixel, BEFORE this stage-B
+    // write). On a peel accept the old pb is the fragment being displaced this pass;
+    // the isp_sort_cache uses it to clear the displaced triangle's "done" bit.
+    // Valid on the same lanes as b_pass_lp (only meaningful where a peel write lands).
+    output     [32*LANES-1:0]   b_old_tag,
 
     // ---- SHADE: single-pixel read (id = {y[4:0], x[4:0]}) ----
     input                       sh_rd_valid,
@@ -155,6 +160,15 @@ module peel_tile_buffer import tsp_pkg::*; #(
     // duplicate the accepted {valid,tag,invW} write with an identical mask.
     assign b_we = ras_b_valid ? (b_inside &
                   (b_peeling ? ras_pass_lp : ras_pass_op)) : '0;
+
+    // per-lane OLD PENDING TAG = tagBufferA (pb) currently at each pixel, read back in
+    // stage B. This is the fragment about to be displaced where a peel accept lands.
+    genvar gt;
+    generate
+        for (gt = 0; gt < NB; gt = gt + 1) begin : oldtag
+            assign b_old_tag[32*gt +: 32] = f_tag(rdata, gt);
+        end
+    endgenerate
 
     // -------------------- READ port mux --------------------
     always @(*) begin
