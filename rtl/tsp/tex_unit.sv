@@ -176,16 +176,29 @@ module tex_unit import tsp_pkg::*; #(
     tex_add_mip u_am (.texel_offset(r_off),.mip_add(r1_mip),.fbpp_shr(r1_fbpp),
                       .byte_offset(byte_off));
 
+    // TEXEL offset (twiddle+mip, in TEXELS, BEFORE the fbpp byte-scale) low bits per corner.
+    // tex_decode's `offset` indexes the SUB-WORD (16b lane = offset[1:0], 8b = offset[2:0],
+    // 4b nibble = offset[3:0]) - refsw's DecodeTextel(memtel, offset) with offset = the
+    // TexOffsetGen texel offset, NOT the byte offset. Feeding byte_off[3:0] (= (texel<<1)>>
+    // fbpp_shr low bits) picks the WRONG lane (for 16bpp the <<1 shifts the lane selector,
+    // so adjacent-U twiddled corners collapse to the same 16b lane -> wrong texels).
+    wire [3:0] texoff_lo [0:3];
+    genvar gto;
+    generate for (gto=0; gto<4; gto=gto+1) begin : txlo
+        assign texoff_lo[gto] = (r_off[gto] + r1_mip[20:0]) & 4'hF;
+    end endgenerate
+
     // ---- ADDRESS REGISTER (critical-path cut #2): splits add_mip from the cache-read
     //      cone (fetch addr adder -> M10K addr). Frozen with the front (holds the fetch
     //      input stable while !fetch_ready, as the streaming protocol requires).
     reg [21:0] r_boff [0:3];
+    reg [3:0]  r_toff [0:3];        // texel-offset low bits (for tex_decode sub-word select)
     reg [20:0] r_texaddr, r_vqaddr;
     reg        r_tex, r_vq, r_iss;
     always @(posedge clk) begin
         if (reset) r_iss <= 1'b0;
         else if (!front_stall) begin
-            for (d=0; d<4; d=d+1) r_boff[d] <= byte_off[d];
+            for (d=0; d<4; d=d+1) begin r_boff[d] <= byte_off[d]; r_toff[d] <= texoff_lo[d]; end
             r_texaddr <= r1_texaddr; r_vqaddr <= r1_vqaddr; r_tex <= r1_tex; r_vq <= r1_vq;
             r_iss <= r1_iss;
         end
@@ -250,8 +263,8 @@ module tex_unit import tsp_pkg::*; #(
     // (r_iss): the offset lane bits come from the REGISTERED r_boff (what the fetch reads),
     // and the config from the r_iss-aligned i_*. Both freeze with the front (front_stall).
     always @(posedge clk) if (!front_stall) begin
-        p_off[0][0]<=r_boff[0][3:0]; p_off[1][0]<=r_boff[1][3:0];
-        p_off[2][0]<=r_boff[2][3:0]; p_off[3][0]<=r_boff[3][3:0];
+        p_off[0][0]<=r_toff[0]; p_off[1][0]<=r_toff[1];
+        p_off[2][0]<=r_toff[2]; p_off[3][0]<=r_toff[3];
         p_pixfmt[0]<=i_pixfmt; p_palfmt[0]<=i_palfmt; p_scan[0]<=i_scan; p_palsel[0]<=i_palsel;
         p_uf[0]<=i_uf; p_vf[0]<=i_vf; p_filt[0]<=i_filt; p_igna[0]<=i_igna; p_tex[0]<=i_tex; p_id[0]<=i_id;
         for (d=1; d<FETCHLAT; d=d+1) begin
