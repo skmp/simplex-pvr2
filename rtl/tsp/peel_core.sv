@@ -323,18 +323,50 @@ module peel_core import tsp_pkg::*; (
     endfunction
 
     wire [4:0] ras_ox, ras_oy;     // coords echoed with the result chunk
+    // probe (the "257th step"), reusing this pipeline's FP datapath:
+    //   * cr_issue : a 1-cycle pulse into the pipe's in_valid (issue the probe once).
+    //   * ras_probe: a LEVEL held for the whole RS_CORNER window -> selects the per-edge
+    //     max-corner witnesses in u_line (coeffs are stable across the window, so a level
+    //     is timing-robust vs a per-stage-aligned pulse). probe_reject lands LAT later.
+    reg        cr_issue;          // 1-cycle probe issue pulse (in RS_CORNER)
+    reg        cr_seen;           // this triangle's probe verdict already sampled
+    wire ras_probe = (rs_st == RS_CORNER) && cr_en;   // witness-select level for the issue
+    wire ras_probe_reject, ras_probe_valid;
+    // Verdict timing: the probe verdict is valid a FIXED number of cycles after the issue.
+    // Instead of consuming the (un-triangle-tagged) probe_valid bus - which could belong to
+    // a PRIOR triangle's probe when a short sweep finished early - run a per-triangle
+    // countdown started at the probe issue. When it expires we sample ras_probe_reject; it
+    // is guaranteed to be THIS triangle's verdict (only one probe in flight, serial sweeps).
+    // The countdown runs CONCURRENTLY with the sweep (no stall). CR_LAT = probe issue->verdict.
+    // CR_LAT chosen so cr_cnt==1 (the sample) lands exactly on the cycle probe_reject pulses
+    // (LAT=6 pipe: issue -> verdict valid 7 cycles later). Set in RS_CORNER, decremented each
+    // RS_RAS cycle; read cr_cnt==1 on cyc7 after issue. A sweep that ends before then (tiny
+    // bbox) simply never samples the (moot) verdict - correct, no stale-verdict leak.
+    localparam integer CR_LAT = 7;
+    reg  [3:0] cr_cnt;            // per-triangle verdict countdown (0 => idle/expired)
     isp_raster_line #(.LANES(RAS_LANES)) u_line (
         .clk(clk), .reset(reset),
-        .in_valid(ras_in_valid), .y(ras_y), .x_base(ras_x),
+        .in_valid(ras_in_valid || cr_issue), .y(ras_y), .x_base(ras_x),
         .c1(isp_c1), .c2(isp_c2), .c3(isp_c3), .c4(isp_c4),
         .dx12(isp_dx12),.dx23(isp_dx23),.dx31(isp_dx31),.dx41(isp_dx41),
         .dy12(isp_dy12),.dy23(isp_dy23),.dy31(isp_dy31),.dy41(isp_dy41),
         .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
+        .probe(ras_probe), .probe_reject(ras_probe_reject), .probe_valid(ras_probe_valid),
         .out_valid(ras_out_valid),
         .inside_mask(ras_inside),
         .invw_flat(ras_invw_flat),
         .out_x(ras_ox), .out_y(ras_oy)
     );
+
+    // per-tile trivial reject (the "257th step") is computed by REUSING u_line's FP
+    // datapath in probe mode (see the isp_raster_line instance below); RS_CORNER issues
+    // the probe and waits for ras_probe_reject. +nocornercull disables it.
+    reg cr_en;
+`ifndef SYNTHESIS
+    initial cr_en = !$test$plusargs("nocornercull");
+`else
+    initial cr_en = 1'b1;
+`endif
 
     wire [2:0] depth_mode = isp_word[31:29];
     wire       zwrite_dis = isp_word[26];
@@ -753,7 +785,10 @@ module peel_core import tsp_pkg::*; (
     // RS_POP absorbs the 1-cycle registered-read latency of the M10K plane FIFO:
     // RS_IDLE issues the read (pq_ram[pq_head] -> pq_rdw) and advances head; RS_POP
     // splices pq_rdw into the active plane regs and starts the sweep.
-    localparam RS_IDLE=0, RS_POP=1, RS_RAS=2, RS_DRAIN=3;  reg [2:0] rs_st;
+    // RS_CORNER: the "257th step" per-tile trivial reject. After RS_POP latches the edge
+    // coeffs, evaluate isp_corner_reject; if the whole tile is outside the triangle, skip
+    // the 256-chunk sweep entirely (-> RS_IDLE, no raster). +nocornercull disables it.
+    localparam RS_IDLE=0, RS_POP=1, RS_CORNER=4, RS_RAS=2, RS_DRAIN=3;  reg [2:0] rs_st;
 
     // ---- unified PT+TL layer-peel pass loop (TB-FSM; refsw do..while(MoreToDraw)) ----
     reg        more_to_draw;      // set by the raster consumer during a peel pass
@@ -1022,6 +1057,8 @@ module peel_core import tsp_pkg::*; (
     integer pc_ras_pop;         // RS_POP: plane-FIFO pop + splice
     integer pc_ras_drain;       // RS_DRAIN: raster pipe drain
     integer pc_ras_idle;        // RS_IDLE: not rasterizing (waiting / nothing to do)
+    integer pc_ras_corner;      // RS_CORNER: per-triangle 4-corner probe wait (8 cyc/tri)
+    integer pc_corner_cull;     // triangles trivially rejected by the 4-corner test
     // TSP / shade engine (classified by top FSM `st` when in a shade sub-phase)
     integer pc_sh_present;      // SH_PRESENT accepted: pixel issued into shade pipe
     integer pc_sh_tex_stall;    // SH_PRESENT && pp_stall: blocked on texture fetch
@@ -1130,6 +1167,7 @@ module peel_core import tsp_pkg::*; (
     end
     final if (fbd_en && fbd_fd!=0) begin $fflush(fbd_fd); $fclose(fbd_fd);
         $display("[peel_core] framebuffer writes: %0d -> %0s", fbd_n, fbd_name); end
+    final $display("[peel_core] corner-cull: %0d triangle(s) trivially rejected (256-chunk sweep skipped)", pc_corner_cull);
 `endif
 
     // ============ COMBINATIONAL buffer request ports (valid THIS cycle) ============
@@ -1200,6 +1238,7 @@ module peel_core import tsp_pkg::*; (
 `ifndef SYNTHESIS
             pc_total<=0;
             pc_ras_active<=0; pc_ras_pop<=0; pc_ras_drain<=0; pc_ras_idle<=0;
+            pc_ras_corner<=0; pc_corner_cull<=0; cr_issue<=1'b0; cr_seen<=1'b0; cr_cnt<=4'd0;
             pc_sh_present<=0; pc_sh_tex_stall<=0; pc_sh_setup_wait<=0; pc_sh_fetch<=0;
             pc_sh_look<=0; pc_sh_drain<=0; pc_sh_none<=0;
             pc_top_clear<=0; pc_top_peelbuf<=0; pc_top_flush<=0; pc_top_ol<=0;
@@ -1254,10 +1293,11 @@ module peel_core import tsp_pkg::*; (
 
                 // ISP / raster engine (by rs_st)
                 case (rs_st)
-                    RS_RAS:   pc_ras_active <= pc_ras_active + 1;
-                    RS_POP:   pc_ras_pop    <= pc_ras_pop    + 1;
-                    RS_DRAIN: pc_ras_drain  <= pc_ras_drain  + 1;
-                    default:  pc_ras_idle   <= pc_ras_idle   + 1;   // RS_IDLE
+                    RS_RAS:    pc_ras_active <= pc_ras_active + 1;
+                    RS_POP:    pc_ras_pop    <= pc_ras_pop    + 1;
+                    RS_DRAIN:  pc_ras_drain  <= pc_ras_drain  + 1;
+                    RS_CORNER: pc_ras_corner <= pc_ras_corner + 1;  // 257th-step probe wait
+                    default:   pc_ras_idle   <= pc_ras_idle   + 1;   // RS_IDLE
                 endcase
 
                 // TSP / shade engine now SPLIT: the SPANNER resolves planes (its miss
@@ -1716,10 +1756,13 @@ module peel_core import tsp_pkg::*; (
                          tri_count, cull_count, hit_count, miss_count);
 `ifndef SYNTHESIS
                 $display("=== PERF (active clks=%0d) ===", pc_total);
-                $display("  ISP/raster:  RAS=%0d (%0d%%)  POP=%0d  DRAIN=%0d  IDLE=%0d (%0d%%)",
+                $display("  ISP/raster:  RAS=%0d (%0d%%)  POP=%0d  DRAIN=%0d  CORNER=%0d  IDLE=%0d (%0d%%)",
                     pc_ras_active, (pc_ras_active*100)/(pc_total?pc_total:1),
-                    pc_ras_pop, pc_ras_drain,
+                    pc_ras_pop, pc_ras_drain, pc_ras_corner,
                     pc_ras_idle, (pc_ras_idle*100)/(pc_total?pc_total:1));
+                $display("  CORNER-CULL: culled=%0d / probed=%0d tris (corner-wait=%0d cyc = %0d/tri; sweep saved ~%0d cyc)",
+                    pc_corner_cull, tri_count, pc_ras_corner,
+                    tri_count ? pc_ras_corner/tri_count : 0, pc_corner_cull*256);
                 // WHY is raster IDLE? Partition RS_IDLE by top `st`. %% is of the IDLE total.
                 // SHADE = overlapped (good: raster done, spanner/reader still shading); the
                 // rest is serial ISP overhead with no downstream running.
@@ -2213,15 +2256,54 @@ module peel_core import tsp_pkg::*; (
                 rby1 <= pq_rdw[QF_BY1 +:5];
                 ras_y <= pq_rdw[QF_BY0 +:5];
                 ras_x <= pq_rdw[QF_BX0 +:5] & 5'(~(RAS_LANES-1));
+                // PIPELINED "257th step": spend ONE cycle (RS_CORNER) issuing the probe into
+                // u_line, then sweep IMMEDIATELY (RS_RAS) WITHOUT waiting for the verdict.
+                // The probe rides the shared raster pipeline alongside the first sweep chunks;
+                // its reject verdict lands ~LAT cycles into the sweep. A rejectable triangle
+                // has NO covered pixel in the tile, so every chunk's b_we is all-zero -> the
+                // early sweep writes are harmless no-ops. When the reject verdict arrives we
+                // ABORT the remaining sweep (jump to DRAIN), saving the rest of the 256.
+                //
+                cr_issue <= cr_en;     // fire the probe next cycle (RS_CORNER)
+                cr_seen  <= 1'b0;      // verdict not yet sampled for this triangle
+                cr_cnt   <= 4'd0;
+                rs_st <= cr_en ? RS_CORNER : RS_RAS;
+            end
+            // one dedicated probe-issue cycle (no sweep chunk this cycle so the probe gets a
+            // clean pipeline slot), then straight into the overlapped sweep. Start the
+            // per-triangle verdict countdown here (probe enters the pipe THIS cycle).
+            RS_CORNER: begin
+                cr_issue <= 1'b0;      // 1-cycle probe issue pulse
+                cr_cnt   <= CR_LAT[3:0];
                 rs_st <= RS_RAS;
             end
             RS_RAS: begin
-                if (ras_x == rbx1) begin
-                    ras_x <= rbx0;
-                    if (ras_y == rby1) rs_st <= RS_DRAIN;
-                    else ras_y <= ras_y + 5'd1;
-                end else begin
-                    ras_x <= ras_x + 5'(RAS_LANES);
+                // Overlapped reject: the verdict lands cr_cnt cycles after issue, sampled by
+                // the countdown (guaranteed THIS triangle's verdict - one probe in flight,
+                // serial sweeps). Runs concurrently with the sweep, no stall. On reject ABORT
+                // (stop issuing remaining chunks -> DRAIN the in-flight no-op writes). If the
+                // sweep ends before the countdown expires (tiny bbox), we just leave RS_RAS;
+                // the moot verdict is never sampled (correct - a finished sweep can't abort).
+                if (cr_cnt != 4'd0) cr_cnt <= cr_cnt - 4'd1;
+                if (cr_en && !cr_seen && cr_cnt == 4'd1) begin
+                    cr_seen <= 1'b1;
+`ifndef SYNTHESIS
+                    if ($test$plusargs("probedump"))
+                        $display("[PROBE] tile(%0d,%0d) rej=%b", cur_tx, cur_ty, ras_probe_reject);
+`endif
+                    if (ras_probe_reject) begin
+                        pc_corner_cull <= pc_corner_cull + 1;
+                        rs_st <= RS_DRAIN;             // abort the rest of the sweep
+                    end
+                end
+                if (!(cr_en && !cr_seen && cr_cnt == 4'd1 && ras_probe_reject)) begin
+                    if (ras_x == rbx1) begin
+                        ras_x <= rbx0;
+                        if (ras_y == rby1) rs_st <= RS_DRAIN;
+                        else ras_y <= ras_y + 5'd1;
+                    end else begin
+                        ras_x <= ras_x + 5'(RAS_LANES);
+                    end
                 end
             end
             // also wait for the depth-cmp write-back (stage B, b_valid) to land, else

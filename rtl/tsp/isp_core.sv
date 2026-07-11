@@ -281,6 +281,7 @@ module isp_core import tsp_pkg::*; (
         .dx12(isp_dx12),.dx23(isp_dx23),.dx31(isp_dx31),.dx41(isp_dx41),
         .dy12(isp_dy12),.dy23(isp_dy23),.dy31(isp_dy31),.dy41(isp_dy41),
         .ddx(isp_ddx_invw),.ddy(isp_ddy_invw),.c_invw(isp_c_invw),
+        .probe(1'b0), .probe_reject(), .probe_valid(),   // corner-probe unused in isp_core
         .out_valid(ras_out_valid),
         .inside_mask(ras_inside),
         .invw_flat(ras_invw_flat),

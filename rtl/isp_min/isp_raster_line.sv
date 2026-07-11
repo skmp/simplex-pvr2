@@ -33,6 +33,16 @@ module isp_raster_line #(
     input      [31:0] dy12,dy23,dy31,dy41,
     input      [31:0] ddx,ddy,c_invw,
 
+    // ---- CORNER-PROBE mode (the "257th step"): trivial per-tile reject, REUSING this
+    // pipeline's adders/multipliers (no duplicate FP hw). When `probe` is asserted with
+    // `in_valid`, s1/s3 evaluate each edge at ITS OWN max corner instead of the chunk grid:
+    // Xhs_n is affine, so the tile max is at y*=(DXn>=0?31:0), x*=(DYn<=0?31:0). If any
+    // edge's max-corner Xhs_n < 0, the whole 32x32 tile is outside that edge -> reject.
+    // `probe_reject` is valid together with out_valid (same LAT) for a probe issue.
+    input             probe,
+    output reg               probe_reject,   // reject verdict (valid when probe_valid)
+    output reg               probe_valid,    // 1-cyc: a probe issue's verdict is on the bus
+
     output reg               out_valid,
     output reg [LANES-1:0]    inside_mask,
     output reg [32*LANES-1:0] invw_flat,
@@ -48,21 +58,39 @@ module isp_raster_line #(
     // outputs are co-aligned for back-to-back streaming.
     reg [LANES-1:0]    im0;
     reg [32*LANES-1:0] iw0;
+    reg                pr_rej0;   // probe reject at the s4b stage (lane 0), retimed below
 
     function fpos_or_zero(input [31:0] f); fpos_or_zero = ~f[31]; endfunction
 
     reg [LAT-1:0] vpipe;
+    reg [LAT-1:0] ppipe;   // probe flag, LAT-deep (aligned with vpipe)
     // x_base / y travel the full LAT-deep pipe so they arrive with out_valid.
     reg [4:0] xpipe [0:LAT-1];
     reg [4:0] ypipe [0:LAT-1];
     integer pp;
     always @(posedge clk) begin
-        if (reset) vpipe <= '0;
-        else       vpipe <= {vpipe[LAT-2:0], in_valid};
+        if (reset) begin vpipe <= '0; ppipe <= '0; end
+        else begin
+            vpipe <= {vpipe[LAT-2:0], in_valid};
+            ppipe <= {ppipe[LAT-2:0], (in_valid && probe)};
+        end
         xpipe[0] <= x_base; ypipe[0] <= y;
         for (pp = 1; pp < LAT; pp = pp + 1) begin
             xpipe[pp] <= xpipe[pp-1]; ypipe[pp] <= ypipe[pp-1];
         end
+    end
+    // PROBE flag must travel WITH the data so the witness selects fire at the right stage
+    // (the sweep chunks share this pipeline right behind the probe and must NOT use the
+    // witnesses). s1 witness uses the live issue-cycle `probe` (s1 muls are at issue). The
+    // s3 x-witness mul runs at cyc3 (same stage as xb2b, 3 regs after x_base), so delay the
+    // issue flag exactly 3 cycles to align. (A 2-cycle delay is one cycle EARLY -> the mul
+    // uses the sweep x instead of the witness -> spurious rejects; only masked when `probe`
+    // was held as a level across the whole probe transit.)
+    wire pr_s1 = probe;                 // s1 y-witness select (combinational at issue)
+    reg  pr_a, pr_b, pr_s3;             // s3 x-witness select (issue flag, 3 regs deep)
+    always @(posedge clk) begin
+        if (reset) begin pr_a <= 1'b0; pr_b <= 1'b0; pr_s3 <= 1'b0; end
+        else begin pr_a <= (in_valid && probe); pr_b <= pr_a; pr_s3 <= pr_b; end
     end
 
     // carry x_base to stage 3 (line base stages don't need it)
@@ -70,11 +98,17 @@ module isp_raster_line #(
     always @(posedge clk) begin xb1<=x_base; xb2a<=xb1; xb2b<=xb2a; end
 
     // ---- s1: DXn*y, ddy*y ----
+    // In PROBE mode each edge uses its own y-witness (y*=31 if DXn>=0 else 0) so the
+    // pipeline evaluates that edge's tile-max corner; else the normal shared chunk row y.
+    wire [4:0] y12 = pr_s1 ? (dx12[31] ? 5'd0 : 5'd31) : y;
+    wire [4:0] y23 = pr_s1 ? (dx23[31] ? 5'd0 : 5'd31) : y;
+    wire [4:0] y31 = pr_s1 ? (dx31[31] ? 5'd0 : 5'd31) : y;
+    wire [4:0] y41 = pr_s1 ? (dx41[31] ? 5'd0 : 5'd31) : y;
     wire [31:0] dx12y_c,dx23y_c,dx31y_c,dx41y_c, ddyy_c;
-    fp_mul_i5 m_dx12y(.f(dx12),.k(y),.y(dx12y_c));
-    fp_mul_i5 m_dx23y(.f(dx23),.k(y),.y(dx23y_c));
-    fp_mul_i5 m_dx31y(.f(dx31),.k(y),.y(dx31y_c));
-    fp_mul_i5 m_dx41y(.f(dx41),.k(y),.y(dx41y_c));
+    fp_mul_i5 m_dx12y(.f(dx12),.k(y12),.y(dx12y_c));
+    fp_mul_i5 m_dx23y(.f(dx23),.k(y23),.y(dx23y_c));
+    fp_mul_i5 m_dx31y(.f(dx31),.k(y31),.y(dx31y_c));
+    fp_mul_i5 m_dx41y(.f(dx41),.k(y41),.y(dx41y_c));
     fp_mul_i5 m_ddyy (.f(ddy), .k(y),.y(ddyy_c));
     reg [31:0] dx12y,dx23y,dx31y,dx41y, ddyy;
     reg [31:0] c1_1,c2_1,c3_1,c4_1,cinvw_1;
@@ -128,11 +162,18 @@ module isp_raster_line #(
       for (gi = 0; gi < LANES; gi = gi + 1) begin : px
         wire [4:0] x = xb2b + gi[4:0];       // absolute column at stage 3
         // ---- s3: DYn*x, ddx*x ----
+        // PROBE mode: each edge uses its own x-witness (x*=31 if DYn<=0 i.e. DYn[31], else
+        // 0) so the pipeline evaluates that edge's tile-MAX corner. Xhs = Cn+DXn*y-DYn*x, so
+        // -DYn*x is maximized at x=31 when DYn<0. Only lane 0 is used by the probe consumer.
+        wire [4:0] xk12 = pr_s3 ? (dy12_3[31] ? 5'd31 : 5'd0) : x;
+        wire [4:0] xk23 = pr_s3 ? (dy23_3[31] ? 5'd31 : 5'd0) : x;
+        wire [4:0] xk31 = pr_s3 ? (dy31_3[31] ? 5'd31 : 5'd0) : x;
+        wire [4:0] xk41 = pr_s3 ? (dy41_3[31] ? 5'd31 : 5'd0) : x;
         wire [31:0] dy12x_c,dy23x_c,dy31x_c,dy41x_c, ddxx_c;
-        fp_mul_i5 mdy12(.f(dy12_3),.k(x),.y(dy12x_c));
-        fp_mul_i5 mdy23(.f(dy23_3),.k(x),.y(dy23x_c));
-        fp_mul_i5 mdy31(.f(dy31_3),.k(x),.y(dy31x_c));
-        fp_mul_i5 mdy41(.f(dy41_3),.k(x),.y(dy41x_c));
+        fp_mul_i5 mdy12(.f(dy12_3),.k(xk12),.y(dy12x_c));
+        fp_mul_i5 mdy23(.f(dy23_3),.k(xk23),.y(dy23x_c));
+        fp_mul_i5 mdy31(.f(dy31_3),.k(xk31),.y(dy31x_c));
+        fp_mul_i5 mdy41(.f(dy41_3),.k(xk41),.y(dy41x_c));
         fp_mul_i5 mddx (.f(ddx_3), .k(x),.y(ddxx_c));
         reg [31:0] dy12x,dy23x,dy31x,dy41x, ddxx;
         always @(posedge clk) begin
@@ -169,6 +210,14 @@ module isp_raster_line #(
                      & fpos_or_zero(xh3) & fpos_or_zero(xh4);
             iw0[32*gi +: 32] <= iw;
         end
+        // PROBE: lane 0's xh1..xh4 are the 4 edges' tile-MAX-corner half-space values.
+        // Reject if ANY edge is strictly outside there (~fpos_or_zero == sign bit set),
+        // meaning the whole tile is outside that edge.
+        if (gi == 0) begin : probe_lane
+            always @(posedge clk)
+                pr_rej0 <= (~fpos_or_zero(xh1)) | (~fpos_or_zero(xh2))
+                         | (~fpos_or_zero(xh3)) | (~fpos_or_zero(xh4));
+        end
       end
     endgenerate
 
@@ -177,10 +226,17 @@ module isp_raster_line #(
     // cycle BEFORE out_valid, which only worked when the issue side held data
     // stable; a back-to-back stream needs them aligned.)
     always @(posedge clk) begin
-        out_valid   <= vpipe[LAT-1];
-        out_x       <= xpipe[LAT-1];
-        out_y       <= ypipe[LAT-1];
-        inside_mask <= im0;
-        invw_flat   <= iw0;
+        // A PROBE issue must NOT look like a real rastered chunk to the consumer: suppress
+        // out_valid on probe cycles so no stage-B write / inflight accounting fires for it.
+        // Only probe_reject carries the probe result.
+        out_valid    <= vpipe[LAT-1] & ~ppipe[LAT-1];
+        out_x        <= xpipe[LAT-1];
+        out_y        <= ypipe[LAT-1];
+        inside_mask  <= im0;
+        invw_flat    <= iw0;
+        // probe_reject/probe_valid align with the (suppressed) out_valid slot; probe_valid
+        // marks the cycle a probe issue's verdict is on the bus.
+        probe_valid  <= ppipe[LAT-1];
+        probe_reject <= pr_rej0 & ppipe[LAT-1];
     end
 endmodule
