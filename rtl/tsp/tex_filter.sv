@@ -133,10 +133,14 @@ module tex_filter (
     end
 
     // ============================ STAGE 4 : column sub ===============================
-    // dv = b - a. Carry a (the column-lerp p endpoint) + weight + control.
+    // Column lerp = lerp(b, a, vf): p=b (v+0 row), q=a (v+1 row), so vf=0 -> b (v+0) and
+    // vf->255 approaches a (v+1) - matching the fraction convention (larger frac -> +1
+    // corner) and the U-axis row lerp. dv = a - b ; carry b as the p endpoint.
+    // (Previously this used dv=b-a / p=a, which INVERTED the V axis -> the whole bilinear
+    // filter picked the wrong V corner, e.g. vf=0 returned the v+1 texel.)
     reg               v4;
-    reg signed [9:0]  s4_dv [0:3];      // b-a in [-255,255]
-    reg        [7:0]  s4_a  [0:3];      // column-lerp p endpoint (= a)
+    reg signed [9:0]  s4_dv [0:3];      // a-b in [-255,255]
+    reg        [7:0]  s4_b  [0:3];      // column-lerp p endpoint (= b, the v+0 row)
     reg        [7:0]  s4_vf;
     reg               s4_filter, s4_ignta;
     reg        [31:0] s4_t11;
@@ -146,8 +150,8 @@ module tex_filter (
         else begin
             v4 <= v3;
             for (i4=0; i4<4; i4=i4+1) begin
-                s4_dv[i4] <= $signed({2'b0, s3_b[i4]}) - $signed({2'b0, s3_a[i4]});
-                s4_a[i4]  <= s3_a[i4];
+                s4_dv[i4] <= $signed({2'b0, s3_a[i4]}) - $signed({2'b0, s3_b[i4]});
+                s4_b[i4]  <= s3_b[i4];
             end
             s4_vf     <= s3_vf;
             s4_filter <= s3_filter;
@@ -160,7 +164,7 @@ module tex_filter (
     // Raw product only: mv = dv*vf. multstyle="logic" -> NO DSP. Carry a + control.
     reg               v5;
     (* multstyle = "logic" *) reg signed [18:0] s5_mv [0:3];  // dv*vf
-    reg        [7:0]  s5_a [0:3];
+    reg        [7:0]  s5_b [0:3];      // column-lerp p endpoint (= b, the v+0 row)
     reg               s5_filter, s5_ignta;
     reg        [31:0] s5_t11;
     integer i5; reg signed [8:0] vf_s;
@@ -171,7 +175,7 @@ module tex_filter (
             vf_s = $signed({1'b0, s4_vf});
             for (i5=0; i5<4; i5=i5+1) begin
                 s5_mv[i5] <= s4_dv[i5] * vf_s;
-                s5_a[i5]  <= s4_a[i5];
+                s5_b[i5]  <= s4_b[i5];
             end
             s5_filter <= s4_filter;
             s5_ignta  <= s4_ignta;
@@ -191,7 +195,7 @@ module tex_filter (
         else begin
             v6 <= v5;
             for (i6=0; i6<4; i6=i6+1)
-                o[i6] = lclamp($signed({3'b0, s5_a[i6]}) + $signed(s5_mv[i6] >>> 8));
+                o[i6] = lclamp($signed({3'b0, s5_b[i6]}) + $signed(s5_mv[i6] >>> 8));
             // o[3]=A o[2]=R o[1]=G o[0]=B  -> {A,R,G,B}
             begin : pack
                 reg [31:0] bilin, pre;
