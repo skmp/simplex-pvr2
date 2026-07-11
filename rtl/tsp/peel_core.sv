@@ -30,10 +30,13 @@ module peel_core import tsp_pkg::*; (
 
     // ---- injected framebuffer write port (one 32-bit pixel per accepted cycle) ----
     output fb_wr_req_t   fbw_req,
-    input  fb_wr_resp_t  fbw_resp
+    input  fb_wr_resp_t  fbw_resp,
+
+    output pvr_regs_t    regs_out
 );
     // -------------------- reg_file --------------------
     pvr_regs_t  regs;
+    assign regs_out = regs;
     fog_rd_req_t fog_req; fog_rd_resp_t fog_resp;
     pal_rd_req_t pal_req [0:3]; pal_rd_resp_t pal_resp [0:3];   // 4 corner palette read ports
     assign fog_req = '0;
