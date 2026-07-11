@@ -205,16 +205,37 @@ module tex_unit import tsp_pkg::*; #(
     end
 
     // ============================================================================
-    // STAGE FETCH (streaming, owns caches): 4 raw 64-bit words.
+    // STAGE FETCH (streaming, owns caches): 4 raw 64-bit words. The DECODE/FILTER payload
+    // (per-corner texel-offset low bits + format/frac/id config) rides THROUGH the fetch on
+    // in_pl->out_pl, so it advances in exact lockstep with the corners over the fetch's
+    // VARIABLE latency (VQ 2nd trip / miss-fills) and can never desync. Packed at the fetch-
+    // ISSUE cycle (r_iss): offsets from r_toff (texel-offset low bits), config from the
+    // r_iss-aligned i_* (see the i1_/i2_/i_ delay lines below).
     // ============================================================================
+    // payload layout: {off0,off1,off2,off3 (4b each), pixfmt(3), palfmt(2), scan(1),
+    //                  palsel(6), uf(8), vf(8), filt(2), igna(1), tex(1), id(IDW)}
+    localparam integer FPLW = 16 + 3 + 2 + 1 + 6 + 8 + 8 + 2 + 1 + 1 + IDW;
+    wire [FPLW-1:0] fpl_in = { r_toff[0], r_toff[1], r_toff[2], r_toff[3],
+                               i_pixfmt, i_palfmt, i_scan, i_palsel,
+                               i_uf, i_vf, i_filt, i_igna, i_tex, i_id };
+    wire [FPLW-1:0] fpl_out;
+
     wire        f_ov;
     wire [63:0] f_word [0:3];
-    tex_fetch4_ob u_fetch (
+    tex_fetch4_ob #(.PLW(FPLW)) u_fetch (
         .clk(clk),.reset(reset),
         .in_valid(r_iss),.tex(r_tex),.vq(r_vq),.in_ready(fetch_ready),
-        .tex_addr(r_texaddr),.vq_addr(r_vqaddr),.tex_offset(r_boff),
-        .out_valid(f_ov),.texel(f_word),
+        .tex_addr(r_texaddr),.vq_addr(r_vqaddr),.tex_offset(r_boff),.in_pl(fpl_in),
+        .out_valid(f_ov),.texel(f_word),.out_pl(fpl_out),
         .ddr_req(ddr_req),.ddr_resp(ddr_resp));
+
+    // unpack the fetch-carried payload (aligned with f_ov / f_word).
+    wire [3:0]  fo_off [0:3];
+    wire [2:0]  fo_pixfmt; wire [1:0] fo_palfmt; wire fo_scan; wire [5:0] fo_palsel;
+    wire [7:0]  fo_uf, fo_vf; wire [1:0] fo_filt; wire fo_igna, fo_tex; wire [IDW-1:0] fo_id;
+    assign { fo_off[0], fo_off[1], fo_off[2], fo_off[3],
+             fo_pixfmt, fo_palfmt, fo_scan, fo_palsel,
+             fo_uf, fo_vf, fo_filt, fo_igna, fo_tex, fo_id } = fpl_out;
 
     // ============================================================================
     // Payload for DECODE/FILTER (rides an in-order delay line from the ADDROFFS-stage
@@ -225,17 +246,13 @@ module tex_unit import tsp_pkg::*; #(
     // shallow shift register matched to the fetch latency. Depth FETCHLAT covers T0..T2.
     // The offset low bits (byte lane / nibble) go to decode as `offset`.
     // ============================================================================
-    localparam integer FETCHLAT = 3;         // T0->T1->T2
-    // decode/filter payload captured at the fetch-issue cycle (ao_ov), delayed FETCHLAT.
-    reg [3:0]  p_off  [0:3][0:FETCHLAT-1];   // per-corner offset[3:0] (lane/nibble)
-    reg [2:0]  p_pixfmt[0:FETCHLAT-1];
-    reg [1:0]  p_palfmt[0:FETCHLAT-1];
-    reg        p_scan [0:FETCHLAT-1];
-    reg [5:0]  p_palsel[0:FETCHLAT-1];
-    reg [7:0]  p_uf[0:FETCHLAT-1], p_vf[0:FETCHLAT-1];
-    reg [1:0]  p_filt[0:FETCHLAT-1];
-    reg        p_igna[0:FETCHLAT-1], p_tex[0:FETCHLAT-1];
-    reg [IDW-1:0] p_id[0:FETCHLAT-1];
+    // The DECODE/FILTER payload now rides THROUGH the fetch (in_pl->out_pl, see above), so
+    // the old fixed-depth p_* shift register (clocked on !front_stall - the fetch's ACCEPT
+    // gate, NOT its internal advance) is GONE. It drifted whenever the fetch's variable
+    // latency diverged from a rigid 3-cycle assumption (VQ 2nd trip, cache-miss fills at
+    // texture/config boundaries), pairing texels with the WRONG pixel's frac/offset.
+    // The i1_/i2_/i_ lines below still delay the config to the fetch-ISSUE cycle (r_iss) so
+    // it can be packed into fpl_in; from there the fetch carries it.
     // NB: the offset low bits per corner = byte_off[gi][3:0]; the uvmap fracs + config
     // are the per-pixel values delayed to the ao_ov (fetch-issue) cycle. The config was
     // registered at d_*[L] (uvmap-aligned); it needs +1 (addroffs) more to reach issue.
@@ -259,34 +276,17 @@ module tex_unit import tsp_pkg::*; #(
         i_pixfmt<=i2_pixfmt; i_palfmt<=i2_palfmt; i_scan<=i2_scan; i_palsel<=i2_palsel;
         i_uf<=i2_uf; i_vf<=i2_vf; i_filt<=i2_filt; i_igna<=i2_igna; i_tex<=i2_tex; i_id<=i2_id;
     end
-    // shift the payload down FETCHLAT stages. Stage-0 captures at the fetch-issue cycle
-    // (r_iss): the offset lane bits come from the REGISTERED r_boff (what the fetch reads),
-    // and the config from the r_iss-aligned i_*. Both freeze with the front (front_stall).
-    always @(posedge clk) if (!front_stall) begin
-        p_off[0][0]<=r_toff[0]; p_off[1][0]<=r_toff[1];
-        p_off[2][0]<=r_toff[2]; p_off[3][0]<=r_toff[3];
-        p_pixfmt[0]<=i_pixfmt; p_palfmt[0]<=i_palfmt; p_scan[0]<=i_scan; p_palsel[0]<=i_palsel;
-        p_uf[0]<=i_uf; p_vf[0]<=i_vf; p_filt[0]<=i_filt; p_igna[0]<=i_igna; p_tex[0]<=i_tex; p_id[0]<=i_id;
-        for (d=1; d<FETCHLAT; d=d+1) begin
-            p_off[0][d]<=p_off[0][d-1]; p_off[1][d]<=p_off[1][d-1];
-            p_off[2][d]<=p_off[2][d-1]; p_off[3][d]<=p_off[3][d-1];
-            p_pixfmt[d]<=p_pixfmt[d-1]; p_palfmt[d]<=p_palfmt[d-1]; p_scan[d]<=p_scan[d-1];
-            p_palsel[d]<=p_palsel[d-1]; p_uf[d]<=p_uf[d-1]; p_vf[d]<=p_vf[d-1];
-            p_filt[d]<=p_filt[d-1]; p_igna[d]<=p_igna[d-1]; p_tex[d]<=p_tex[d-1]; p_id[d]<=p_id[d-1];
-        end
-    end
-    localparam integer F = FETCHLAT-1;       // aligned-with-f_ov index
-
     // ============================================================================
-    // STAGE DECODE x4 (3 cyc): raw word -> ARGB per corner.
+    // STAGE DECODE x4 (3 cyc): raw word -> ARGB per corner. Config/offset come from the
+    // fetch-carried payload (fo_*), guaranteed aligned with f_word / f_ov.
     // ============================================================================
     wire [31:0] dec_argb [0:3];
     wire [3:0]  dec_ov;
     generate for (gi=0; gi<4; gi=gi+1) begin : dec
         tex_decode u_dec (
             .clk(clk),.reset(reset),.in_valid(f_ov),
-            .pixfmt(p_pixfmt[F]),.pal_fmt(p_palfmt[F]),.scan_order(p_scan[F]),
-            .palsel(p_palsel[F]),.memtel(f_word[gi]),.offset(p_off[gi][F]),
+            .pixfmt(fo_pixfmt),.pal_fmt(fo_palfmt),.scan_order(fo_scan),
+            .palsel(fo_palsel),.memtel(f_word[gi]),.offset(fo_off[gi]),
             .pal_addr(pal_addr[gi]),.pal_data(pal_data[gi]),
             .out_valid(dec_ov[gi]),.argb(dec_argb[gi]));
     end endgenerate
@@ -296,8 +296,8 @@ module tex_unit import tsp_pkg::*; #(
     reg [7:0] q_uf[0:DECLAT-1], q_vf[0:DECLAT-1]; reg [1:0] q_filt[0:DECLAT-1];
     reg       q_igna[0:DECLAT-1], q_tex[0:DECLAT-1]; reg [IDW-1:0] q_id[0:DECLAT-1];
     always @(posedge clk) begin
-        q_uf[0]<=p_uf[F]; q_vf[0]<=p_vf[F]; q_filt[0]<=p_filt[F]; q_igna[0]<=p_igna[F];
-        q_tex[0]<=p_tex[F]; q_id[0]<=p_id[F];
+        q_uf[0]<=fo_uf; q_vf[0]<=fo_vf; q_filt[0]<=fo_filt; q_igna[0]<=fo_igna;
+        q_tex[0]<=fo_tex; q_id[0]<=fo_id;
         for (d=1; d<DECLAT; d=d+1) begin
             q_uf[d]<=q_uf[d-1]; q_vf[d]<=q_vf[d-1]; q_filt[d]<=q_filt[d-1];
             q_igna[d]<=q_igna[d-1]; q_tex[d]<=q_tex[d-1]; q_id[d]<=q_id[d-1];

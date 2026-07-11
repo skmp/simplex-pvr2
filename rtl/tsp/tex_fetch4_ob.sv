@@ -24,7 +24,9 @@
 //
 // Exposes TWO DDR read ports (tc, vq) to the parent arbiter.
 //
-module tex_fetch4_ob import tsp_pkg::*; (
+module tex_fetch4_ob import tsp_pkg::*; #(
+    parameter integer PLW = 1              // decode payload bus width (rides with the pixel)
+) (
     input             clk,
     input             reset,
 
@@ -34,10 +36,12 @@ module tex_fetch4_ob import tsp_pkg::*; (
     input      [20:0] tex_addr,          // data base (64-bit-word units)
     input      [20:0] vq_addr,           // VQ codebook base (64-bit-word units)
     input      [21:0] tex_offset [0:3],  // per-corner byte offsets (22b: up to 16bpp+mip)
+    input      [PLW-1:0] in_pl,           // decode payload latched WITH the accepted pixel
     output            in_ready,          // 0 = stall (cache filling); hold inputs
 
     output            out_valid,
     output     [63:0] texel [0:3],       // raw 64-bit memory words (undefined if !tex)
+    output     [PLW-1:0] out_pl,          // in_pl carried to align with out_valid/texel
 
     // two DDR read ports to the parent arbiter ([0]=tc data, [1]=vq codebook)
     output ddr_rd_req_t  ddr_req  [0:1],
@@ -85,6 +89,13 @@ module tex_fetch4_ob import tsp_pkg::*; (
     reg [63:0] t2_word [0:3];
     reg        t2_dv;           // t2_word holds the final word
     reg        t2_vq;
+
+    // ---- decode PAYLOAD skew register: rides T0->T1->T2 with the SAME per-stage advances
+    //      as the corners, so the payload can NEVER desync from the texels regardless of the
+    //      fetch's variable latency (VQ 2nd trip, miss-fills). This replaces the fixed-depth
+    //      shift register in tex_unit that advanced on !front_stall (the fetch's ACCEPT gate,
+    //      not its internal advance) and drifted at cache-miss / config boundaries. ----
+    reg [PLW-1:0] t0_pl, t1_pl, t2_pl;
 
     integer i;
 
@@ -147,6 +158,7 @@ module tex_fetch4_ob import tsp_pkg::*; (
     generate for (gi=0; gi<4; gi=gi+1) begin : out
         assign texel[gi] = (t2_v && t2_vq && !t2_dv) ? vq_resp[gi].rdata : t2_word[gi];
     end endgenerate
+    assign out_pl = t2_pl;     // payload rode T0->T1->T2 in lockstep with the texels
     // out_valid is the DRAIN PULSE (t2_adv), NOT the T2-occupied level (t2_v). A VQ pixel
     // whose codebook read MISSES the cache lingers in T2 for the fill (t2_v stays high, but
     // t2_adv waits for vq_ack). The downstream decode has no stall - it fires on every
@@ -175,6 +187,7 @@ module tex_fetch4_ob import tsp_pkg::*; (
                 t0_v <= 1'b1; t0_dv <= 1'b0;
                 t0_tex <= tex; t0_vq <= vq; t0_vqbase <= vq_addr;
                 for (i=0;i<4;i=i+1) t0_lane[i] <= vqlane[i];
+                t0_pl <= in_pl;                          // payload latched with the pixel
             end else if (t0_adv) t0_v <= 1'b0;
 
             // ---- T0 data-word capture (lands cycle after accept; hold it) ----
@@ -187,6 +200,7 @@ module tex_fetch4_ob import tsp_pkg::*; (
             if (t0_adv) begin
                 t1_v <= 1'b1; t1_tex <= t0_tex; t1_vq <= t0_vq; t1_vqbase <= t0_vqbase;
                 for (i=0;i<4;i=i+1) begin t1_mem[i] <= t0_word[i]; t1_lane[i] <= t0_lane[i]; end
+                t1_pl <= t0_pl;
             end else if (t1_adv) t1_v <= 1'b0;
 
             // ---- T1 -> T2 : non-VQ done immediately (word = data); VQ awaits its ack ----
@@ -194,6 +208,7 @@ module tex_fetch4_ob import tsp_pkg::*; (
                 t2_v <= 1'b1; t2_vq <= (t1_tex && t1_vq);
                 t2_dv <= !(t1_tex && t1_vq);           // done unless VQ
                 for (i=0;i<4;i=i+1) t2_word[i] <= t1_mem[i];   // data word (VQ overwrites below)
+                t2_pl <= t1_pl;
             end else if (t2_adv) t2_v <= 1'b0;
 
             // ---- T2 VQ capture: codebook word lands cycle after its read accepted. Guarded
