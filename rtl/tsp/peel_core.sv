@@ -390,6 +390,7 @@ module peel_core import tsp_pkg::*; (
     reg                    b_zwdis;
     reg                    b_peeling;   // carry the peel/opaque select into stage B
     reg                    b_which;     // per-triangle is_pt (tri_is_pt) snapshot (PT => dt_pt=1)
+    wire [32*RAS_LANES-1:0] b_old_tag;  // per-lane OLD pending tag (pb) from u_peel stage B
 
     // ---- peel + color tile buffers (own the RAM ports + access-pattern enforcement) ----
     peel_tile_buffer #(.LANES(RAS_LANES)) u_peel (
@@ -401,6 +402,7 @@ module peel_core import tsp_pkg::*; (
         .b_y(b_oy), .b_x(b_ox), .b_tag(b_tag), .b_mode(b_mode),
         .b_zwdis(b_zwdis), .b_peeling(b_peeling),
         .b_pass_lp(b_pass_lp), .b_more(b_more), .b_we(b_we),
+        .b_old_tag(b_old_tag),
         // shade single-pixel read: MOVED to the split-out u_taginvw handoff buffer.
         // u_peel stays ISP-private (depth compare + PeelBuffers only); its shade port
         // is tied off.
@@ -467,6 +469,72 @@ module peel_core import tsp_pkg::*; (
         );
       end
     endgenerate
+
+    // ============ ISP SORT CACHE (PT/TL peel skip tracker) ===========================
+    // ONE isp_sort_cache with a 2-BIT per-entry `done` (one bit per pass PARITY). The
+    // ping-pong is now INSIDE the entry: `sc_pp` (pass parity) selects read=done[~pp]
+    // (previous pass, for the skip test) vs write=done[pp] (current pass). Every write
+    // is a STICKY RMW: done[pp] <= done[~pp] | new_bit -> a triangle marked done in any
+    // pass stays done in all later passes for free (no A/B copy, no skip-forward). Bulk
+    // clear (generation bump) at the tile's peel start. VERILATOR-ONLY.
+`ifndef SYNTHESIS
+    reg          sc_pp;             // pass parity (toggles each peel pass >=2)
+    reg          sc_clr;            // bulk-clear pulse (per tile)
+    // before-fetch skip lookup (previous-pass bit)
+    wire [31:0]  sc_lk_tag = it_trio.tag;
+    wire         sc_prev_hit, sc_prev_done;
+    // a peel triangle already fully processed last pass -> skip fetch/setup/scan.
+    // +nosortskip disables the skip (still tracks) to isolate wiring from policy.
+    reg          sc_skip_en;
+    initial      sc_skip_en = !$test$plusargs("nosortskip");
+    wire         sc_skip = sc_skip_en && peeling && sc_prev_hit && sc_prev_done;
+    integer      sc_nskip = 0;
+
+    // RMW WRITE LANES (all write the CURRENT-pass bit = done[~pp] | new_bit):
+    //   [0..RAS_LANES-1] DISPLACE : replaced old tag (b_old_tag), new_bit=0 -> "not done"
+    //                               unless it was already done (sticky).
+    //   [RAS_LANES]      SELF      : active triangle won/deferred a pixel, new_bit=0.
+    //   [RAS_LANES+1]    PROVIS    : RS_POP provisional install, new_bit=1 (assume done).
+    //   [RAS_LANES+2]    SKIP      : a skipped triangle carries done forward, new_bit=1.
+    // DISPLACE/SELF (stage B) and PROVIS (RS_POP) never coincide for the same triangle;
+    // SKIP (iterator stage) runs concurrently, hence its own lane.
+    localparam integer SC_W = RAS_LANES + 3;
+    localparam integer L_SELF   = RAS_LANES;
+    localparam integer L_PROVIS = RAS_LANES + 1;
+    localparam integer L_SKIP   = RAS_LANES + 2;
+    wire [SC_W-1:0]    sc_w_v;
+    wire [32*SC_W-1:0] sc_w_tag;
+    wire [SC_W-1:0]    sc_w_bit;
+    // provisional-install (RS_POP) and skip (iterator) drive these regs:
+    reg          sc_prov_v;  reg [31:0] sc_prov_tag;   // provisional set (bit=1)
+    reg          sc_skip_v;  reg [31:0] sc_skip_tag;   // skip carry-forward (bit=1)
+    genvar scl;
+    generate
+        for (scl = 0; scl < RAS_LANES; scl = scl + 1) begin : sc_disp
+            assign sc_w_v  [scl]          = b_valid && b_peeling && b_pass_lp[scl];
+            assign sc_w_tag[32*scl +: 32] = b_old_tag[32*scl +: 32];  // displaced old tag
+            assign sc_w_bit[scl]          = 1'b0;                     // "not done"
+        end
+    endgenerate
+    assign sc_w_v  [L_SELF]           = b_valid && b_peeling && ((|b_pass_lp) | (|b_more));
+    assign sc_w_tag[32*L_SELF +: 32]  = tri_tag;      // active triangle won/deferred
+    assign sc_w_bit[L_SELF]           = 1'b0;
+    assign sc_w_v  [L_PROVIS]         = sc_prov_v;
+    assign sc_w_tag[32*L_PROVIS +: 32]= sc_prov_tag;
+    assign sc_w_bit[L_PROVIS]         = 1'b1;         // provisional "done"
+    assign sc_w_v  [L_SKIP]           = sc_skip_v;
+    assign sc_w_tag[32*L_SKIP +: 32]  = sc_skip_tag;
+    assign sc_w_bit[L_SKIP]           = 1'b1;         // skipped -> carry done forward
+
+    isp_sort_cache #(.WLANES(SC_W)) u_sc (
+        .clk(clk), .reset(reset),
+        .pp(sc_pp), .clr(sc_clr),
+        .lk_tag(sc_lk_tag), .lk_hit(sc_prev_hit), .lk_done(sc_prev_done),
+        .w_valid(sc_w_v), .w_tag(sc_w_tag), .w_bit(sc_w_bit)
+    );
+`else
+    wire sc_skip = 1'b0;   // synth: feature disabled (no sort cache)
+`endif
 
     // ---- PING-PONG color buffer (2 halves): TSP blend fills the half of the tile it
     // is shading (col_prod = tsp_half); the decoupled video-out engine drains col_vo.
@@ -1168,6 +1236,7 @@ module peel_core import tsp_pkg::*; (
     final if (fbd_en && fbd_fd!=0) begin $fflush(fbd_fd); $fclose(fbd_fd);
         $display("[peel_core] framebuffer writes: %0d -> %0s", fbd_n, fbd_name); end
     final $display("[peel_core] corner-cull: %0d triangle(s) trivially rejected (256-chunk sweep skipped)", pc_corner_cull);
+    final $display("[peel_core] sort-cache: %0d triangle(s) skipped (peel fetch/setup/scan avoided)", sc_nskip);
 `endif
 
     // ============ COMBINATIONAL buffer request ports (valid THIS cycle) ============
@@ -1259,6 +1328,10 @@ module peel_core import tsp_pkg::*; (
             eq_head<=0; eq_tail<=0; eq_count<=0;
             peeling<=1'b0; more_to_draw<=1'b0; peel_pass<=8'd0; op_shaded<=1'b0;
             has_pt<=1'b0; has_tr<=1'b0; peel_which<=1'b0;
+`ifndef SYNTHESIS
+            sc_pp<=1'b0; sc_clr<=1'b1;
+            sc_prov_v<=1'b0; sc_prov_tag<=32'd0; sc_skip_v<=1'b0; sc_skip_tag<=32'd0;
+`endif
             b_valid<=1'b0; cb_valid<=1'b0;
             cl_i<='0; pb_i<='0; pb_rd<='0; pb_pipe<=1'b0; first_peel<=1'b0;
             col_post<=1'b0;                   // color post-to-VO intent
@@ -1368,6 +1441,9 @@ module peel_core import tsp_pkg::*; (
 `endif
             done<=0; ra_start<=0; ol_start<=0;
             spv_start<=1'b0; spv_rd_done<=1'b0;  // 1-cyc spanner start / ring-free strobes
+`ifndef SYNTHESIS
+            sc_clr<=1'b0; sc_prov_v<=1'b0; sc_skip_v<=1'b0;  // 1-cyc sort-cache strobes
+`endif
             ra_ack.list_done<=0; ol_ack.entry_done<=0; it_ack.triangle_done<=0;
             eq_push = 1'b0;
             col_post<=1'b0;                   // 1-cyc: color-buffer post-to-VO intent
@@ -1418,6 +1494,9 @@ module peel_core import tsp_pkg::*; (
                     if (b_more[l]) more_to_draw <= 1'b1;
                     /* verilator lint_on WIDTH */
                 end
+                if ($test$plusargs("scpass") && b_peeling && ((|b_pass_lp) | (|b_more)))
+                    $display("[SC WORK] pass=%0d tile(%0d,%0d) tag=%08x won=%b more=%b",
+                             peel_pass, cur_tx, cur_ty, tri_tag, |b_pass_lp, |b_more);
             end
             ras_inflight <= ras_inflight + (ras_in_valid ? 1 : 0) - (ras_out_valid ? 1 : 0);
 
@@ -1696,6 +1775,12 @@ module peel_core import tsp_pkg::*; (
                 peel_pass  <= 8'd0;  // reset the pass counter for THIS tile's peel
                 first_peel <= 1'b1;  // fold SetTagToMax into the first PeelBuffers
                 st <= S_PEEL_BUF;    // S_PEEL_BUF gates on !ti_ready[htile]
+`ifndef SYNTHESIS
+                // new tile's peel: bump generation (all entries stale) + reset parity so no
+                // cross-tile tag falsely hits. pp=0 -> pass 1 writes done[0], reads done[1]
+                // (stale -> every lookup MISS -> nothing skipped on pass 1).
+                sc_clr <= 1'b1; sc_pp <= 1'b0;
+`endif
             end
 
             // PeelBuffers(FLT_MAX, 0): per pixel depth2<-depth, tag2<-tag (or
@@ -1731,6 +1816,14 @@ module peel_core import tsp_pkg::*; (
                     // whole tile transformed -> issue the object list for this pass.
                     first_peel <= 1'b0;
                     peel_pass  <= peel_pass + 8'd1;
+`ifndef SYNTHESIS
+                    // SORT-CACHE parity toggle at the START of each pass AFTER the first
+                    // (peel_pass!=0 => this PeelBuffers precedes pass 2, 3, ...). The bit
+                    // just filled (done[pp]) becomes the PREV view (done[~pp]) read by this
+                    // pass's skip test; writes now land in the other bit. No clear needed -
+                    // the sticky RMW (done[pp] <= done[~pp] | new_bit) carries prev forward.
+                    if (peel_pass != 8'd0) sc_pp <= ~sc_pp;
+`endif
                     // start with the PT list if present, else the TL list.
                     if (has_pt) begin
                         peel_which <= 1'b0;                 // rasterizing PT list
@@ -2164,6 +2257,20 @@ module peel_core import tsp_pkg::*; (
             end
 
             // push emitted triangles into the tri FIFO (hold-until-space handshake)
+`ifndef SYNTHESIS
+            // SORT-CACHE SKIP: on a peel pass, a triangle whose prev-pass cache entry is
+            // {hit, done=1} has no visible pixels left -> DON'T fetch/setup/scan it. Just
+            // ack the iterator and copy its done=1 forward into the current-pass cache so
+            // the skip propagates to later passes. No fq push, no fq_full gate needed.
+            if (it_trio.triangle_ready && !it_ack.triangle_done && sc_skip) begin
+                it_ack.triangle_done <= 1'b1;
+                sc_skip_v   <= 1'b1;            // carry done forward into the current-pass bit
+                sc_skip_tag <= it_trio.tag;
+                sc_nskip    <= sc_nskip + 1;
+                if ($test$plusargs("scpass"))
+                    $display("[SC SKIP] pass=%0d tile(%0d,%0d) tag=%08x", peel_pass, cur_tx, cur_ty, it_trio.tag);
+            end else
+`endif
             if (it_trio.triangle_ready && !fq_full && !it_ack.triangle_done) begin
                 fq_ram[fq_tail[2:0]] <= fq_wrw;   // one packed M10K word
                 it_ack.triangle_done <= 1'b1;   // advance iterator to next tri
@@ -2250,6 +2357,17 @@ module peel_core import tsp_pkg::*; (
                 isp_word<=pq_rdw[QF_ISP +:32]; tri_tag<=pq_rdw[QF_TAG +:32];
                 tri_is_pt<=pq_rdw[QF_PT];
                 tri_count<=tri_count+1;
+`ifndef SYNTHESIS
+                // SORT-CACHE rule 1 (before raster): provisionally install done=1 for this
+                // triangle (assume fully processed). During its raster, CLR1 clears it if it
+                // is displaced, wins, or defers a pixel (=> not finished). Peel passes only.
+                if (peeling) begin
+                    sc_prov_v   <= 1'b1;       // provisional done=1 (RMW ORs prev bit)
+                    sc_prov_tag <= pq_rdw[QF_TAG +:32];
+                    if ($test$plusargs("scpass"))
+                        $display("[SC RAST] pass=%0d tile(%0d,%0d) tag=%08x", peel_pass, cur_tx, cur_ty, pq_rdw[QF_TAG +:32]);
+                end
+`endif
                 // chunk-aligned x range + row range from the bbox
                 rbx0 <= pq_rdw[QF_BX0 +:5] & 5'(~(RAS_LANES-1));
                 rbx1 <= pq_rdw[QF_BX1 +:5] & 5'(~(RAS_LANES-1));
