@@ -2292,7 +2292,9 @@ module peel_core import tsp_pkg::*; (
                         $display("[PROBE] tile(%0d,%0d) rej=%b", cur_tx, cur_ty, ras_probe_reject);
 `endif
                     if (ras_probe_reject) begin
-                        pc_corner_cull <= pc_corner_cull + 1;
+`ifndef SYNTHESIS
+                        pc_corner_cull <= pc_corner_cull + 1;  // sim-only stat (decl guarded)
+`endif
                         rs_st <= RS_DRAIN;             // abort the rest of the sweep
                     end
                 end
