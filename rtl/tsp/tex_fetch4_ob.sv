@@ -1,10 +1,10 @@
 //
-// tex_fetch4_ob - 4-corner raw texel fetch (rewrite; output-buffered). 4 byte-offsets in -> 4 raw 64-bit
-// memory words out. Owns the two shared 4-read-port caches (data + VQ) as its ONLY
-// submodules; the whole fetch pipeline is inline (no tex_fetch_core, no tex_decode).
+// tex_fetch4_ob - 4-corner raw texel fetch (output-buffered). 4 byte-offsets in -> 4 raw
+// 64-bit memory words out. Owns the two shared 4-read-port caches (data + VQ) as its ONLY
+// submodules; the whole fetch pipeline is inline.
 //
 // Addressing. tex_addr / vq_addr are 64-BIT-WORD base addresses (21b, DC VRAM). The 4
-// corner offsets are in BYTES (20b). So per corner:
+// corner offsets are in BYTES (22b). So per corner:
 //   data word addr = tex_addr + offset[21:3]      (offset byte, its 64-bit-word part)
 //   byte lane      = offset[2:0]                   (byte-within-word; also the VQ lane)
 //
@@ -14,13 +14,32 @@
 //   TEX &  VQ     : data-cache read -> memtel ; index = memtel[8*offset[2:0] +: 8] ;
 //                   VQ-cache read at (vq_addr + index) -> output = that 64-bit word.
 //
-// STREAMING (verbatim discipline from tex_fetch_pp/_core): accepts a new request every
-// cycle; the 4 corners run LOCKSTEP over the 1-cycle caches (freeze together on a
-// miss-fill), so out_valid / in_ready track corner 0. No external stall - the unit
-// asserts !in_ready (stall) while a cache is filling; the caller holds inputs stable.
-//   T0 : present data-cache req ; accepted when tc ready
-//   T1 : data word landed. If VQ, present VQ req NOW (codebook addr from the data word).
-//   T2 : VQ word landed (VQ) / data word (non-VQ)  -> texel out
+// =============================================================================
+// MULTIPLE-IN-FLIGHT, BACK-PRESSURED HANDSHAKE. -----------------------------
+// tex_cache_4p_1c is a multi-stage M10K pipeline (ACCEPT -> MATCH -> DATA) whose DATA stage
+// HOLDS ack+rdata until the consumer pulses resp_take (and freezes .ready while un-taken).
+// That lets the fetch keep MANY requests in flight for 1-pixel/clock throughput WITHOUT the
+// "dropped ack pulse" hazard: the fetch drains each cache strictly at its ack rate (take ==
+// ack), and the cache stalls issue if the fetch can't keep up.
+//
+// THREE ordered queues, all draining in cache-issue order:
+//   df (DATA in-flight): pushed on ACCEPT (a TC read issued, or a !tex bypass). The cache
+//        holds TC results in issue order; the df LAND pointer captures tc_resp.rdata into the
+//        df head on every tc_ack (tc_take pulsed) and marks it landed. !tex heads land with
+//        no cache trip. Fully decouples ISSUE from LAND.
+//   vf (VQ in-flight):   pushed when a landed VQ pixel issues its codebook read. Drained on
+//        vq_ack (vq_take pulsed). Carries only the ride-through payload; the word comes from
+//        vq_resp at the rf head.
+//   rf (RESULT, accept order): the single ORDERED output. Every processed df head pushes one
+//        rf entry. A non-VQ / !tex entry carries its resolved word and drains immediately; a
+//        VQ entry drains when its codebook word acks. HEAD-OF-LINE: a VQ entry awaiting its
+//        ack stalls the entries behind it - the strict in-order discipline the downstream
+//        (no-stall) decode requires (exactly one out_valid pulse per pixel).
+// Because both caches ack in issue order and VQ reads issue in that same order, the rf VQ
+// head's ack is exactly the current vq_ack (an earlier VQ pixel's ack always precedes and
+// drains it first) - no reorder buffer needed.
+//
+// PAYLOAD (in_pl -> out_pl) rides the queues so it can NEVER desync from the texels.
 //
 // Exposes TWO DDR read ports (tc, vq) to the parent arbiter.
 //
@@ -37,7 +56,7 @@ module tex_fetch4_ob import tsp_pkg::*; #(
     input      [20:0] vq_addr,           // VQ codebook base (64-bit-word units)
     input      [21:0] tex_offset [0:3],  // per-corner byte offsets (22b: up to 16bpp+mip)
     input      [PLW-1:0] in_pl,           // decode payload latched WITH the accepted pixel
-    output            in_ready,          // 0 = stall (cache filling); hold inputs
+    output            in_ready,          // 0 = stall (cache filling / queues full); hold
 
     output            out_valid,
     output     [63:0] texel [0:3],       // raw 64-bit memory words (undefined if !tex)
@@ -47,13 +66,25 @@ module tex_fetch4_ob import tsp_pkg::*; #(
     output ddr_rd_req_t  ddr_req  [0:1],
     input  ddr_rd_resp_t ddr_resp [0:1]
 );
-    // shared 4-read-port caches (data + VQ)
+    localparam integer QW = 3;             // queue addr width -> depth 8
+    localparam integer QD = 1 << QW;
+
+    // shared 4-read-port caches (data + VQ). resp_take back-pressures each cache's held
+    // DATA-stage result until the fetch drains it.
     cache_req_t   tc_req [0:3], vq_req [0:3];
     cache_resp_t  tc_resp[0:3], vq_resp[0:3];
+    wire          tc_take, vq_take;
     tex_cache_4p_1c u_tc4 (.clk(clk),.reset(reset),
-        .creq(tc_req),.cresp(tc_resp),.dreq(ddr_req[0]),.dresp(ddr_resp[0]));
+        .creq(tc_req),.cresp(tc_resp),.resp_take(tc_take),
+        .dreq(ddr_req[0]),.dresp(ddr_resp[0]));
     tex_cache_4p_1c u_vq4 (.clk(clk),.reset(reset),
-        .creq(vq_req),.cresp(vq_resp),.dreq(ddr_req[1]),.dresp(ddr_resp[1]));
+        .creq(vq_req),.cresp(vq_resp),.resp_take(vq_take),
+        .dreq(ddr_req[1]),.dresp(ddr_resp[1]));
+
+    wire tc_ready = tc_resp[0].ready;      // all 4 ports gate together
+    wire vq_ready = vq_resp[0].ready;
+    wire tc_ack   = tc_resp[0].ack;        // HELD until tc_take
+    wire vq_ack   = vq_resp[0].ack;        // HELD until vq_take
 
     // per-corner data-cache word address + VQ byte lane (combinational off inputs)
     wire [28:0] tc_waddr [0:3];
@@ -64,163 +95,157 @@ module tex_fetch4_ob import tsp_pkg::*; #(
         assign vqlane[gi]   = tex_offset[gi][2:0];
     end endgenerate
 
-    // ============================================================================
-    // Streaming pipeline, 4 corners lockstep. All corners share the accept/advance
-    // decisions (they freeze together), so control is computed ONCE (corner 0's cache
-    // readiness == all, since the 4-read-port cache gates all ports together).
-    // ============================================================================
-    // ---- T0: accepted request in flight (data read) ----
-    reg        t0_v;
-    reg        t0_tex, t0_vq;
-    reg [20:0] t0_vqbase;
-    reg [2:0]  t0_lane [0:3];
-    reg [63:0] t0_mem  [0:3];   // held data word (captured when it lands)
-    reg        t0_dv;           // data word captured
-
-    // ---- T1: data word held; if VQ, issue VQ read ----
-    reg        t1_v;
-    reg        t1_tex, t1_vq;
-    reg [20:0] t1_vqbase;
-    reg [2:0]  t1_lane [0:3];
-    reg [63:0] t1_mem  [0:3];   // data word (per corner)
-
-    // ---- T2: resolved word (VQ codebook / data) -> output ----
-    reg        t2_v;
-    reg [63:0] t2_word [0:3];
-    reg        t2_dv;           // t2_word holds the final word
-    reg        t2_vq;
-
-    // ---- decode PAYLOAD skew register: rides T0->T1->T2 with the SAME per-stage advances
-    //      as the corners, so the payload can NEVER desync from the texels regardless of the
-    //      fetch's variable latency (VQ 2nd trip, miss-fills). This replaces the fixed-depth
-    //      shift register in tex_unit that advanced on !front_stall (the fetch's ACCEPT gate,
-    //      not its internal advance) and drifted at cache-miss / config boundaries. ----
-    reg [PLW-1:0] t0_pl, t1_pl, t2_pl;
-
     integer i;
 
-    // VQ codebook address per corner (from the HELD T1 data word + lane)
-    wire [7:0]  t1_idx  [0:3];
-    wire [28:0] t1_vqaddr [0:3];
-    generate for (gi=0; gi<4; gi=gi+1) begin : vqa
-        assign t1_idx[gi]    = t1_mem[gi][ {t1_lane[gi], 3'd0} +: 8 ];   // byte lane*8
-        assign t1_vqaddr[gi] = {8'd0, t1_vqbase} + {21'd0, t1_idx[gi]};
-    end endgenerate
+    // ============================================================================
+    // DATA in-flight FIFO (df). Two pointers:
+    //   df_wr : push on ACCEPT (issue a TC read, or a !tex bypass entry).
+    //   df_ld : LAND pointer - the oldest not-yet-landed TC entry. Advances (captures
+    //           tc_resp.rdata) on each tc_ack. Decouples the cache-drain rate from the head
+    //           processor's rate.
+    //   df_rd : HEAD pointer - the oldest landed entry, processed into rf/vf.
+    // Invariant: df_rd <= df_ld <= df_wr.
+    // ============================================================================
+    reg              df_vq   [0:QD-1];
+    reg              df_tex  [0:QD-1];
+    reg [20:0]       df_vqbase[0:QD-1];
+    reg [2:0]        df_lane [0:QD-1][0:3];
+    reg [PLW-1:0]    df_pl   [0:QD-1];
+    reg [63:0]       df_word [0:QD-1][0:3];  // captured data word (valid once landed)
+    reg [QW:0]       df_wr, df_ld, df_rd;    // extra MSB for full/empty
+    wire             df_wr_full = (df_wr[QW-1:0]==df_rd[QW-1:0]) && (df_wr[QW]!=df_rd[QW]);
+    wire [QW-1:0]    df_wa = df_wr[QW-1:0];
+    wire [QW-1:0]    df_la = df_ld[QW-1:0];
+    wire [QW-1:0]    df_ra = df_rd[QW-1:0];
 
-    // ---- per-stage advance (lockstep; gate on shared cache readiness) ----
-    // data cache ready == tc_resp[0].ready (all 4 ports gate together); same for vq.
-    wire tc_ready = tc_resp[0].ready;
-    wire vq_ready = vq_resp[0].ready;
-    wire tc_ack   = tc_resp[0].ack;
-    wire vq_ack   = vq_resp[0].ack;
+    // ============================================================================
+    // Result FIFO (rf): the single ORDERED output stage. Declared before the accept gate so
+    // in_ready can require room. VQ entries get their word from vq_resp at the head on vq_ack.
+    // ============================================================================
+    reg              rf_vq  [0:QD-1];
+    reg [63:0]       rf_word[0:QD-1][0:3];
+    reg [PLW-1:0]    rf_pl  [0:QD-1];
+    reg [QW:0]       rf_wr, rf_rd;
+    wire             rf_full  = (rf_wr[QW-1:0]==rf_rd[QW-1:0]) && (rf_wr[QW]!=rf_rd[QW]);
+    wire             rf_empty = (rf_wr==rf_rd);
+    wire [QW-1:0]    rf_wa = rf_wr[QW-1:0];
+    wire [QW-1:0]    rf_ra = rf_rd[QW-1:0];
 
-    // T2 -> out : T2 result "here" (non-VQ done on entry; VQ when codebook word lands).
-    wire t2_here = t2_dv || (t2_v && t2_vq && vq_ack);
-    wire t2_adv  = t2_v && t2_here;            // out_ready tied high -> always drains
-    wire t2_free = !t2_v || t2_adv;
-
-    // T1 -> T2 : VQ pixel needs its VQ read accepted; non-VQ advances immediately.
-    wire vq_need = t1_v && t1_tex && t1_vq;
-    wire t1_okvq = !vq_need || vq_ready;
-    wire t1_adv  = t1_v && t1_okvq && t2_free;
-    wire t1_free = !t1_v || t1_adv;
-
-    // T0 -> T1 : data word here (bypass for !tex; captured; or landing this cycle).
-    wire t0_bypass = t0_v && !t0_tex;
-    wire t0_here   = t0_bypass || t0_dv || (t0_v && tc_ack);
-    wire t0_adv    = t0_v && t0_here && t1_free;
-    wire t0_free   = !t0_v || t0_adv;
-
-    // ---- accept a new pixel: T0 free and (textured -> data cache ready) ----
-    assign in_ready = t0_free && (!tex || tc_ready);
+    // ============================================================================
+    // ACCEPT: a new pixel enters when the data cache is ready (for textured pixels) and both
+    // the df and rf queues have room. A !tex bypass pixel needs no cache but still rides.
+    // ============================================================================
+    assign in_ready = !df_wr_full && !rf_full && (!tex || tc_ready);
     wire   accept   = in_valid && in_ready;
 
-    // ---- issue data-cache read (only textured pixels) ----
+    // issue data-cache read (textured pixels only)
     generate for (gi=0; gi<4; gi=gi+1) begin : tcreq
         assign tc_req[gi].req   = accept && tex;
         assign tc_req[gi].waddr = tc_waddr[gi];
     end endgenerate
 
-    // ---- issue VQ read (T1 VQ pixel, when it can advance into a free T2) ----
+    // ============================================================================
+    // LAND: capture TC results in issue order. The df LAND slot (df_la) is the oldest entry
+    // whose word hasn't been captured. A textured land slot captures on tc_ack; a !tex slot
+    // needs no cache trip. df_ld advances as slots land. tc_take pulses on each capture so
+    // the cache releases its held result.
+    // ============================================================================
+    wire df_land_pending = (df_ld != df_wr);          // an issued entry awaiting land
+    wire df_la_tex       = df_tex[df_la];
+    wire df_do_land      = df_land_pending && (df_la_tex ? tc_ack : 1'b1);
+    assign tc_take       = df_land_pending && df_la_tex && tc_ack;   // take exactly on capture
+
+    // ============================================================================
+    // HEAD PROCESS: the oldest LANDED df entry (df_rd, valid when df_rd != df_ld) is turned
+    // into an rf entry. Non-VQ/!tex -> resolved word, ready now. VQ -> issue codebook read
+    // (needs vq_ready) and push a VQ rf entry (word resolved later at the rf head).
+    // ============================================================================
+    wire df_head_valid = (df_rd != df_ld);            // a landed entry at the head
+    wire df_head_tex   = df_tex[df_ra];
+    wire df_head_vq    = df_vq [df_ra];
+
+    // VQ codebook address per corner (from the CAPTURED head data word + head lanes/base)
+    wire [7:0]  vqidx  [0:3];
+    wire [28:0] vqaddr [0:3];
+    generate for (gi=0; gi<4; gi=gi+1) begin : vqa
+        assign vqidx[gi]  = df_word[df_ra][gi][ {df_lane[df_ra][gi], 3'd0} +: 8 ];
+        assign vqaddr[gi] = {8'd0, df_vqbase[df_ra]} + {21'd0, vqidx[gi]};
+    end endgenerate
+
+    // A VQ head issues its codebook read when vq is ready and rf has room. A non-VQ/!tex head
+    // just needs rf room. Head advances (df_rd++) and pushes rf when processed.
+    wire head_is_vq   = df_head_valid && df_head_tex && df_head_vq;
+    wire vq_issue     = head_is_vq && vq_ready && !rf_full;
+    wire head_nonvq   = df_head_valid && !(df_head_tex && df_head_vq);  // non-VQ tex or !tex
+    wire head_proc    = (head_nonvq && !rf_full) || vq_issue;
+
     generate for (gi=0; gi<4; gi=gi+1) begin : vqreq
-        assign vq_req[gi].req   = vq_need && t2_free && vq_ready;
-        assign vq_req[gi].waddr = t1_vqaddr[gi];
+        assign vq_req[gi].req   = vq_issue;
+        assign vq_req[gi].waddr = vqaddr[gi];
     end endgenerate
 
-    // ---- output ----
-    // t2_word holds the RESOLVED word ONLY once t2_dv is set (non-VQ on T2 entry; VQ after
-    // its codebook read is captured). But a VQ pixel drains from T2 the SAME cycle its
-    // codebook word lands (t2_adv && vq_ack, still !t2_dv) - the register-capture below is
-    // guarded by !t2_adv and never runs on that cycle, so the register still holds the
-    // INDEX word (t1_mem). Combinationally bypass to vq_resp.rdata for that drain cycle,
-    // exactly as the legacy tex_fetch_core's combinational t2_word did. Without this the
-    // codebook lookup is skipped and VQ textures fetch the raw index word.
+    // ============================================================================
+    // rf OUTPUT: head drains in order. Non-VQ ready now; VQ ready on its vq_ack (in order).
+    // ============================================================================
+    wire rf_head_vq   = rf_vq[rf_ra];
+    wire rf_out_ready = !rf_empty && (!rf_head_vq || vq_ack);
+    assign vq_take    = !rf_empty && rf_head_vq && vq_ack;   // consume the codebook word
+    wire   rf_pop     = rf_out_ready;
+
+    wire [63:0] rf_out_word [0:3];
+    generate for (gi=0; gi<4; gi=gi+1) begin : ow
+        assign rf_out_word[gi] = rf_head_vq ? vq_resp[gi].rdata : rf_word[rf_ra][gi];
+    end endgenerate
+
     generate for (gi=0; gi<4; gi=gi+1) begin : out
-        assign texel[gi] = (t2_v && t2_vq && !t2_dv) ? vq_resp[gi].rdata : t2_word[gi];
+        assign texel[gi] = rf_out_word[gi];
     end endgenerate
-    assign out_pl = t2_pl;     // payload rode T0->T1->T2 in lockstep with the texels
-    // out_valid is the DRAIN PULSE (t2_adv), NOT the T2-occupied level (t2_v). A VQ pixel
-    // whose codebook read MISSES the cache lingers in T2 for the fill (t2_v stays high, but
-    // t2_adv waits for vq_ack). The downstream decode has no stall - it fires on every
-    // out_valid cycle - so a stretched level would re-decode the same (frozen) payload each
-    // fill cycle and desync the pipe. t2_adv pulses exactly once, on the cycle texel resolves
-    // (matching the legacy tex_fetch_core, which registered its out_valid off t2_adv).
-    assign out_valid = t2_adv;
+    assign out_pl    = rf_pl[rf_ra];
+    assign out_valid = rf_pop;
 
-    // ---- data words to carry/capture (held or just-landed) ----
-    wire [63:0] t0_word [0:3];
-    generate for (gi=0; gi<4; gi=gi+1) begin : t0w
-        assign t0_word[gi] = t0_dv ? t0_mem[gi] : tc_resp[gi].rdata;
-    end endgenerate
-
+    // ============================================================================
+    // SEQUENTIAL
+    // ============================================================================
     always @(posedge clk) begin
         if (reset) begin
-            t0_v<=0; t0_dv<=0; t1_v<=0; t2_v<=0; t2_dv<=0;
-            t0_tex<=0; t0_vq<=0; t1_tex<=0; t1_vq<=0; t2_vq<=0;
-            for (i=0;i<4;i=i+1) begin
-                t0_mem[i]<=64'd0; t1_mem[i]<=64'd0; t2_word[i]<=64'd0;
-                t0_lane[i]<=3'd0; t1_lane[i]<=3'd0;
-            end
+            df_wr <= 0; df_ld <= 0; df_rd <= 0;
+            rf_wr <= 0; rf_rd <= 0;
         end else begin
-            // ---- in -> T0 ----
+            // ---- df PUSH (accept) ----
             if (accept) begin
-                t0_v <= 1'b1; t0_dv <= 1'b0;
-                t0_tex <= tex; t0_vq <= vq; t0_vqbase <= vq_addr;
-                for (i=0;i<4;i=i+1) t0_lane[i] <= vqlane[i];
-                t0_pl <= in_pl;                          // payload latched with the pixel
-            end else if (t0_adv) t0_v <= 1'b0;
-
-            // ---- T0 data-word capture (lands cycle after accept; hold it) ----
-            if (t0_v && !t0_dv && tc_ack && !t0_adv) begin
-                for (i=0;i<4;i=i+1) t0_mem[i] <= tc_resp[i].rdata;
-                t0_dv <= 1'b1;
+                df_vq   [df_wa]  <= vq;
+                df_tex  [df_wa]  <= tex;
+                df_vqbase[df_wa] <= vq_addr;
+                for (i=0;i<4;i=i+1) df_lane[df_wa][i] <= vqlane[i];
+                df_pl   [df_wa]  <= in_pl;
+                df_wr <= df_wr + 1'b1;
             end
-
-            // ---- T0 -> T1 ----
-            if (t0_adv) begin
-                t1_v <= 1'b1; t1_tex <= t0_tex; t1_vq <= t0_vq; t1_vqbase <= t0_vqbase;
-                for (i=0;i<4;i=i+1) begin t1_mem[i] <= t0_word[i]; t1_lane[i] <= t0_lane[i]; end
-                t1_pl <= t0_pl;
-            end else if (t1_adv) t1_v <= 1'b0;
-
-            // ---- T1 -> T2 : non-VQ done immediately (word = data); VQ awaits its ack ----
-            if (t1_adv) begin
-                t2_v <= 1'b1; t2_vq <= (t1_tex && t1_vq);
-                t2_dv <= !(t1_tex && t1_vq);           // done unless VQ
-                for (i=0;i<4;i=i+1) t2_word[i] <= t1_mem[i];   // data word (VQ overwrites below)
-                t2_pl <= t1_pl;
-            end else if (t2_adv) t2_v <= 1'b0;
-
-            // ---- T2 VQ capture: codebook word lands cycle after its read accepted. Guarded
-            //      by !t2_adv, but vq_ack now implies t2_adv (out_ready tied high -> the pixel
-            //      drains the moment its word arrives), so this branch never fires - the
-            //      combinational texel bypass above forwards vq_resp.rdata on that drain cycle
-            //      instead. Kept for symmetry with the T0 capture / in case out_ready ever
-            //      gates T2 (then a held VQ pixel would latch its word here).
-            if (t2_v && t2_vq && !t2_dv && vq_ack && !t2_adv) begin
-                for (i=0;i<4;i=i+1) t2_word[i] <= vq_resp[i].rdata;
-                t2_dv <= 1'b1;
+            // ---- df LAND (capture TC word / bypass) ----
+            if (df_do_land) begin
+                if (df_la_tex)
+                    for (i=0;i<4;i=i+1) df_word[df_la][i] <= tc_resp[i].rdata;
+                // !tex: word unused; leave as-is.
+                df_ld <= df_ld + 1'b1;
             end
+            // ---- HEAD PROCESS -> rf PUSH ----
+            if (head_proc) begin
+                rf_vq[rf_wa] <= head_is_vq;
+                if (!head_is_vq)
+                    for (i=0;i<4;i=i+1) rf_word[rf_wa][i] <= df_word[df_ra][i];
+                rf_pl[rf_wa] <= df_pl[df_ra];
+                rf_wr <= rf_wr + 1'b1;
+                df_rd <= df_rd + 1'b1;
+            end
+            // ---- rf POP (emit) ----
+            if (rf_pop) rf_rd <= rf_rd + 1'b1;
         end
     end
+
+`ifndef SYNTHESIS
+    // queues must never overflow: assert on push-into-full.
+    always @(posedge clk) if (!reset) begin
+        if (accept    && df_wr_full) $display("$$$ tex_fetch4_ob df OVERFLOW %m @%0t", $time);
+        if (head_proc && rf_full)    $display("$$$ tex_fetch4_ob rf OVERFLOW %m @%0t", $time);
+    end
+`endif
 endmodule
