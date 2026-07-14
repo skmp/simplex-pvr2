@@ -217,7 +217,13 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
     generate for (gi=2; gi<=9; gi=gi+1) begin : cvt
         f2u8 u_c (.f(iv_attr[gi]), .u(u8a[gi]));
     end endgenerate
-    wire [31:0] iv_base = {u8a[5],u8a[4],u8a[3],u8a[2]};
+    // TSP.UseAlpha (bit 20) = 0 forces the BASE colour's alpha to 255 AFTER
+    // interpolation (refsw2 InterpolateBase: `if (!pp_UseAlpha) rv.a = 255`) - the
+    // vertex alpha plane is ignored. Without this, an alpha-blended UseAlpha=0 poly
+    // (e.g. the bios BACKGROUND: SRCALPHA/INVSRCALPHA with vertex alpha 0) blends to
+    // pure dst and shades whatever the colour buffer last held (black on a cold
+    // buffer). Offset colour alpha is NOT affected (refsw2 InterpolateOffs).
+    wire [31:0] iv_base = {(iv_tsp[20] ? u8a[5] : 8'd255),u8a[4],u8a[3],u8a[2]};
     wire [31:0] iv_ofs  = {u8a[9],u8a[8],u8a[7],u8a[6]};
 
     // ==============================================================
