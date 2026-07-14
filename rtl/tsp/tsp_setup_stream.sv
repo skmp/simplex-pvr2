@@ -9,7 +9,7 @@
 //
 // vs the previous II=4 window version:
 //   * all arithmetic on streaming registered-output units (fp_mul16_spp_ro 2clk,
-//     fp_mul_c9_spp_ro 2clk, fp_add24_spp_ro 3clk, fp_add3_24_spp_ro 3clk,
+//     fp_mul_c9_spp_ro 2clk, fp_add24_spp_ro 3clk, fp_add3_24_spp_ro 4clk,
 //     fp_rcp_fast 3clk) - no combinational unit output is ever consumed in the same
 //     cycle it is produced except through the next unit's OWN stage-1 register.
 //   * min-magnitude anchor RESTORED (the old stream always anchored on vertex 1):
@@ -25,40 +25,49 @@
 // inject pulse (per-plane stepper). Unit outputs are registered, valid exactly
 // LAT cycles after issue, and are read exactly then.
 //
-// GEO preamble (shared units, before/under the plane stream):
-//   cnt 1..4 : the 10 delta subs on A0/A1/A2 (3 add24 units)
-//                cnt1: Y31(A0)  Y21(A1)  X31(A2)
-//                cnt2: X21(A0)  XL1(A1)  YT1(A2)
-//                cnt3: XL2(A0)  YT2(A1)  XL3(A2)
-//                cnt4: YT3(A0)
-//   cnt 5    : area products X21*Y31 (M0), X31*Y21 (M1)   [outs cnt 7]
-//   cnt 7    : area = M0.y - M1.y on A0                   [out  cnt 10]
-//   cnt 8    : min-magnitude anchor select (XL/YT regs all captured by now)
-//   cnt 10   : rcp in                                     [rcy ready cnt 14]
+// GEO preamble (shared units, before/under the plane stream). The GEO operands go
+// through a REGISTER (g?_r) before the adders - selected at cnt N, issued at cnt N+1 -
+// so the wide cnt-mux is OFF the adder S1 critical path (it was reg->mux->S1-align,
+// a -3.5..-4ns violator; now reg->S1). Results land one cycle later than the naive
+// schedule; only the GEO timeline shifts, the plane stepper is untouched:
+//   sel cnt 1..4 : the 10 delta subs on A0/A1/A2 (issue cnt 2..5, results cnt 5..8)
+//                sel cnt1: Y31(A0)  Y21(A1)  X31(A2)      [results cnt 5]
+//                sel cnt2: X21(A0)  XL1(A1)  YT1(A2)      [results cnt 6]
+//                sel cnt3: XL2(A0)  YT2(A1)  XL3(A2)      [results cnt 7]
+//                sel cnt4: YT3(A0)                        [result  cnt 8]
+//   cnt 6     : area products X21*Y31 (M0), X31*Y21 (M1)  [outs cnt 8]
+//   sel cnt 8 : area = M0.y - M1.y on A0 (issue cnt 9)    [out  cnt 12]
+//   cnt 9     : min-magnitude anchor select (XL/YT regs all captured by now;
+//               anch/aXLr/aYTr valid cnt 10)
+//   cnt 12    : rcp in                                     [rcy ready cnt 16]
 //
 // Plane stepper (plane injected at T = 6 + 2k; all offsets relative to T):
 //   +0  prime v1 (MP0) + v2 (MP1)         p_i = z_i * attr_i   (mul16 / mul_c9)
 //   +1  prime v3 (MP0)
 //   +2  A1: da2 = p2 - p1                 (p1,p2 on the prime outputs NOW)
-//   +3  A1: da3 = p3 - p1_r ; pa = anchor-mux(p1_r,p2_r,p3) -> pa_sr
+//   +3  A1: da3 = p3 - p1_r ; p3 -> p3_r
+//   +4  pa = anchor-mux(p1_r,p2_r,p3_r) -> pa_sr   (anchor is valid cnt 10 = T+4
+//       for the FIRST plane - the extra p3_r hold buys the shifted GEO one cycle)
 //   +5  M0: da2*Y31   M1: X31*da2         (da2 on A1.y NOW)
 //   +6  M0: da3*Y21   M1: X21*da3
 //   +8  A2: Aa = da3*Y21 - da2*Y31        (M0.y now / held)
 //   +9  A2: Ba = X31*da2 - X21*da3        (both held)
-//   +11 MD: ddx = -Aa * rcy               (Aa on A2.y NOW; rcy ready cnt>=14)
+//   +11 MD: ddx = -Aa * rcy               (Aa on A2.y NOW; rcy ready cnt>=16)
 //   +12 MD: ddy = -Ba * rcy
 //   +13 MF: f0 = ddx * XLa                (ddx on MD.y NOW)
 //   +14 MF: f1 = ddy * YTa
-//   +16 A3: c = pa - f0 - f1              (pa from pa_sr; f0 held; f1 on MF.y NOW)
-//   +19 EMIT: o_ddx/o_ddy from the MD delay line, o_c = A3.y, idx from idx_sr
+//   +16 A3: c = pa - f0 - f1              (pa from pa_sr; f0 held; f1 on MF.y NOW;
+//                                          A3 is the 4-clock unit -> result at +20)
+//   +20 EMIT: o_ddx/o_ddy from the MD delay line, o_c = A3.y, idx from idx_sr
 //
-// The earliest inject T=6 satisfies every hazard: anchor (ready cnt 9) is first used
-// at T+3=9; rcy (ready cnt 14) is first used at T+11=17. With II=2 each unit sees each
-// offset parity exactly once - no structural conflicts (GEO uses A0/A1/A2 at cnt 1..4
-// and M0/M1 at cnt 5, all before the first stream issues at 8 and 11).
+// The earliest inject T=6 satisfies every hazard: anchor (ready cnt 10) is first used
+// at T+4=10; rcy (ready cnt 16) is first used at T+11=17. With II=2 each unit sees each
+// offset parity exactly once - no structural conflicts (GEO issues on A0/A1/A2 at
+// cnt 2..5 + area at 9, M0/M1 at cnt 6, all before the first stream issues at 8/9
+// (A1), 14 (A2), 11 (M0/M1)).
 //
-// Latency: inject -> plane_valid = 20 clks. n enabled planes: done at cnt 25+2n
-// (n=10 -> 45; n=4, flat untextured -> 33).
+// Latency: inject -> plane_valid = 21 clks. n enabled planes: done at cnt 26+2n
+// (n=10 -> 46; n=4, flat untextured -> 34).
 //
 // plane_valid pulses at MOST every 2 clocks (was every 4) - the consumer must accept
 // one plane per 2 clocks.
@@ -137,12 +146,12 @@ module tsp_setup_stream (
     reg              inj_uv_q;
 
     // ---------------- pulse + carry delay lines (shift every RUN clock) ----------
-    reg [19:1] d;                  // d[i] high during T+i for an inject at T
-    reg [3:0]  idx_sr [0:18];      // plane_idx to the emit point
-    reg [31:0] pa_sr  [0:12];      // anchor p to the C issue point
-    reg [31:0] dxy_sr [0:5];       // MD.y history: ddx@[5] / ddy@[4] at emit
+    reg [20:1] d;                  // d[i] high during T+i for an inject at T
+    reg [3:0]  idx_sr [0:19];      // plane_idx to the emit point (T+20)
+    reg [31:0] pa_sr  [0:11];      // anchor p (captured T+4) to the C issue point (T+16)
+    reg [31:0] dxy_sr [0:6];       // MD.y history: ddx@[6] / ddy@[5] at emit (T+20)
     reg        kd0, kd1;           // prime kind (uv/colour) aligned to prime outputs
-    reg [31:0] p1_r, p2_r;         // this plane's p1/p2 held for the +3 / pa cycles
+    reg [31:0] p1_r, p2_r, p3_r;   // this plane's primes held for the +3/+4 pa cycles
     reg [31:0] h_m0, h_m1, h2_m1, h_mf;   // 1/2-cycle output holds
 
     // ======================= arithmetic units =======================
@@ -162,63 +171,69 @@ module tsp_setup_stream (
     wire [31:0] p_mp0 = kd1 ? mu0_y : mc0_y;
     wire [31:0] p_mp1 = kd1 ? mu1_y : mc1_y;
 
-    // A0: GEO deltas + area (every op is a subtract -> sub tied 1)
-    reg [31:0] a0_a, a0_b;
-    always @(*) case (cnt)
-        6'd1:    begin a0_a = Yv[2]; a0_b = Yv[0]; end   // Y31
-        6'd2:    begin a0_a = Xv[1]; a0_b = Xv[0]; end   // X21
-        6'd3:    begin a0_a = Xv[1]; a0_b = XB;    end   // XL2
-        6'd4:    begin a0_a = Yv[2]; a0_b = YB;    end   // YT3
-        default: begin a0_a = m0_y;  a0_b = m1_y;  end   // area (issued cnt 7)
-    endcase
-    wire [31:0] a0_y;
-    fp_add24_spp_ro A0 (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && (cnt<=6'd4 || cnt==6'd7)),
-        .a(a0_a), .b_in(a0_b), .sub(1'b1), .out_valid(), .y(a0_y));
+    // -------- GEO operand REGISTER (Fix #2): the cnt-keyed operand mux is captured
+    // into g?_r one cycle before the add is issued, so the wide mux (and cnt's fanout)
+    // is OFF the adder S1 critical path (reg->S1, not reg->mux->S1). The plane-stream
+    // operands below stay direct - they are 2:1 muxes of registered unit outputs and
+    // were never the violator. Select at cnt N -> issue at cnt N+1 -> result cnt N+4.
+    reg [31:0] g0a_c, g0b_c, g1a_c, g1b_c, g2a_c, g2b_c;   // selected (comb)
+    reg        g0v_c, g1v_c, g2v_c;
+    always @(*) begin
+        g0a_c = m0_y;  g0b_c = m1_y;
+        g1a_c = Yv[1]; g1b_c = Yv[0];
+        g2a_c = Xv[2]; g2b_c = Xv[0];
+        g0v_c = 1'b0;  g1v_c = 1'b0;  g2v_c = 1'b0;
+        case (cnt)
+            6'd1: begin g0a_c=Yv[2]; g0b_c=Yv[0]; g0v_c=1'b1;     // Y31
+                        g1a_c=Yv[1]; g1b_c=Yv[0]; g1v_c=1'b1;     // Y21
+                        g2a_c=Xv[2]; g2b_c=Xv[0]; g2v_c=1'b1; end // X31
+            6'd2: begin g0a_c=Xv[1]; g0b_c=Xv[0]; g0v_c=1'b1;     // X21
+                        g1a_c=Xv[0]; g1b_c=XB;    g1v_c=1'b1;     // XL1
+                        g2a_c=Yv[0]; g2b_c=YB;    g2v_c=1'b1; end // YT1
+            6'd3: begin g0a_c=Xv[1]; g0b_c=XB;    g0v_c=1'b1;     // XL2
+                        g1a_c=Yv[1]; g1b_c=YB;    g1v_c=1'b1;     // YT2
+                        g2a_c=Xv[2]; g2b_c=XB;    g2v_c=1'b1; end // XL3
+            6'd4: begin g0a_c=Yv[2]; g0b_c=YB;    g0v_c=1'b1; end // YT3
+            6'd8: begin g0a_c=m0_y;  g0b_c=m1_y;  g0v_c=1'b1; end // area = M0-M1
+            default: ;
+        endcase
+    end
+    reg [31:0] g0a_r, g0b_r, g1a_r, g1b_r, g2a_r, g2b_r;
+    reg        g0v_r, g1v_r, g2v_r;
 
-    // A1: GEO (cnt 1..3) then the plane da2/da3 stream
-    reg [31:0] a1_a, a1_b;
-    always @(*) case (cnt)
-        6'd1:    begin a1_a = Yv[1]; a1_b = Yv[0]; end   // Y21
-        6'd2:    begin a1_a = Xv[0]; a1_b = XB;    end   // XL1
-        6'd3:    begin a1_a = Yv[1]; a1_b = YB;    end   // YT2
-        default: begin                                    // da3 : da2
-            a1_a = d[3] ? p_mp0 : p_mp1;
-            a1_b = d[3] ? p1_r  : p_mp0;
-        end
-    endcase
+    // A0: GEO-only (deltas + area), always via the registered operand
+    wire [31:0] a0_y;
+    fp_add24_spp_ro A0 (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(g0v_r),
+        .a(g0a_r), .b_in(g0b_r), .sub(1'b1), .out_valid(), .y(a0_y));
+
+    // A1: GEO via g1_r, then the plane da2/da3 stream (direct - registered sources)
+    wire [31:0] a1_a = g1v_r ? g1a_r : (d[3] ? p_mp0 : p_mp1);   // da3 : da2
+    wire [31:0] a1_b = g1v_r ? g1b_r : (d[3] ? p1_r  : p_mp0);
     wire [31:0] a1_y;
     fp_add24_spp_ro A1 (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && (cnt>=6'd1 && cnt<=6'd3) || d[2] || d[3]),
+        .in_valid(g1v_r || d[2] || d[3]),
         .a(a1_a), .b_in(a1_b), .sub(1'b1), .out_valid(), .y(a1_y));
 
-    // A2: GEO (cnt 1..3) then the plane Aa/Ba stream
-    reg [31:0] a2_a, a2_b;
-    always @(*) case (cnt)
-        6'd1:    begin a2_a = Xv[2]; a2_b = Xv[0]; end   // X31
-        6'd2:    begin a2_a = Yv[0]; a2_b = YB;    end   // YT1
-        6'd3:    begin a2_a = Xv[2]; a2_b = XB;    end   // XL3
-        default: begin                                    // Ba : Aa
-            a2_a = d[9] ? h2_m1 : m0_y;
-            a2_b = d[9] ? h_m1  : h_m0;
-        end
-    endcase
+    // A2: GEO via g2_r, then the plane Aa/Ba stream
+    wire [31:0] a2_a = g2v_r ? g2a_r : (d[9] ? h2_m1 : m0_y);    // Ba : Aa
+    wire [31:0] a2_b = g2v_r ? g2b_r : (d[9] ? h_m1  : h_m0);
     wire [31:0] a2_y;
     fp_add24_spp_ro A2 (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && (cnt>=6'd1 && cnt<=6'd3) || d[8] || d[9]),
+        .in_valid(g2v_r || d[8] || d[9]),
         .a(a2_a), .b_in(a2_b), .sub(1'b1), .out_valid(), .y(a2_y));
 
-    // M0/M1: area products (cnt 5) then the plane mC stream
-    wire [31:0] m0_a = (cnt==6'd5) ? a0_y : a1_y;                    // X21 / da2 / da3
-    wire [31:0] m0_b = (cnt==6'd5) ? Y31r : (d[6] ? Y21r : Y31r);
-    wire [31:0] m1_a = (cnt==6'd5) ? X31r : (d[6] ? X21r : X31r);
-    wire [31:0] m1_b = (cnt==6'd5) ? Y21r : a1_y;
+    // M0/M1: area products (cnt 6: X21 on A0.y then, Y31r/X31r/Y21r captured cnt 5)
+    // then the plane mC stream
+    wire [31:0] m0_a = (cnt==6'd6) ? a0_y : a1_y;                    // X21 / da2 / da3
+    wire [31:0] m0_b = (cnt==6'd6) ? Y31r : (d[6] ? Y21r : Y31r);
+    wire [31:0] m1_a = (cnt==6'd6) ? X31r : (d[6] ? X21r : X31r);
+    wire [31:0] m1_b = (cnt==6'd6) ? Y21r : a1_y;
     wire [31:0] m0_y, m1_y;
     fp_mul16_spp_ro M0 (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && cnt==6'd5 || d[5] || d[6]),
+        .in_valid(run && cnt==6'd6 || d[5] || d[6]),
         .a(m0_a), .b(m0_b), .out_valid(), .y(m0_y));
     fp_mul16_spp_ro M1 (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && cnt==6'd5 || d[5] || d[6]),
+        .in_valid(run && cnt==6'd6 || d[5] || d[6]),
         .a(m1_a), .b(m1_b), .out_valid(), .y(m1_y));
 
     // MD: ddx/ddy = -Aa/-Ba * rcy (fixed routing)
@@ -236,26 +251,29 @@ module tsp_setup_stream (
     // A3: c = pa - f0 - f1
     wire [31:0] a3_y;
     fp_add3_24_spp_ro A3 (.clk(clk),.reset(reset),.stall(1'b0),.in_valid(d[16]),
-        .a(pa_sr[12]), .b(fneg(h_mf)), .c(fneg(mf_y)), .out_valid(), .y(a3_y));
+        .a(pa_sr[11]), .b(fneg(h_mf)), .c(fneg(mf_y)), .out_valid(), .y(a3_y));
 
-    // RCP: 1/area, once per triangle
+    // RCP: 1/area, once per triangle (area = A0 result, valid cnt 12)
     wire        rc_ack; wire [31:0] rc_y;
     fp_rcp_fast u_rcp (.clk(clk),.reset(reset),.stall(1'b0),
-        .in_valid(run && cnt==6'd10), .x(a0_y), .out_valid(rc_ack), .y(rc_y));
+        .in_valid(run && cnt==6'd12), .x(a0_y), .out_valid(rc_ack), .y(rc_y));
 
-    // anchor-p mux (correct only during a plane's T+3 cycle; pa_sr tap reads it then)
-    wire [31:0] pa_mux = (anch==2'd2) ? p_mp0 : (anch==2'd1) ? p2_r : p1_r;
+    // anchor-p mux (correct only during a plane's T+4 cycle - p1/p2/p3 all in holds by
+    // then, and the anchor regs are valid from cnt 10 = T+4 of the first plane)
+    wire [31:0] pa_mux = (anch==2'd2) ? p3_r : (anch==2'd1) ? p2_r : p1_r;
 
     // ======================= sequential control =======================
     integer i;
     always @(posedge clk) begin
         if (reset) begin
             run<=1'b0; done<=1'b0; plane_valid<=1'b0; fin<=1'b0;
-            cnt<=6'd0; d<=19'd0;
+            cnt<=6'd0; d<='0;
+            g0v_r<=1'b0; g1v_r<=1'b0; g2v_r<=1'b0;
         end else begin
             done<=1'b0; plane_valid<=1'b0;
 
             if (!run) begin
+                g0v_r<=1'b0; g1v_r<=1'b0; g2v_r<=1'b0;
                 if (start) begin
                     Zr[0]<=z1; Zr[1]<=z2; Zr[2]<=z3;
                     Xv[0]<=x1; Xv[1]<=x2; Xv[2]<=x3;
@@ -268,18 +286,23 @@ module tsp_setup_stream (
                     g_r<=gouraud; tex_r<=texture; ofs_r<=offset;
                     n_planes <= 4'd4 + (texture ? 4'd2 : 4'd0) + (offset ? 4'd4 : 4'd0);
                     nextp<=4'd0; emit_cnt<=4'd0; fin<=1'b0;
-                    d<=19'd0; cnt<=6'd1; run<=1'b1;
+                    d<='0; cnt<=6'd1; run<=1'b1;
                 end
             end else begin
                 cnt <= (cnt==6'd63) ? cnt : cnt + 6'd1;
 
-                // ---- GEO result captures (fixed output clocks) ----
-                if (cnt==6'd4) begin Y31r<=a0_y; Y21r<=a1_y; X31r<=a2_y; end
-                if (cnt==6'd5) begin X21r<=a0_y; XL1r<=a1_y; YT1r<=a2_y; end
-                if (cnt==6'd6) begin XL2r<=a0_y; YT2r<=a1_y; XL3r<=a2_y; end
-                if (cnt==6'd7) begin YT3r<=a0_y; end
+                // ---- GEO operand registration (Fix #2): sel cnt N -> issue cnt N+1
+                g0a_r<=g0a_c; g0b_r<=g0b_c; g0v_r<=g0v_c;
+                g1a_r<=g1a_c; g1b_r<=g1b_c; g1v_r<=g1v_c;
+                g2a_r<=g2a_c; g2b_r<=g2b_c; g2v_r<=g2v_c;
+
+                // ---- GEO result captures (adder result = sel + 4) ----
+                if (cnt==6'd5) begin Y31r<=a0_y; Y21r<=a1_y; X31r<=a2_y; end
+                if (cnt==6'd6) begin X21r<=a0_y; XL1r<=a1_y; YT1r<=a2_y; end
+                if (cnt==6'd7) begin XL2r<=a0_y; YT2r<=a1_y; XL3r<=a2_y; end
+                if (cnt==6'd8) begin YT3r<=a0_y; end
                 // min-magnitude anchor (all six offsets captured by now)
-                if (cnt==6'd8) begin
+                if (cnt==6'd9) begin
                     if (amag(XL3r,YT3r) < amag(XL1r,YT1r) &&
                         amag(XL3r,YT3r) < amag(XL2r,YT2r)) begin
                         anch<=2'd2; aXLr<=XL3r; aYTr<=YT3r;
@@ -301,24 +324,25 @@ module tsp_setup_stream (
 
                 // ---- pulse + carry delay lines (shift every clock) ----
                 d[1] <= inject;
-                for (i=2; i<=19; i=i+1) d[i] <= d[i-1];
+                for (i=2; i<=20; i=i+1) d[i] <= d[i-1];
                 idx_sr[0] <= inj_idx;
-                for (i=1; i<=18; i=i+1) idx_sr[i] <= idx_sr[i-1];
+                for (i=1; i<=19; i=i+1) idx_sr[i] <= idx_sr[i-1];
                 pa_sr[0] <= pa_mux;
-                for (i=1; i<=12; i=i+1) pa_sr[i] <= pa_sr[i-1];
+                for (i=1; i<=11; i=i+1) pa_sr[i] <= pa_sr[i-1];
                 dxy_sr[0] <= md_y;
-                for (i=1; i<=5;  i=i+1) dxy_sr[i] <= dxy_sr[i-1];
+                for (i=1; i<=6;  i=i+1) dxy_sr[i] <= dxy_sr[i-1];
                 kd0 <= inject ? inj_uv : inj_uv_q;
                 kd1 <= kd0;
                 h_m0 <= m0_y;  h_m1 <= m1_y;  h2_m1 <= h_m1;  h_mf <= mf_y;
                 if (d[2]) begin p1_r <= p_mp0; p2_r <= p_mp1; end
+                if (d[3]) begin p3_r <= p_mp0; end   // p3 held for the T+4 pa mux
 
-                // ---- emit ----
-                if (d[19]) begin
+                // ---- emit (A3 is 4-clock: d[16] issue -> result at d[20]) ----
+                if (d[20]) begin
                     plane_valid <= 1'b1;
-                    plane_idx   <= idx_sr[18];
-                    o_ddx <= dxy_sr[5];
-                    o_ddy <= dxy_sr[4];
+                    plane_idx   <= idx_sr[19];
+                    o_ddx <= dxy_sr[6];
+                    o_ddy <= dxy_sr[5];
                     o_c   <= a3_y;
                     emit_cnt <= emit_cnt + 4'd1;
                     if (emit_cnt + 4'd1 == n_planes) fin <= 1'b1;
