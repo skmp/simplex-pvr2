@@ -24,7 +24,7 @@
 // Split after the min/max reduction so the compare cascade and the add+clamp are in
 // separate stages:
 //   S1 : exponent extracts ; eX=max,eY=max ; eMin=min ; pick mMin ; mmd_log2 (casez)
-//   S2 : lod = eMin+eW+texu+mmd_log2+mMin+mW-254 ; clamp -> miplevel
+//   S2 : lod = eMin+eW+texu+mmd_log2+mMin+mW-253 ; clamp -> miplevel
 //
 // HOLD (backpressure): lives inside tsp_shade_pp's `en`-gated front (a texture-cache
 // miss freezes the whole front via one clock-enable). Takes `stall` (same convention
@@ -94,8 +94,7 @@ module tsp_miplevel (
 
     // ================= STAGE 2 : lod accumulate + clamp -> miplevel ===================
     // log2(dMip): (eMin-127)+(eW-127)+(3+TexU)+(mmd_log2-2)+mMin+mW
-    //           = eMin + eW + TexU + mmd_log2 + mMin + mW - 253, biased -1 more (-254)
-    //             to select one lower (sharper) mip level.
+    //           = eMin + eW + TexU + mmd_log2 + mMin + mW - 253
     wire signed [11:0] lod =
           $signed({4'd0, s1_eMin})
         + $signed({4'd0, s1_eW})
@@ -103,7 +102,7 @@ module tsp_miplevel (
         + $signed({9'd0, s1_mmd_log2})
         + $signed({11'd0, s1_mMin})
         + $signed({11'd0, s1_mW})
-        - 12'sd254;
+        - 12'sd253;
     wire [3:0] lvl_max = 4'(3) + {1'b0, s1_texu};   // TexU+3 (max 10)
     reg v2;
     always @(posedge clk) begin
