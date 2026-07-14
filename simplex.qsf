@@ -14,6 +14,8 @@
 
 set_global_assignment -name FAMILY "Cyclone V"
 set_global_assignment -name DEVICE 5CSEBA6U23I7
+set_global_assignment -name MIN_CORE_JUNCTION_TEMP 0
+set_global_assignment -name MAX_CORE_JUNCTION_TEMP 85
 set_global_assignment -name LAST_QUARTUS_VERSION "17.0.0 Standard Edition"
 
 set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
