@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <vector>
 
 static Vtsp_setup_stream_tb_top* dut;
 
@@ -155,6 +156,114 @@ int main(int argc, char** argv){
     printf("  avg cycles/tri: min=%.1f stream=%.1f (stream max %d)\n",
            (double)cyc_min_sum/NT, (double)cyc_str_sum/NT, cyc_str_max);
     printf("  planes where stream >4x worse than min: %ld\n", bad);
+
+    // ================= PHASE 2: back-to-back (rdy handshake) =================
+    // Same RTL, same triangles run twice: first serially (start after done), then
+    // back-to-back (start held, latched on rdy). The emission sequences must be
+    // BIT-EXACT (overlapping triangles share the units + delay lines, so any overlap
+    // hazard corrupts bits), and done must pulse exactly once per triangle.
+    struct Tri { uint32_t x[3],y[3],z[3],u[3],v[3],co[3],of[3],xb,yb; int g,tex,ofl; };
+    struct Emit { int idx; uint32_t ddx, ddy, c; };
+
+    auto apply_tri = [&](const Tri& tr){
+        dut->x1=tr.x[0]; dut->y1=tr.y[0]; dut->z1=tr.z[0];
+        dut->x2=tr.x[1]; dut->y2=tr.y[1]; dut->z2=tr.z[1];
+        dut->x3=tr.x[2]; dut->y3=tr.y[2]; dut->z3=tr.z[2];
+        dut->xbase=tr.xb; dut->ybase=tr.yb;
+        dut->u1=tr.u[0]; dut->v1=tr.v[0];
+        dut->u2=tr.u[1]; dut->v2=tr.v[1];
+        dut->u3=tr.u[2]; dut->v3=tr.v[2];
+        dut->col1=tr.co[0]; dut->col2=tr.co[1]; dut->col3=tr.co[2];
+        dut->ofs1=tr.of[0]; dut->ofs2=tr.of[1]; dut->ofs3=tr.of[2];
+        dut->gouraud=tr.g; dut->texture=tr.tex; dut->offset=tr.ofl;
+    };
+    auto gen_tri = [&](int force_all)->Tri{
+        Tri tr; float xs[3], ys[3]; double a;
+        do {
+            for (int i=0;i<3;i++) { xs[i]=frnd(0,640); ys[i]=frnd(0,480); }
+            a = ((double)xs[1]-xs[0])*((double)ys[2]-ys[0])
+              - ((double)xs[2]-xs[0])*((double)ys[1]-ys[0]);
+        } while (fabs(a) < 4.0);
+        for (int i=0;i<3;i++) {
+            tr.x[i]=b32(xs[i]); tr.y[i]=b32(ys[i]); tr.z[i]=b32(frnd(0.01f,50.f));
+            tr.u[i]=b32(frnd(0,8)); tr.v[i]=b32(frnd(0,8));
+            tr.co[i]=(uint32_t)rand()<<16 ^ (uint32_t)rand();
+            tr.of[i]=(uint32_t)rand()<<16 ^ (uint32_t)rand();
+        }
+        tr.xb=b32(32.f*(int)(fminf(fminf(xs[0],xs[1]),xs[2])/32.f));
+        tr.yb=b32(32.f*(int)(fminf(fminf(ys[0],ys[1]),ys[2])/32.f));
+        tr.g   = force_all ? 1 : (rand()&1);
+        tr.tex = force_all ? 1 : (rand()&1);
+        tr.ofl = force_all ? 1 : (rand()&1);
+        return tr;
+    };
+    // serial run of the STREAM unit, recording raw-bit emissions in order
+    auto run_serial = [&](const Tri& tr, std::vector<Emit>& out)->void{
+        apply_tri(tr);
+        if (!dut->rdy_str) { printf("B2B: rdy low at serial start\n"); exit(1); }
+        dut->start_str = 1; tick(); dut->start_str = 0;
+        for (int cyc=1; cyc<1200; cyc++) {
+            if (dut->pv_str) out.push_back({(int)dut->pidx_str, dut->ddx_str, dut->ddy_str, dut->c_str});
+            if (dut->done_str) return;
+            tick();
+        }
+        printf("B2B: serial TIMEOUT\n"); exit(1);
+    };
+    // back-to-back run of a whole batch: start held, latched on rdy; collect the
+    // global emission sequence + done count; returns total ticks
+    auto run_b2b = [&](const std::vector<Tri>& tris, std::vector<Emit>& out, long& dones)->long{
+        long ticks = 0, guard = 0;
+        size_t next = 0; dones = 0;
+        while (next < tris.size() || dones < (long)tris.size()) {
+            bool accepted = false;
+            if (next < tris.size()) {
+                apply_tri(tris[next]);
+                dut->start_str = 1;
+                accepted = dut->rdy_str;   // latch happens on this edge
+            } else dut->start_str = 0;
+            tick(); ticks++;
+            if (accepted) next++;
+            if (dut->pv_str) out.push_back({(int)dut->pidx_str, dut->ddx_str, dut->ddy_str, dut->c_str});
+            if (dut->done_str) dones++;
+            if (++guard > 500000) { printf("B2B: TIMEOUT (next=%zu dones=%ld)\n", next, dones); exit(1); }
+        }
+        dut->start_str = 0;
+        return ticks;
+    };
+    auto check_batch = [&](const char* name, const std::vector<Tri>& tris)->long{
+        std::vector<std::vector<Emit>> ser(tris.size());
+        for (size_t t=0; t<tris.size(); t++) run_serial(tris[t], ser[t]);
+        std::vector<Emit> b2b; long dones=0;
+        long ticks = run_b2b(tris, b2b, dones);
+        long mism = 0; size_t k = 0, expect_total = 0;
+        for (size_t t=0; t<tris.size(); t++) {
+            for (auto& e : ser[t]) {
+                expect_total++;
+                if (k >= b2b.size()) { mism++; continue; }
+                Emit& o = b2b[k++];
+                if (o.idx!=e.idx || o.ddx!=e.ddx || o.ddy!=e.ddy || o.c!=e.c) {
+                    mism++;
+                    if (mism <= 8)
+                        printf("B2B MISMATCH t=%zu: got idx%d %08x/%08x/%08x want idx%d %08x/%08x/%08x\n",
+                               t, o.idx,o.ddx,o.ddy,o.c, e.idx,e.ddx,e.ddy,e.c);
+                }
+            }
+        }
+        if (b2b.size() != expect_total) { printf("B2B %s: emission count %zu != %zu\n", name, b2b.size(), expect_total); mism++; }
+        if (dones != (long)tris.size())  { printf("B2B %s: done count %ld != %zu\n", name, dones, tris.size()); mism++; }
+        printf("  b2b %s: %zu tris, %zu planes, mismatches=%ld, sustained %.1f cyc/tri\n",
+               name, tris.size(), expect_total, mism, (double)ticks/tris.size());
+        return mism;
+    };
+
+    std::vector<Tri> batch_rand, batch_full;
+    for (int t=0; t<3000; t++) batch_rand.push_back(gen_tri(0));
+    for (int t=0; t<500;  t++) batch_full.push_back(gen_tri(1));
+    long b2b_mism = 0;
+    printf("back-to-back (rdy handshake) vs serial, bit-exact:\n");
+    b2b_mism += check_batch("random-flags", batch_rand);
+    b2b_mism += check_batch("all-10-plane", batch_full);
+
     dut->final(); delete dut;
-    return bad ? 1 : 0;
+    return (bad || b2b_mism) ? 1 : 0;
 }

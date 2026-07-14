@@ -13,9 +13,13 @@
 //   stall=1 freezes every stage. one result/clock throughput when !stall.
 //
 // Pipeline:
-//   (comb, off inputs) decode + |k| + 16x9 product
-//   [S1 REG] prod(25) + ef + sign + zero flags
-//   (comb)   MSB scan + normalize + pack
+//   (comb, off inputs) decode + |k| + 16x9 product + msb(|k|) (9-bit priority - cheap)
+//   [S1 REG] prod(25) + mk(4) + ef + sign + zero flags
+//   (comb)   normalize + pack. The product's leading 1 is at mk+15 or mk+16 (sig is in
+//            [2^15,2^16), |k| in [2^mk,2^(mk+1)) -> prod in [2^(mk+15),2^(mk+17))), so
+//            S2 tests ONE product bit instead of running a 10-way priority scan over
+//            the 25-bit product - that scan stacked on the shift+pack was an Fmax
+//            violator (-1.1ns).
 //   [S2 REG] y ; out_valid
 //
 module fp_mul_c9_spp_ro (
@@ -39,9 +43,19 @@ module fp_mul_c9_spp_ro (
     wire [15:0] sig    = {1'b1, f[22:8]};
     wire [24:0] prod_c = sig * {16'd0, kabs};        // 16 x 9 -> 25 bits
 
+    // msb(|k|): 9-bit priority encode (0..8), computed in parallel with the product.
+    reg [3:0] mk_c;
+    integer ki;
+    always @(*) begin
+        mk_c = 4'd0;
+        for (ki = 0; ki <= 8; ki = ki + 1)
+            if (kabs[ki]) mk_c = ki[3:0];
+    end
+
     // ================= S1 REGISTER: product + carried decode =================
     reg        v1;
     reg [24:0] s1_prod;
+    reg [3:0]  s1_mk;
     reg [7:0]  s1_ef;
     reg        s1_sign, s1_zero;
     always @(posedge clk) begin
@@ -49,6 +63,7 @@ module fp_mul_c9_spp_ro (
         else if (!stall) begin
             v1      <= in_valid;
             s1_prod <= prod_c;
+            s1_mk   <= mk_c;
             s1_ef   <= ef;
             s1_sign <= sf ^ ksign;
             s1_zero <= f_zero | k_zero;
@@ -56,17 +71,11 @@ module fp_mul_c9_spp_ro (
     end
 
     // ================= combinational normalize + pack from S1 ================
-    // leading one is between bit15 (k==1) and bit24 (k up to 256).
-    reg  [4:0] msb;
-    integer i;
-    always @(*) begin
-        msb = 5'd15;
-        for (i = 15; i <= 24; i = i + 1)
-            if (s1_prod[i]) msb = i[4:0];
-    end
-
-    wire [5:0]  sh   = msb - 5'd15;                  // 0..9
-    wire [24:0] norm = s1_prod >> sh;                // leading one -> bit15
+    // leading one is at mk+15 or mk+16; one bit test picks which (see header).
+    wire [4:0] hi_bit = {1'b0, s1_mk} + 5'd16;       // candidate upper position
+    wire       top    = s1_prod[hi_bit];             // set -> msb = mk+16
+    wire [5:0] sh     = {2'b0, s1_mk} + (top ? 6'd1 : 6'd0);   // 0..9
+    wire [24:0] norm  = s1_prod >> sh;               // leading one -> bit15
     wire [22:0] mant = {norm[14:0], 8'b0};           // 15 real frac bits, padded
 
     wire signed [10:0] e = $signed({3'b0, s1_ef}) + $signed({5'b0, sh});

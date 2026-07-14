@@ -19,7 +19,7 @@ module tsp_setup_stream_tb_top (
     output [3:0]      pidx_min,
     output [31:0]     ddx_min, ddy_min, c_min,
 
-    output            done_str, pv_str,
+    output            done_str, pv_str, rdy_str,
     output [3:0]      pidx_str,
     output [31:0]     ddx_str, ddy_str, c_str
 );
@@ -34,7 +34,7 @@ module tsp_setup_stream_tb_top (
         .o_ddx(ddx_min), .o_ddy(ddy_min), .o_c(c_min));
 
     tsp_setup_stream u_str (
-        .clk(clk), .reset(reset), .start(start_str), .done(done_str),
+        .clk(clk), .reset(reset), .start(start_str), .rdy(rdy_str), .done(done_str),
         .gouraud(gouraud), .texture(texture), .offset(offset),
         .x1(x1),.y1(y1),.z1(z1), .x2(x2),.y2(y2),.z2(z2), .x3(x3),.y3(y3),.z3(z3),
         .xbase(xbase), .ybase(ybase),

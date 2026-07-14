@@ -282,7 +282,7 @@ tspsetupstream: | $(BUILD)
 	  rtl/tsp/tsp_setup_min.sv rtl/tsp/tsp_setup_stream.sv \
 	  rtl/tsp/fp_mul_c9.sv rtl/tsp/fp_mul_c9_spp_ro.sv \
 	  rtl/isp_min/mac16.sv rtl/isp_min/fp_mul16.sv rtl/isp_min/fp_add24.sv \
-	  rtl/isp_min/fp_rcp_fast.sv \
+	  rtl/isp_min/fp_rcp_fast.sv rtl/isp_min/fp_rcp_faster.sv \
 	  rtl/isp_min/fp_mul16_spp_ro.sv rtl/isp_min/fp_add24_spp_ro.sv rtl/isp_min/fp_add3_24_spp_ro.sv \
 	  $(CWD)/tb/tsp_setup_stream_tb.cpp -CFLAGS -I$(CWD)/tb --Mdir $(BUILD)/obj_tspsetupstream -o tb
 	./$(BUILD)/obj_tspsetupstream/tb

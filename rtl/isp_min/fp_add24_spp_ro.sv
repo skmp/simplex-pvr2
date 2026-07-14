@@ -4,12 +4,19 @@
 // Same reduced-precision non-IEEE add/sub as the combinational fp_add24 (DaZ, no
 // inf/NaN, truncate, overflow saturates, underflow flushes) and BIT-EXACT to it for the
 // same (a, b_in, sub) - but split into a 3-clock streaming pipeline whose OUTPUT is
-// registered. The deep part of fp_add24 is the normalize: a 24-way leading-zero scan
-// feeding a variable shift + pack. That single combinational cloud (stacked after the
-// align+add) is the Fmax limiter, so here it is SPLIT across two stages:
-//   S1 : align + add/sub  (== fp_add24_s1)            -> {sum, e_big, s_big}
-//   S2 : leading-1 SEARCH only (priority encode -> shift amount / case), no shifting
-//   S3 : apply the shift + exponent adjust + pack     -> registered y
+// registered.
+//
+// S1 is restructured in the fp_add3_24 style: instead of fp_add24's compare-and-swap
+// alignment (8b exp compare + 24b significand magnitude compare -> big/small swap
+// muxes -> shift -> add, ~12ns on Cyclone V), BOTH operands are aligned to the max
+// exponent and summed SIGNED:
+//   S1 : e_max = max(exa,exb); shift each significand right by (e_max - e_own); the
+//        larger shifts by 0 (lossless), the smaller truncates exactly as fp_add24's
+//        single-shift did -> signed sum (26b). No magnitude compare, no swap.
+//   S2 : sign/abs + leading-1 SEARCH only (priority encode -> shift select / amount).
+//   S3 : apply the shift + exponent adjust + pack -> registered y.
+// Bit-exact: |ssum| == big - small_shifted (same truncation), sign(ssum) == sign of the
+// larger-magnitude operand, and the exact-cancellation case packs +0 both ways.
 //
 // CONVENTION (matches fp_rcp_fast / the streaming units):
 //   ports (clk, reset, stall, in_valid, a, b_in, sub, out_valid, y).
@@ -28,77 +35,76 @@ module fp_add24_spp_ro (
     output reg [31:0] y
 );
     // ======================================================================
-    // S1 combinational: align + add/sub (identical to fp_add24_s1).
+    // S1 combinational: align BOTH operands to the max exponent + signed sum.
     // ======================================================================
     wire [31:0] b = sub ? {~b_in[31], b_in[30:0]} : b_in;
     wire       sa = a[31],  sb = b[31];
     wire [7:0] ea = a[30:23], eb = b[30:23];
 
+    // same decode as fp_add24: denormal keeps its mantissa with hidden bit 0,
+    // exponent clamped to 1.
     wire [23:0] sig_a = {(ea != 8'd0), a[22:0]};
     wire [23:0] sig_b = {(eb != 8'd0), b[22:0]};
     wire [7:0]  exa   = (ea == 8'd0) ? 8'd1 : ea;
     wire [7:0]  exb   = (eb == 8'd0) ? 8'd1 : eb;
 
-    wire        a_ge  = (exa > exb) || ((exa == exb) && (sig_a >= sig_b));
-    wire [23:0] sig_big = a_ge ? sig_a : sig_b;
-    wire [23:0] sig_sml = a_ge ? sig_b : sig_a;
-    wire        s_sml   = a_ge ? sb : sa;
-    wire [7:0]  e_sml_e = a_ge ? exb : exa;
-    wire [7:0]  e_big_c = a_ge ? exa : exb;
-    wire        s_big_c = a_ge ? sa : sb;
-    wire [7:0]  shamt   = e_big_c - e_sml_e;
+    wire [7:0] e_max_c = (exa >= exb) ? exa : exb;
+    wire [7:0] sha = e_max_c - exa;
+    wire [7:0] shb = e_max_c - exb;
+    wire [23:0] al_a = (sha >= 8'd24) ? 24'd0 : (sig_a >> sha);
+    wire [23:0] al_b = (shb >= 8'd24) ? 24'd0 : (sig_b >> shb);
 
-    wire [23:0] sml_sh = (shamt >= 8'd24) ? 24'd0 : (sig_sml >> shamt);
-    wire same_sign = (s_big_c == s_sml);
-    wire [24:0] sum_c = same_sign ? ({1'b0, sig_big} + {1'b0, sml_sh})
-                                  : ({1'b0, sig_big} - {1'b0, sml_sh});
+    // signed contributions: 26 bits = 24 mag + sign + 1 headroom (sum of two).
+    wire signed [25:0] va = sa ? -$signed({2'b0, al_a}) : $signed({2'b0, al_a});
+    wire signed [25:0] vb = sb ? -$signed({2'b0, al_b}) : $signed({2'b0, al_b});
+    wire signed [25:0] ssum_c = va + vb;
 
     // ---- S1 registers ----
     reg               v1;
-    reg [24:0]        s1_sum;
-    reg [7:0]         s1_ebig;
-    reg               s1_sbig;
+    reg signed [25:0] s1_ssum;
+    reg [7:0]         s1_emax;
     always @(posedge clk) begin
         if (reset) v1 <= 1'b0;
         else if (!stall) begin
             v1      <= in_valid;
-            s1_sum  <= sum_c;
-            s1_ebig <= e_big_c;
-            s1_sbig <= s_big_c;
+            s1_ssum <= ssum_c;
+            s1_emax <= e_max_c;
         end
     end
 
     // ======================================================================
-    // S2 combinational: leading-1 SEARCH ONLY. Determine how the significand must be
-    // normalized (carry-out, already-normal, or a cancellation left-shift by `lz`),
-    // WITHOUT doing the shift here - that is the deep part and moves to S3.
-    //   sh_sel : 0 = carry (sum[24])   -> shift right 1, exp+1
-    //            1 = normal (sum[23])  -> no shift
-    //            2 = cancel            -> left shift by `lz` (1..23), exp-lz
-    //   lz     : leading-zero count in [1..23] for the cancel case (else 0).
+    // S2 combinational: sign/abs + leading-1 SEARCH ONLY (no shifting here).
+    // mag is 25 bits: bit24 = carry (same-sign add overflow), bit23 = already
+    // normal, below = cancellation left-shift by `lz`.
+    //   sh_sel : 0 = carry (mag[24]) -> shift right 1, exp+1
+    //            1 = normal (mag[23]) -> no shift
+    //            2 = cancel           -> left shift by `lz` (1..23), exp-lz
     // ======================================================================
+    wire        s_res_c = s1_ssum[25];
+    wire [24:0] mag_c   = s_res_c ? (~s1_ssum[24:0] + 25'd1) : s1_ssum[24:0];
+
     reg  [1:0] sh_sel_c;
     reg  [4:0] lz_c;
     integer si; reg found_c;
     always @(*) begin
         found_c = 1'b0;
-        if (s1_sum[24]) begin
+        if (mag_c[24]) begin
             sh_sel_c = 2'd0; lz_c = 5'd0;
-        end else if (s1_sum[23]) begin
+        end else if (mag_c[23]) begin
             sh_sel_c = 2'd1; lz_c = 5'd0;
         end else begin
             sh_sel_c = 2'd2; lz_c = 5'd0;
             for (si = 1; si < 24; si = si + 1)
-                if (!found_c && s1_sum[23-si]) begin
+                if (!found_c && mag_c[23-si]) begin
                     lz_c = si[4:0]; found_c = 1'b1;
                 end
         end
     end
-    wire s1_zero_c = (s1_sum == 25'd0);
+    wire s1_zero_c = (mag_c == 25'd0);
 
     // ---- S2 registers ----
     reg        v2;
-    reg [24:0] s2_sum;
+    reg [24:0] s2_mag;
     reg [7:0]  s2_ebig;
     reg        s2_sbig, s2_zero;
     reg [1:0]  s2_sel;
@@ -107,9 +113,9 @@ module fp_add24_spp_ro (
         if (reset) v2 <= 1'b0;
         else if (!stall) begin
             v2      <= v1;
-            s2_sum  <= s1_sum;
-            s2_ebig <= s1_ebig;
-            s2_sbig <= s1_sbig;
+            s2_mag  <= mag_c;
+            s2_ebig <= s1_emax;
+            s2_sbig <= s_res_c;
             s2_zero <= s1_zero_c;
             s2_sel  <= sh_sel_c;
             s2_lz   <= lz_c;
@@ -123,10 +129,10 @@ module fp_add24_spp_ro (
     reg  signed [10:0] e_norm;
     always @(*) begin
         case (s2_sel)
-            2'd0: begin norm_sig = s2_sum[24:1];      e_norm = $signed({3'b0, s2_ebig}) + 11'sd1; end
-            2'd1: begin norm_sig = s2_sum[23:0];      e_norm = $signed({3'b0, s2_ebig});          end
+            2'd0: begin norm_sig = s2_mag[24:1];      e_norm = $signed({3'b0, s2_ebig}) + 11'sd1; end
+            2'd1: begin norm_sig = s2_mag[23:0];      e_norm = $signed({3'b0, s2_ebig});          end
             default: begin
-                norm_sig = s2_sum[23:0] << s2_lz;
+                norm_sig = s2_mag[23:0] << s2_lz;
                 e_norm   = $signed({3'b0, s2_ebig}) - $signed({6'd0, s2_lz});
             end
         endcase
