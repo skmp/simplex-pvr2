@@ -13,11 +13,15 @@
 //   s2a : ebase/wbase align (Cn + DXn*y)        (fp_add24_s1)
 //   s2b : ebase/wbase normalize                 (fp_add24_s2)
 //   s3  : DYn*x, ddx*x                           (fp_mul_i5)
-//   s4a : Xhs/invW align (ebase - DY*x)         (fp_add24_s1)
-//   s4b : Xhs/invW normalize -> inside, invW    (fp_add24_s2)
+//   s4a : edge ordering cmp ebase>=DY*x (fp_ge); invW align (fp_add24_s1)
+//   s4b : invW normalize -> inside, invW        (fp_add24_s2)
 //
 // Numerics per spec: pixel-index products use the fast 16x5 multiplier; sums use
-// fp_add24 (split align|normalize here for timing).
+// fp_add24 (split align|normalize here for timing). The edge inside tests need
+// only the SIGN of ebase - DY*x, and the sign of a float subtract is exactly
+// the ordering predicate, so they are fp_ge magnitude compares - bit-exact vs
+// the former fp_add24 sub (incl. +0 on exact cancellation, which is only
+// reachable at shamt==0, and the underflow flush keeping s_big).
 //
 module isp_raster_line #(
     parameter integer LANES = 8
@@ -59,8 +63,6 @@ module isp_raster_line #(
     reg [LANES-1:0]    im0;
     reg [32*LANES-1:0] iw0;
     reg                pr_rej0;   // probe reject at the s4b stage (lane 0), retimed below
-
-    function fpos_or_zero(input [31:0] f); fpos_or_zero = ~f[31]; endfunction
 
     reg [LAT-1:0] vpipe;
     reg [LAT-1:0] ppipe;   // probe flag, LAT-deep (aligned with vpipe)
@@ -180,43 +182,39 @@ module isp_raster_line #(
             dy12x<=dy12x_c;dy23x<=dy23x_c;dy31x<=dy31x_c;dy41x<=dy41x_c;ddxx<=ddxx_c;
         end
 
-        // ---- s4a: Xhs/invW align ----
-        wire [24:0] h1s,h2s,h3s,h4s,ws; wire [7:0] h1e,h2e,h3e,h4e,we;
-        wire h1g,h2g,h3g,h4g,wg;
-        fp_add24_s1 x1a(.a(eb1_3),.b_in(dy12x),.sub(1'b1),.sum(h1s),.e_big(h1e),.s_big(h1g));
-        fp_add24_s1 x2a(.a(eb2_3),.b_in(dy23x),.sub(1'b1),.sum(h2s),.e_big(h2e),.s_big(h2g));
-        fp_add24_s1 x3a(.a(eb3_3),.b_in(dy31x),.sub(1'b1),.sum(h3s),.e_big(h3e),.s_big(h3g));
-        fp_add24_s1 x4a(.a(eb4_3),.b_in(dy41x),.sub(1'b1),.sum(h4s),.e_big(h4e),.s_big(h4g));
+        // ---- s4a: edge ordering compares + invW align ----
+        // inside_n = "sign of (eb_n - DYn*x) clear" = (eb_n >= DYn*x): the 4
+        // edge fp_add24 pairs collapse to fp_ge compares (see fp_ge.sv for the
+        // bit-exactness argument); only invW, whose VALUE is consumed
+        // downstream, keeps the real adder. fp_ge registers its output, which
+        // IS the s4a->s4b pipe register for the edge bits.
+        wire ge1,ge2,ge3,ge4;
+        fp_ge cmp1(.clk(clk),.a(eb1_3),.b(dy12x),.ge(ge1));
+        fp_ge cmp2(.clk(clk),.a(eb2_3),.b(dy23x),.ge(ge2));
+        fp_ge cmp3(.clk(clk),.a(eb3_3),.b(dy31x),.ge(ge3));
+        fp_ge cmp4(.clk(clk),.a(eb4_3),.b(dy41x),.ge(ge4));
+        wire [24:0] ws; wire [7:0] we; wire wg;
         fp_add24_s1 iwa(.a(wbase_3),.b_in(ddxx),.sub(1'b0),.sum(ws),.e_big(we),.s_big(wg));
-        reg [24:0] h1s_r,h2s_r,h3s_r,h4s_r,ws_r; reg [7:0] h1e_r,h2e_r,h3e_r,h4e_r,we_r;
-        reg h1g_r,h2g_r,h3g_r,h4g_r,wg_r;
+        reg [24:0] ws_r; reg [7:0] we_r; reg wg_r;
         always @(posedge clk) begin
-            h1s_r<=h1s;h2s_r<=h2s;h3s_r<=h3s;h4s_r<=h4s;ws_r<=ws;
-            h1e_r<=h1e;h2e_r<=h2e;h3e_r<=h3e;h4e_r<=h4e;we_r<=we;
-            h1g_r<=h1g;h2g_r<=h2g;h3g_r<=h3g;h4g_r<=h4g;wg_r<=wg;
+            ws_r<=ws;we_r<=we;wg_r<=wg;
         end
 
-        // ---- s4b: Xhs/invW normalize -> outputs ----
-        wire [31:0] xh1,xh2,xh3,xh4, iw;
-        fp_add24_s2 x1b(.sum(h1s_r),.e_big(h1e_r),.s_big(h1g_r),.y(xh1));
-        fp_add24_s2 x2b(.sum(h2s_r),.e_big(h2e_r),.s_big(h2g_r),.y(xh2));
-        fp_add24_s2 x3b(.sum(h3s_r),.e_big(h3e_r),.s_big(h3g_r),.y(xh3));
-        fp_add24_s2 x4b(.sum(h4s_r),.e_big(h4e_r),.s_big(h4g_r),.y(xh4));
+        // ---- s4b: invW normalize -> outputs ----
+        wire [31:0] iw;
         fp_add24_s2 iwb(.sum(ws_r),.e_big(we_r),.s_big(wg_r),.y(iw));
         // s4b register -> internal (im0/iw0); aligned one cycle EARLIER than the
         // final output register below.
         always @(posedge clk) begin
-            im0[gi] <= fpos_or_zero(xh1) & fpos_or_zero(xh2)
-                     & fpos_or_zero(xh3) & fpos_or_zero(xh4);
+            im0[gi] <= ge1 & ge2 & ge3 & ge4;
             iw0[32*gi +: 32] <= iw;
         end
-        // PROBE: lane 0's xh1..xh4 are the 4 edges' tile-MAX-corner half-space values.
-        // Reject if ANY edge is strictly outside there (~fpos_or_zero == sign bit set),
-        // meaning the whole tile is outside that edge.
+        // PROBE: lane 0's compares test the 4 edges at their tile-MAX corners.
+        // Reject if ANY edge's max corner is strictly outside (whole tile is
+        // then outside that edge).
         if (gi == 0) begin : probe_lane
             always @(posedge clk)
-                pr_rej0 <= (~fpos_or_zero(xh1)) | (~fpos_or_zero(xh2))
-                         | (~fpos_or_zero(xh3)) | (~fpos_or_zero(xh4));
+                pr_rej0 <= ~(ge1 & ge2 & ge3 & ge4);
         end
       end
     endgenerate
