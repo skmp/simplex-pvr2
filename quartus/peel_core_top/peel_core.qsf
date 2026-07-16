@@ -1,6 +1,6 @@
 # --------------------------------------------------------------------------
 #
-# simplex - refsw2 ISP/TSP triangle-setup units
+# peel_core - refsw2 ISP/TSP triangle-setup units
 # Standalone Quartus synthesis project (resource/timing check).
 #
 # This compiles the SEQUENCED (one mul+add/unit, one reciprocal) ISP and TSP

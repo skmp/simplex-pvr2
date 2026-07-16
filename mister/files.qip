@@ -1,0 +1,5 @@
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/SPG.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/hps_lw_bridge.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/pvr_mmio.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/clk_mux_gf.sv
+set_global_assignment -name SDC_FILE S32X.sdc
