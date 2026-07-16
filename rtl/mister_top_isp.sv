@@ -123,7 +123,9 @@ module mister_top_isp import tsp_pkg::*; #(
 
     assign ddr_resp.busy   = rd_inflight || (rd_issue && r1_waitrequest);
     assign ddr_resp.dout   = r1_readdata;
-    assign ddr_resp.dready = r1_readdatavalid;
+    // gated on rd_inflight: a stray readdatavalid with no read outstanding must
+    // never reach the core arbiter's beat count (desync hangs the burst clients).
+    assign ddr_resp.dready = r1_readdatavalid && rd_inflight;
 
     always @(posedge clk_100m) begin
         if (reset_100m) begin

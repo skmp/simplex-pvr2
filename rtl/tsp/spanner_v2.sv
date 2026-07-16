@@ -498,12 +498,21 @@ module spanner_v2 import tsp_pkg::*; #(
                 busy  <= 1'b1;
                 fwd0_valid <= 1'b0; fwd1_valid <= 1'b0;
                 sf_wp <= '0; sf_rp <= '0;
-                if (ring_empty && !(tsp_rd_done && !gf_empty)) begin top_tag <= '0; tail <= '0; end
+                // NORMALIZE gate: ring_empty alone does NOT mean "all handed tiles done" -
+                // an EMPTY pass (zero allocs/spans, e.g. a terminating PEEL pass) leaves the
+                // rings empty yet is still handed, with gf/sgf entries recording the
+                // PRE-normalize end pointers. Normalizing under such an outstanding entry
+                // makes its later tsp_rd_done load a STALE tail (tail<=T, span_tail<=S while
+                // head restarted at 0) -> spurious ring_full/empty -> permanent SPANGEN stall
+                // (busy=1 deadlock) or broken backpressure (live-slot overwrite). So also
+                // require gf_empty: no handed-but-unfreed pass may be outstanding. (This
+                // subsumes the old same-cycle-free guard: tsp_rd_done implies !gf_empty.)
+                if (ring_empty && gf_empty) begin top_tag <= '0; tail <= '0; end
                 // Span ring: same normalize (idle -> restart dense at 0) and latch this pass's
                 // range base. CRUCIAL: latch the POST-normalize head (0 when normalizing, else
                 // the current head), NOT the pre-normalize span_head - the normalize's NBA
                 // wouldn't be visible to a same-cycle span_pass_base <= span_head.
-                if (span_ring_empty && !(tsp_rd_done && !gf_empty)) begin
+                if (span_ring_empty && gf_empty) begin
                     span_head <= '0; span_tail <= '0; span_pass_base <= '0;
                 end else begin
                     span_pass_base <= span_head;   // overlapped: this pass starts at the live head
@@ -703,6 +712,10 @@ module spanner_v2 import tsp_pkg::*; #(
     always @(posedge clk) if (!reset) begin
         if (sf_push && sf_full)
             $error("spanner_v2: setup FIFO overflow (push while full)");
+        // a ring-free pulse with no outstanding handed pass would be silently dropped,
+        // leaking ring space forever (permanent ring_full stall) - protocol violation.
+        if (tsp_rd_done && gf_empty)
+            $error("spanner_v2: tsp_rd_done with empty go-FIFO (free dropped)");
     end
 `endif
 endmodule

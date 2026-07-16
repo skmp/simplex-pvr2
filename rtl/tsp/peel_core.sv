@@ -98,6 +98,17 @@ module peel_core import tsp_pkg::*; (
     assign ddr_req.addr  = pa[d_owner];
     assign ddr_req.burst = d_beats;
 
+    // a response beat belongs to the CURRENT grant only while that read is in
+    // flight: granted (d_busy) AND actually issued (d_issued). A straggler beat
+    // landing in the grant->accept window (d_busy && !d_issued), or after release
+    // (d_owner is stale then), must neither be counted against d_beats nor be
+    // delivered to a client - one uncounted/misdelivered beat permanently desyncs
+    // the exact-beat-count clients (record_fetcher hangs mid-burst -> spanner_v2
+    // busy=1 deadlock). d_issued is registered on the accept cycle and every DDR
+    // backend (faux sim model and the Avalon bridge) returns the first beat at
+    // least one cycle after acceptance, so no legitimate beat is ever gated off.
+    wire d_beat = ddr_resp.dready && d_busy && d_issued;
+
     always @(posedge clk) begin
         if (reset) begin d_busy <= 1'b0; pend <= 6'd0; d_issued <= 1'b0; end
         else begin
@@ -113,8 +124,8 @@ module peel_core import tsp_pkg::*; (
             end else begin
                 // hold ddr_req.rd until the controller accepts it
                 if (ddr_req.rd && !ddr_resp.busy) d_issued <= 1'b1;
-                // count returned beats; release the channel after the last
-                if (ddr_resp.dready) begin
+                // count returned QUALIFIED beats; release the channel after the last
+                if (d_beat) begin
                     if (d_beats <= 8'd1) begin d_busy <= 1'b0; d_issued <= 1'b0; end
                     d_beats <= d_beats - 8'd1;
                 end
@@ -131,12 +142,15 @@ module peel_core import tsp_pkg::*; (
     assign tex_dresp[0].dout=ddr_resp.dout; assign tex_dresp[1].dout=ddr_resp.dout;
     assign ts_dresp.dout=ddr_resp.dout; assign pr_dresp.dout=ddr_resp.dout;
     assign ol_dresp.dout=ddr_resp.dout; assign ra_dresp.dout=ddr_resp.dout;
-    assign tex_dresp[0].dready = ddr_resp.dready && (d_owner==3'd0);
-    assign tex_dresp[1].dready = ddr_resp.dready && (d_owner==3'd1);
-    assign ts_dresp.dready     = ddr_resp.dready && (d_owner==3'd2);
-    assign pr_dresp.dready     = ddr_resp.dready && (d_owner==3'd3);
-    assign ol_dresp.dready     = ddr_resp.dready && (d_owner==3'd4);
-    assign ra_dresp.dready     = ddr_resp.dready && (d_owner==3'd5);
+    // fanout uses the QUALIFIED beat (d_beat, not raw dready): keeps every client's
+    // beat count in lockstep with the arbiter's d_beats and never delivers a stray
+    // beat to the stale d_owner after release.
+    assign tex_dresp[0].dready = d_beat && (d_owner==3'd0);
+    assign tex_dresp[1].dready = d_beat && (d_owner==3'd1);
+    assign ts_dresp.dready     = d_beat && (d_owner==3'd2);
+    assign pr_dresp.dready     = d_beat && (d_owner==3'd3);
+    assign ol_dresp.dready     = d_beat && (d_owner==3'd4);
+    assign ra_dresp.dready     = d_beat && (d_owner==3'd5);
 
     // -------------------- caches --------------------
     // Region parser, OL parser, ISP iterator AND TSP param fetch all read DDR

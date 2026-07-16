@@ -90,6 +90,14 @@ module isp_core import tsp_pkg::*; (
     assign ddr_req.addr  = pa[d_owner];
     assign ddr_req.burst = d_beats;
 
+    // a response beat belongs to the CURRENT grant only while that read is in
+    // flight (granted AND issued): a straggler in the grant->accept window or
+    // after release (stale d_owner) must neither be counted nor delivered, or
+    // the exact-beat-count clients desync and hang mid-burst. The first real
+    // beat always arrives >=1 cycle after acceptance (registered d_issued is
+    // visible by then), so no legitimate beat is gated off.
+    wire d_beat = ddr_resp.dready && d_busy && d_issued;
+
     integer di;
     always @(posedge clk) begin
         if (reset) begin
@@ -110,7 +118,7 @@ module isp_core import tsp_pkg::*; (
             end else begin
                 // hold ddr_req.rd until the controller accepts it
                 if (ddr_req.rd && !ddr_resp.busy) d_issued <= 1'b1;
-                if (ddr_resp.dready) begin
+                if (d_beat) begin
                     if (d_beats <= 8'd1) begin d_busy <= 1'b0; d_issued <= 1'b0; end
                     d_beats <= d_beats - 8'd1;
                 end
@@ -124,7 +132,7 @@ module isp_core import tsp_pkg::*; (
         for (gc = 0; gc < NCLI; gc = gc + 1) begin : cli_resp_w
             assign cli_resp[gc].busy   = d_busy || pend[gc];
             assign cli_resp[gc].dout   = ddr_resp.dout;
-            assign cli_resp[gc].dready = ddr_resp.dready && (d_owner == gc[1:0]);
+            assign cli_resp[gc].dready = d_beat && (d_owner == gc[1:0]);
         end
     endgenerate
 

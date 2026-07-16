@@ -129,11 +129,12 @@ module mister_top import tsp_pkg::*; #(
     assign r1_burstcnt = ddr_req.burst;
 
     // core-facing response: busy while a read is accepted-and-returning, or while
-    // our issue is still waiting on the bridge (waitrequest). dready passes the
-    // Avalon readdatavalid straight through.
+    // our issue is still waiting on the bridge (waitrequest). dready is GATED on
+    // rd_inflight so a stray/late readdatavalid with no read outstanding can never
+    // desync the core arbiter's beat count (hangs the exact-beat burst clients).
     assign ddr_resp.busy   = rd_inflight || (rd_issue && r1_waitrequest);
     assign ddr_resp.dout   = r1_readdata;
-    assign ddr_resp.dready = r1_readdatavalid;
+    assign ddr_resp.dready = r1_readdatavalid && rd_inflight;
 
     always @(posedge clk_100m) begin
         if (reset_100m) begin
