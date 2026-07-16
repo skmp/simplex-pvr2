@@ -62,9 +62,13 @@ int main(int argc,char**argv){
     const char* name = "menu2";
     for(int i=1;i<argc;i++)
         if(argv[i][0] != '+' && argv[i][0] != '-'){ name = argv[i]; break; }
+    // dump data lives in the sibling polly2-data/ repo (see DUMPS_DIR default).
+#ifndef DUMPS_DIR
+#define DUMPS_DIR "../polly2-data/dumps"
+#endif
     char regs_path[256], vram_path[256], out_path[256];
-    snprintf(regs_path,sizeof(regs_path),"dumps/pvr_regs_%s.bin",name);
-    snprintf(vram_path,sizeof(vram_path),"dumps/vram_%s.bin",name);
+    snprintf(regs_path,sizeof(regs_path),DUMPS_DIR "/pvr_regs_%s.bin",name);
+    snprintf(vram_path,sizeof(vram_path),DUMPS_DIR "/vram_%s.bin",name);
     snprintf(out_path, sizeof(out_path), "shaded_lp_%s.bmp",name);
     printf("dump set: %s (%s, %s)\n", name, regs_path, vram_path);
 

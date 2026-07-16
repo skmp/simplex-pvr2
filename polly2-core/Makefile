@@ -59,6 +59,18 @@ MODEARG = $(if $(filter quad,$(MODE)),quad,)
 # TSP module files (package first). ISP shared FP units come from rtl/isp_min.
 TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
 
+# --- reorganized core: RTL now lives in rtl/<subsystem>/ trees. --------------
+# Package (must be listed, not just searched) + `-y` search dirs so Verilator
+# auto-resolves every module by name from any subtree.
+TSP_PKG   = rtl/gen/tsp_pkg.sv
+RTL_DIRS  = rtl rtl/gen rtl/buffers rtl/cores rtl/fp rtl/fpu rtl/isp \
+            rtl/lists rtl/tsp rtl/tsp/tex rtl/spanner
+# Files holding modules whose name != filename, so `-y` won't auto-find them:
+#   fp_add24.sv    -> fp_add24_s1 / fp_add24_s2
+#   stage_interp.sv-> interp_unit
+RTL_EXTRA = rtl/fp/fp_add24.sv rtl/tsp/stage_interp.sv
+RTL_INC   = $(addprefix -y ,$(RTL_DIRS)) -Irtl/gen
+
 all: fp sim-tri sim-quad seq-tri seq-quad ip-tri ip-quad
 
 # ---- run the fast unit tests (FP prims + TSP texture blocks + full pipeline) ----
@@ -200,9 +212,8 @@ dense_span_buffer: | $(BUILD)
 # pipe -> shaded_lp_<name>.bmp.
 frontendtsplp: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
-	  --top-module frontend_tsp_lp_tb_top \
-	  $(TSP_RTL) tb/frontend_tsp_lp_tb_top.sv tb/sim_ddr_fb.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  --top-module frontend_tsp_lp_tb_top $(RTL_INC) \
+	  $(TSP_PKG) $(RTL_EXTRA) tb/frontend_tsp_lp_tb_top.sv tb/sim_ddr_fb.sv \
 	  $(CWD)/tb/frontend_tsp_lp_tb.cpp --Mdir $(BUILD)/obj_frontendtsplp -o tb
 	./$(BUILD)/obj_frontendtsplp/tb $(DUMP)
 
