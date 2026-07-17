@@ -18,6 +18,9 @@
  *                          the store BLOCKS THIS CPU until the I2S side
  *                          frees a slot (~21us per sample).
  *                          R: [11:0] samples currently queued (0..2048).
+ *   0xFF20201C  REVISION   RO   MMIO interface revision. 0 = pre-audio
+ *                          bitstream (slot was reserved, read 0), 1 = audio
+ *                          (AUDIO_DATA + this register).
  *
  * Prerequisites (load_fpga_bitstream already does both): L3 remap = 0x19
  * (lwhps2fpga visible) and brg_mod_reset = 0 (bridge out of reset).
@@ -40,8 +43,11 @@
 #define POLLY2_MMIO_CYCLES    0x2010
 #define POLLY2_MMIO_CLK       0x2014
 #define POLLY2_MMIO_AUDIO_DATA 0x2018
+#define POLLY2_MMIO_REVISION  0x201C
 
 #define POLLY2_AUDIO_FIFO_DEPTH 2048u
+
+#define POLLY2_REV_AUDIO 1u   /* first revision with AUDIO_DATA + REVISION */
 
 #define POLLY2_STATUS_WORKING 0x1u
 #define POLLY2_STATUS_DONE    0x2u
@@ -127,5 +133,17 @@ static inline uint32_t polly2_audio_level(void) /* samples queued, 0..2048 */
 static inline uint32_t polly2_audio_space(void)
 {
 	return POLLY2_AUDIO_FIFO_DEPTH - polly2_audio_level();
+}
+
+/* 0 = pre-audio bitstream (the slot read 0 before REVISION existed);
+ * >= POLLY2_REV_AUDIO means AUDIO_DATA is present. */
+static inline uint32_t polly2_revision(void)
+{
+	return polly2_mmio_rd(POLLY2_MMIO_REVISION);
+}
+
+static inline int polly2_has_audio(void)
+{
+	return polly2_revision() >= POLLY2_REV_AUDIO;
 }
 

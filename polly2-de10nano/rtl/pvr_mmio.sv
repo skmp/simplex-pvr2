@@ -28,7 +28,10 @@
 //                            write (the HPS store blocks) until the I2S side
 //                            frees a slot - up to ~21us at 48 kHz.
 //                            R: [11:0] samples currently queued (0..2048).
-//   0xFF20201C  reserved (read 0, writes ignored).
+//   0xFF20201C  REVISION     RO. MMIO interface revision. 0 = pre-audio
+//                            bitstreams (the then-reserved slot read 0),
+//                            1 = audio (AUDIO_DATA + this register).
+//                            Writes ignored.
 //
 // Single clock domain (clk_sys). waitrequest is low except for AUDIO_DATA
 // writes with the FIFO full - every other access completes immediately;
@@ -75,6 +78,10 @@ module pvr_mmio
 /* verilator lint_off WIDTHTRUNC */
 localparam [8:0] RSTC = RST_CYCLES;
 /* verilator lint_on WIDTHTRUNC */
+
+// MMIO interface revision (REVISION reg): bump on every map change.
+// 1 = audio (AUDIO_DATA + REVISION added); 0 = anything older.
+localparam [31:0] REVISION = 32'd1;
 
 wire wr32     = avs_write && (avs_byteenable == 4'b1111);
 wire sel_regs = (avs_address[20:13] == 8'd0);     // 0x0000-0x1FFF
@@ -160,6 +167,7 @@ always @(posedge clk) begin
 			3'd4: avs_readdata <= cycles;                  // FRAME_CYCLES
 			3'd5: avs_readdata <= {30'd0, clk_sel};        // CLK
 			3'd6: avs_readdata <= {20'd0, aud_level};      // AUDIO_DATA level
+			3'd7: avs_readdata <= REVISION;                // REVISION
 			default: ;
 		endcase
 	end

@@ -20,6 +20,7 @@
 #include <vector>
 
 static const uint32_t AUDIO_DATA = 0x2018;
+static const uint32_t REVISION   = 0x201C;
 static const uint32_t VRAM_BASE  = 0x2000;
 
 static Vaudio_tb_top* dut;
@@ -135,6 +136,11 @@ int main(int argc, char** argv) {
     for (auto& f : frames)
         if (f.l || f.r) { printf("idle frame not silent\n"); errors++; }
     if (avm_read(AUDIO_DATA) != 0) { printf("idle level != 0\n"); errors++; }
+
+    // ---- REVISION: reads 1 (audio support), read-only, never stalls ----
+    if (avm_read(REVISION) != 1) { printf("REVISION != 1\n"); errors++; }
+    if (avm_write(REVISION, 0xDEADBEEF)) { printf("REVISION write stalled\n"); errors++; }
+    if (avm_read(REVISION) != 1) { printf("REVISION not read-only\n"); errors++; }
 
     // ---- small batch: framing, order, one-shot ----
     static const Frame batch[8] = {
