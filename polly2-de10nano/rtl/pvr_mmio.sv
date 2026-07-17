@@ -21,10 +21,21 @@
 //                            3=112.5 MHz. Switching pauses clk_sys briefly
 //                            and pulses the core reset window; avoid other
 //                            MMIO traffic for ~2us after writing.
-//   0xFF202018 - 0xFF20201F  reserved (read 0, writes ignored).
+//   0xFF202018  AUDIO_DATA   W: push one stereo sample ([15:0] left,
+//                            [31:16] right, signed 16-bit PCM) into the
+//                            2048-entry audio FIFO (audio_i2s -> HDMI I2S).
+//                            While the FIFO is full, waitrequest stalls the
+//                            write (the HPS store blocks) until the I2S side
+//                            frees a slot - up to ~21us at 48 kHz.
+//                            R: [11:0] samples currently queued (0..2048).
+//   0xFF20201C  REVISION     RO. MMIO interface revision. 0 = pre-audio
+//                            bitstreams (the then-reserved slot read 0),
+//                            1 = audio (AUDIO_DATA + this register).
+//                            Writes ignored.
 //
-// Single clock domain (clk_sys). waitrequest is tied low - every access
-// completes immediately; reads return data the following cycle.
+// Single clock domain (clk_sys). waitrequest is low except for AUDIO_DATA
+// writes with the FIFO full - every other access completes immediately;
+// reads return data the following cycle.
 
 module pvr_mmio
 #(
@@ -54,20 +65,38 @@ module pvr_mmio
 	output reg         pvr_rst   = 1'b0,   // stretched reset
 	output reg   [7:0] vram_top  = VRAM_TOP_INIT,
 	output reg   [1:0] clk_sel   = 2'd0,     // core clock select (75 MHz default)
-	input  wire        pvr_done              // render done (level or pulse)
-);
+	input  wire        pvr_done,             // render done (level or pulse)
 
-assign avs_waitrequest = 1'b0;
+	// audio FIFO write port (audio_i2s)
+	output reg         aud_wr    = 1'b0,     // 1-clk push pulse
+	output reg  [31:0] aud_wdata = 32'd0,
+	input  wire        aud_full,
+	input  wire [11:0] aud_level
+);
 
 // no size casts (Quartus Standard 17.0)
 /* verilator lint_off WIDTHTRUNC */
 localparam [8:0] RSTC = RST_CYCLES;
 /* verilator lint_on WIDTHTRUNC */
 
+// MMIO interface revision (REVISION reg): bump on every map change.
+// 1 = audio (AUDIO_DATA + REVISION added); 0 = anything older.
+localparam [31:0] REVISION = 32'd1;
+
 wire wr32     = avs_write && (avs_byteenable == 4'b1111);
 wire sel_regs = (avs_address[20:13] == 8'd0);     // 0x0000-0x1FFF
 wire sel_cfg  = (avs_address[20:13] == 8'd1);     // 0x2000-0x3FFF
 wire [2:0] cfg_word = avs_address[4:2];           // 0x2000..0x201C
+
+// AUDIO_DATA is the only stalling access: hold waitrequest while the FIFO
+// is full - and for the one cycle a just-accepted push (aud_wr) needs to
+// reach the FIFO write pointer, so a back-to-back write can't be accepted
+// against the stale full flag and get dropped. hps_lw_bridge keeps
+// avs_write asserted, so the push (and the HPS's blocked store) completes
+// on the first cycle with a free slot.
+wire wr_audio  = wr32 && sel_cfg && (cfg_word == 3'd6);
+wire aud_stall = aud_full || aud_wr;
+assign avs_waitrequest = wr_audio && aud_stall;
 
 reg  [8:0] rst_cnt   = 9'd0;
 reg        busy      = 1'b0;
@@ -78,6 +107,7 @@ reg [31:0] cycles    = 32'd0;
 always @(posedge clk) begin
 	pvr_wr <= 1'b0;
 	pvr_go <= 1'b0;
+	aud_wr <= 1'b0;
 
 	// ---- writes ----
 	if (wr32) begin
@@ -102,6 +132,14 @@ always @(posedge clk) begin
 				done_stk <= 1'b0;
 			end
 			3'd5: clk_sel <= avs_writedata[1:0];           // CLK
+			3'd6: if (!aud_stall) begin                    // AUDIO_DATA
+				// wr32 stays asserted while waitrequest stalls the
+				// transaction; !aud_stall is the acceptance cycle
+				// (must mirror avs_waitrequest exactly), so exactly
+				// one push per HPS store.
+				aud_wr    <= 1'b1;
+				aud_wdata <= avs_writedata;
+			end
 			default: ;                                     // STATUS/CYCLES/rsvd: RO
 		endcase
 	end
@@ -128,6 +166,8 @@ always @(posedge clk) begin
 			3'd1: avs_readdata <= {30'd0, done_stk, busy}; // STATUS
 			3'd4: avs_readdata <= cycles;                  // FRAME_CYCLES
 			3'd5: avs_readdata <= {30'd0, clk_sel};        // CLK
+			3'd6: avs_readdata <= {20'd0, aud_level};      // AUDIO_DATA level
+			3'd7: avs_readdata <= REVISION;                // REVISION
 			default: ;
 		endcase
 	end
