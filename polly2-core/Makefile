@@ -120,7 +120,7 @@ regen:
 # streaming read + concurrent write/read, against the real M10K tile_ram. Self-checking.
 taginvw: | $(BUILD)
 	+$(VERILATOR) --binary $(VFLAGS) -Wno-BLKSEQ --top-module taginvw_selftest \
-	  rtl/tsp/tsp_pkg.sv rtl/isp_min/tile_ram.sv rtl/tsp/taginvw_tile_buffer.sv \
+	  rtl/tsp/tsp_pkg.sv rtl/isp_min/tile_ram.sv rtl/buffers/taginvw_tile_buffer.sv \
 	  tb/taginvw_selftest.sv --Mdir $(BUILD)/obj_taginvw -o taginvw
 	./$(BUILD)/obj_taginvw/taginvw
 

@@ -44,8 +44,11 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/lists/regio
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/lists/object_list_parser.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/isp_primitive_iterator_pf.sv
 
-# ---- ISP setup + rasterize + depth compare ----
-set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/isp_setup_streamed.sv
+# ---- ISP/TSP setups ----
+set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/setup/isp_setup_streamed.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/setup/tsp_setup_stream.sv
+
+# ---- ISP rasterize + depth compare ----
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/isp_raster_line.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/isp_depth_cmp.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/isp_depth_cmp_lp.sv
@@ -54,7 +57,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/isp/tile_ra
 # ---- M10K-backed tile buffers (ping-ponged: taginvw ISP->TSP handoff,
 #      peel depth/tag buffers, colour) ----
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/peel_tile_buffer.sv
-set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/fpu/taginvw_tile_buffer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/taginvw_tile_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/color_tile_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/delay_ram.sv
 
@@ -63,7 +66,6 @@ set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/del
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/dense_span_buffer.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/triangle_setups.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/buffers/sort_cache.sv
-set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/fpu/tsp_setup_stream.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/spanner/record_fetcher.sv
 set_global_assignment -name SYSTEMVERILOG_FILE ../../polly2-core/rtl/spanner/spanner_v2.sv
 
