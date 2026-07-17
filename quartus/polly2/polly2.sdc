@@ -1,5 +1,33 @@
+# ---- Base clocks ----
+# The old MiSTer build got these from sys/sys_top.sdc (included via sys.qip);
+# this project has a single SDC, so they must be declared here. Without the
+# h2f_user0_clk clock the whole clk_100m domain (sysmem_lite, the f2sdram
+# terminator, spg's Avalon fetch FSM) is unconstrained and the fitter ignores
+# it entirely.
+create_clock -period "50.0 MHz"  [get_ports FPGA_CLK1_50]
+create_clock -period "50.0 MHz"  [get_ports FPGA_CLK2_50]
+create_clock -period "50.0 MHz"  [get_ports FPGA_CLK3_50]
+create_clock -period "100.0 MHz" [get_pins -compatibility_mode *|h2f_user0_clk]
+create_clock -period "10.0 MHz"  [get_pins -compatibility_mode hdmi_i2c|out_clk] -name hdmi_sck
+
 derive_pll_clocks
 derive_clock_uncertainty
+
+# ---- Decouple the clock domains (from sys/sys_top.sdc) ----
+# Every crossing is either a proper synchronizer or quasi-static config
+# (fb_base into spg is sampled once per frame). Without these cuts TimeQuest
+# analyzes all CDC paths as synchronous-related: reset_req (50 MHz) into the
+# whole core at ~2.2 ns, and clk_sys -> clk_hdmi (112.5 vs 148.5 MHz) at
+# ~0.07 ns worst-case - unmeetable paths that wreck fitting and routing.
+set_clock_groups -exclusive \
+    -group [get_clocks {pll|pll_inst|altera_pll_i|*[*].*|divclk}] \
+    -group [get_clocks {pll_hdmi|pll_hdmi_inst|altera_pll_i|*[0].*|divclk}] \
+    -group [get_clocks {pll_audio|pll_audio_inst|altera_pll_i|*[0].*|divclk}] \
+    -group [get_clocks {hdmi_sck}] \
+    -group [get_clocks {*|h2f_user0_clk}] \
+    -group [get_clocks {FPGA_CLK1_50}] \
+    -group [get_clocks {FPGA_CLK2_50}] \
+    -group [get_clocks {FPGA_CLK3_50}]
 
 # ---- clk_sys core clock: 4 fixed PLL outputs muxed through an altclkctrl ----
 # The emu PLL (rtl/pll) has 4 fixed outputs from the 900 MHz VCO:
