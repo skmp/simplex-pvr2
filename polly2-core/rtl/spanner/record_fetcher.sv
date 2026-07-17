@@ -59,11 +59,26 @@ module record_fetcher import tsp_pkg::*; (
     // record byte base = param_base + {4'd0, tag[23:3], 2'b00}
     reg  [26:0] rec_b;                        // record byte base
     wire [24:0] rec_w = rec_b[26:2];          // view word index
-    // vertex region base (view words): rec + (two_vol?5:3) + toff*stride
-    wire [24:0] vb_w  = rec_w + (r_two_vol ? 25'd5 : 25'd3)
-                              + {20'd0, r_toff} * {20'd0, r_stride_w};
-    // burst-2 length: 2*stride + fpv words (last field of vertex 2)
-    wire [7:0]  v_len = {2'd0, r_stride_w, 1'b0} + {4'd0, fpv};
+
+    // Burst-2 addressing, PIPELINED. This used to be one combinational cone
+    // off r_tag/rec_b/o_isp straight into ts_addr_r/ts_burst_r in B_V_REQ
+    // (tag decode -> toff*stride multiply -> 25-bit add -> address pack,
+    // qualified by the arbiter's busy) - the design's critical path (-4 ns
+    // at the 112.5 MHz slot). Every input settles cycles before B_V_REQ can
+    // issue (burst 1 must complete first), so stage it through registers:
+    //   voff_r  : tag-only, stable 2 cycles after `start`
+    //   vb_w_r  : one cycle later (B_V_REQ is >= 5 cycles after `start`)
+    //   v_len_r : one cycle after o_isp loads (burst-1 beat 0; B_V_REQ is
+    //             >= 2 cycles later)
+    // Cycle counts and behavior are unchanged.
+    reg  [7:0]  voff_r;   // (two_vol?5:3) + toff*stride, view words
+    reg  [24:0] vb_w_r;   // vertex region base: rec + voff
+    reg  [7:0]  v_len_r;  // burst-2 length: 2*stride + fpv (last field of v2)
+    always @(posedge clk) begin
+        voff_r  <= (r_two_vol ? 8'd5 : 8'd3) + ({5'd0, r_toff} * {3'd0, r_stride_w});
+        vb_w_r  <= rec_w + {17'd0, voff_r};
+        v_len_r <= {2'd0, r_stride_w, 1'b0} + {4'd0, fpv};
+    end
 
     // view word -> physical: bank = word[20] (half select), wofs = word[19:0]
     function automatic [28:0] vw_addr(input [24:0] vw);
@@ -143,9 +158,9 @@ module record_fetcher import tsp_pkg::*; (
             // ---- burst 2: the whole vertex region @ vb (flags now valid) ----
             B_V_REQ: if (!dresp.busy) begin
                 ts_rd_r    <= 1'b1;
-                ts_addr_r  <= vw_addr(vb_w);
-                ts_burst_r <= v_len;
-                v_bank     <= vb_w[20];
+                ts_addr_r  <= vw_addr(vb_w_r);
+                ts_burst_r <= v_len_r;
+                v_bank     <= vb_w_r[20];
                 beat       <= 8'd0;
                 bst        <= B_V_DATA;
             end
@@ -169,7 +184,7 @@ module record_fetcher import tsp_pkg::*; (
                     end
                 end
                 beat <= beat + 8'd1;
-                if (beat == v_len - 8'd1) bst <= B_DONE;
+                if (beat == v_len_r - 8'd1) bst <= B_DONE;
             end
 
             B_DONE: begin

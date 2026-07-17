@@ -208,8 +208,9 @@ module peel_core import tsp_pkg::*; (
     //     owns the depth compare (isp_depth_cmp / isp_depth_cmp_lp) and the raster
     //     stage-A read / stage-B RMW, the shade single-pixel read, the CLEAR walk and
     //     the PeelBuffers RMW walk. Bank = x[2:0], addr = {y[4:0], x[4:3]}.
-    //   * color_tile_buffer (u_col): col_buf as a single 1024x32 M10K. It owns the
-    //     blend RMW (2-stage CA read / CB tsp_blend+write) and the FLUSH read.
+    //   * color_tile_buffer (u_col): col_buf as a single 1024x32 M10K, plain
+    //     read/write ports. The blend ALU is SHARED at peel_core level (one
+    //     tsp_blend + a CW write register serve both ping-pong halves).
     // The registered reads force the raster compare and the blend into 2-stage
     // pipelines and CLEAR/PeelBuffers into 128-chunk walks; the peel_core barriers
     // serialize the raster / shade / bulk phases so each buffer's single read+write
@@ -538,6 +539,34 @@ module peel_core import tsp_pkg::*; (
     wire [31:0]  col_rd_argb_h [0:1];    // per-half registered read
     // blend (CA read / CB write) targets the producer half only; FLUSH read targets
     // the VO half only. gcol picks per-instance whether it is prod or vo this cycle.
+    // ---- ONE shared blend ALU + CW write register. Only the producer half ever
+    // blends, so a single tsp_blend (fed by the producer half's registered CA
+    // read) serves both halves - one set of blend multipliers instead of one
+    // per u_col instance. Its result is REGISTERED (cw_*) and written the next
+    // cycle (stage CW), which also keeps the RAM-write tail off the blend's
+    // timing path. cw_half latches which half was producing so the delayed
+    // write lands in the right instance even across a half swap. ----
+    wire [31:0] cb_blend_out;
+    tsp_blend u_cb_blend (
+        .src       (cb_argb),
+        .dst       (col_rd_argb_h[col_prod]),   // registered CA read = OLD dst
+        .src_instr (cb_tsp[31:29]),
+        .dst_instr (cb_tsp[28:26]),
+        .alpha_test(cb_at_en),
+        .alpha_ref (regs.pt_alpha_ref[7:0]),
+        .out       (cb_blend_out),
+        .at_pass   ());
+    reg         cw_we   = 1'b0;
+    reg         cw_half = 1'b0;
+    reg  [9:0]  cw_id   = 10'd0;
+    reg  [31:0] cw_data = 32'd0;
+    always @(posedge clk) begin
+        cw_we   <= cb_valid && !reset;
+        cw_half <= col_prod;
+        cw_id   <= cb_id;
+        cw_data <= cb_blend_out;
+    end
+
     genvar gcol;
     generate
       for (gcol = 0; gcol < 2; gcol = gcol + 1) begin : gcolbuf
@@ -546,8 +575,8 @@ module peel_core import tsp_pkg::*; (
         color_tile_buffer #(.DEPTH(TILE_W*TILE_H)) u_col (
             .clk(clk), .reset(reset),
             .bl_ca_valid(is_prod && cb_ca_valid), .bl_ca_id(cb_ca_id),
-            .bl_cb_valid(is_prod && cb_valid), .cb_id(cb_id), .cb_argb(cb_argb),
-            .cb_tsp(cb_tsp), .cb_at_en(cb_at_en), .alpha_ref(regs.pt_alpha_ref[7:0]),
+            .wr_valid(cw_we && (cw_half == gcol[0])), .wr_id(cw_id),
+            .wr_argb(cw_data),
             .fl_rd_valid(is_vo && cb_fl_valid), .fl_id(cb_fl_id),
             .rd_argb(col_rd_argb_h[gcol])
         );
@@ -805,17 +834,20 @@ module peel_core import tsp_pkg::*; (
 `endif
 
     // -------- blend unit: the very end of the TSP pipeline (refsw BlendingUnit) --------
-    // The blend RMW now lives INSIDE u_col (color_tile_buffer): a 2-stage pipeline
-    // over the M10K color buffer.
+    // The blend RMW is a 3-stage pipeline over the M10K color buffer, with the
+    // SHARED tsp_blend + CW register at the u_col instantiation above:
     //   stage CA (on pp_out_valid && !pp_stall): latch cb_* and assert cb_ca_valid to
     //     present the col-RAM READ of cb_id; cb_valid<=1.
-    //   stage CB (next cycle, cb_valid): u_col reads OLD col_buf[cb_id] = the dst,
-    //     runs tsp_blend combinationally, and writes col_ram[cb_id] <- blend_out.
+    //   stage CB (next cycle, cb_valid): u_col's registered read = OLD col_buf[cb_id]
+    //     = the dst; the shared tsp_blend runs combinationally; result -> cw_* regs.
+    //   stage CW (next cycle, cw_we): cw_data is written to col_ram[cw_id] in the
+    //     half latched by cw_half.
     // Because the shade sub-phase presents pixels in ASCENDING shp order and the pipe
-    // is in-order, out ids never repeat within a sub-phase -> CA id N and CB id N-1
-    // are always distinct, so no same-address RMW hazard. SH_DRAIN additionally waits
-    // !cb_valid before returning so the trailing blend lands before the next phase
-    // (peel pass / FLUSH) touches the color buffer.
+    // is in-order, out ids never repeat within a sub-phase -> the CA read, CB blend
+    // and delayed CW write always target distinct addresses (later ids read, earlier
+    // id writes), so no same-address RMW hazard. R_DRAIN waits !cb_valid && !cw_we
+    // before returning so the trailing blend lands before the next phase (peel pass /
+    // FLUSH) touches the color buffer.
     reg          cb_valid;
     reg  [9:0]   cb_id;
     reg  [31:0]  cb_argb, cb_tsp;
@@ -2200,10 +2232,12 @@ module peel_core import tsp_pkg::*; (
             // else pp_stall: hold the whole pipeline (addresses re-presented by the combi mux).
 
             // wait for the shade+blend pipe to drain (all fed pixels emerged and the trailing
-            // blend RMW landed). Free this pass's span+plane ring range; pop the descriptor
-            // (unless heading to R_POST, which still needs md_tx/ty/post -> it pops instead).
-            // If this was the tile's FINAL shade (md_last) hand u_col to VO (R_POST).
-            R_DRAIN: if (sh_out_n >= sh_pending && !cb_valid) begin
+            // blend RMW landed - including the CW write register, which lands one cycle
+            // after cb_valid drops). Free this pass's span+plane ring range; pop the
+            // descriptor (unless heading to R_POST, which still needs md_tx/ty/post -> it
+            // pops instead). If this was the tile's FINAL shade (md_last) hand u_col to
+            // VO (R_POST).
+            R_DRAIN: if (sh_out_n >= sh_pending && !cb_valid && !cw_we) begin
                 spv_rd_done      <= 1'b1;        // free this pass's ring range (real pass)
 `ifndef SYNTHESIS
                 pc_drain <= pc_drain + 1;

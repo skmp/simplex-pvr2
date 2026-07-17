@@ -39,7 +39,8 @@ CWD  := $(shell pwd)
         frontendtsplp spannerv2 mulc9 mul16sppro add24sppro mulc9sppro add3sppro
 
 # TSP module files (package first). ISP shared FP units come from rtl/isp_min.
-TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
+# package moved to rtl/gen/ in the reorg; search dirs (RTL_INC) resolve the rest
+TSP_RTL = rtl/gen/tsp_pkg.sv $(wildcard rtl/tsp/*.sv)
 
 # --- reorganized core: RTL now lives in rtl/<subsystem>/ trees. --------------
 # Package (must be listed, not just searched) + `-y` search dirs so Verilator
@@ -149,7 +150,7 @@ frontendtsplp: | $(BUILD)
 # pass "<dir> <first> <count>" (default: spanner_test_vectors 0 8).
 spannerv2: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
-	  --top-module spanner_v2_tb_top \
+	  --top-module spanner_v2_tb_top $(RTL_INC) \
 	  $(TSP_RTL) tb/spanner_v2_tb_top.sv tb/sim_ddr_fb.sv \
 	  $(wildcard rtl/isp_min/*.sv) \
 	  $(CWD)/tb/spanner_v2_tb.cpp --Mdir $(BUILD)/obj_spannerv2 -o tb

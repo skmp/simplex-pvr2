@@ -191,18 +191,26 @@ module spanner_v2 import tsp_pkg::*; #(
     // Multi-span group (A B C D) -> COAL produces 4 descriptors on 4 consecutive cycles
     // (sg_x steps within the held group, no reissue) -> 4 cyc, still 1 span/cyc.
     //
-    // GROUP PREFETCH: the tag buffer read has 1-cyc latency, so we must present the NEXT
-    // group's read the cycle BEFORE COAL needs it. gp_* holds the prefetched group; when
-    // COAL exhausts the current group it swaps gp_* -> g_* and the prefetch reads group+1.
+    // GROUP PREFETCH FIFO: the walk visits groups STRICTLY SEQUENTIALLY (sg_x only
+    // ever advances by run_rep <= 4, monotonically through the tile), so WHICH groups
+    // are read is not data-dependent - only how long COAL dwells on each. A pure
+    // address counter (pf_grp) streams groups 0..255 into a 3-deep FIFO; COAL
+    // coalesces off the FIFO HEAD REGISTERS (gq_*[0]) and pops when it exhausts a
+    // group. This takes the tag-RAM completely out of the COAL recurrence: the old
+    // rdata -> run_rep -> next-address -> raddr single-cycle loop (RAM Tco + compare
+    // tree + adder + address routing) was the design's critical path. Costs +1 cycle
+    // of fill at pass start; throughput is unchanged (pops <= 1/cyc, refills 1/cyc,
+    // the FIFO never underruns after the initial fill).
     reg              sg_active;     // SPANGEN still walking (COAL may produce)
     reg [SLOTW-1:0]  sg_x;          // next pixel to coalesce a span at (0..NSLOT-1)
-    reg              g_ready;       // ti_* holds sg_x's group this cycle (read landed)
-    // The tag buffer is a registered-read RAM: its output ti_* reflects the address
-    // presented LAST cycle, and updates EVERY cycle. So we present rd_group = the group of
-    // the pixel COAL coalesces NEXT cycle, continuously; then ti_* is ALWAYS the correct
-    // group source for the current sg_x -> COAL coalesces directly off ti_* (no held-group
-    // register, no source mux). g_ready gates the 1-cycle fill latency after start/stall.
-    reg [SLOTW-1:0]  rd_next_x;     // combinational: pixel whose group we address
+    reg              pf_active;     // prefetcher still has groups to present
+    reg [SLOTW-3:0]  pf_grp;        // next group index to present (address counter)
+    reg              gq_inflight;   // a read was presented last cycle; ti_* lands now
+    reg [1:0]        gq_cnt;        // FIFO occupancy (0..3)
+    reg [3:0]        gq_valid [0:2];
+    reg [3:0]        gq_pt    [0:2];
+    reg [31:0]       gq_tag   [0:2][0:3];
+    reg [31:0]       gq_invw  [0:2][0:3];
 
     // ---- span descriptor latched at COAL, consumed (emitted) at EMIT ----
     reg              t_valid;       // EMIT stage occupied
@@ -216,8 +224,8 @@ module spanner_v2 import tsp_pkg::*; #(
 
     wire [1:0] sg_lane = sg_x[1:0];              // intra-group position of sg_x
 
-    // ---- leading-run coalesce (combinational off ti_*, the current group source) ----
-    // shade_ok(l) = shade_mode | ti_valid[l] : is lane l shaded this pass. run_ok0 = start
+    // ---- leading-run coalesce (combinational off the FIFO HEAD, the current group) ----
+    // shade_ok(l) = shade_mode | valid[l] : is lane l shaded this pass. run_ok0 = start
     // lane shaded? Two run kinds, both advancing sg_x by run_rep, but only SHADED runs emit
     // a span:
     //   * SHADED start (run_ok0=1): extend while contiguous, shaded, and SAME tag. -> a real
@@ -231,14 +239,14 @@ module spanner_v2 import tsp_pkg::*; #(
     reg        run_ok0;                          // start lane shaded? (span emitted iff 1)
     integer rl;
     always @(*) begin
-        run_tag    = ti_tag[sg_lane];
+        run_tag    = gq_tag[0][sg_lane];
         run_rep    = 3'd1;
-        run_ok0    = shade_mode | ti_valid[sg_lane];
+        run_ok0    = shade_mode | gq_valid[0][sg_lane];
         for (rl = 0; rl < 4; rl = rl + 1) begin
             // extend if in-group, contiguous, same shade-eligibility, and (if shaded) same tag.
             if (rl > sg_lane && rl == sg_lane + run_rep
-                && ((shade_mode | ti_valid[rl]) == run_ok0)
-                && (run_ok0 ? (ti_tag[rl] == run_tag) : 1'b1)) begin
+                && ((shade_mode | gq_valid[0][rl]) == run_ok0)
+                && (run_ok0 ? (gq_tag[0][rl] == run_tag) : 1'b1)) begin
                 run_rep = run_rep + 3'd1;
             end
         end
@@ -293,9 +301,19 @@ module spanner_v2 import tsp_pkg::*; #(
     // ---- COAL advance: sg_x steps by run_rep; group exhausted when it crosses the group ----
     wire [SLOTW-1:0] sg_x_next   = sg_x + { {(SLOTW-3){1'b0}}, run_rep };
     wire walk_last              = (sg_x_next == '0);          // wrapped past pixel 1023
-    // COAL produces a descriptor this cycle iff walking, the group read has landed
-    // (g_ready), and the pipeline isn't frozen.
-    wire coal_fires = sg_active && g_ready && !pipe_stall;
+    // COAL produces a descriptor this cycle iff walking, the FIFO head holds sg_x's
+    // group, and the pipeline isn't frozen.
+    wire coal_fires = sg_active && (gq_cnt != 2'd0) && !pipe_stall;
+
+    // ---- group FIFO pop/land bookkeeping ----
+    // pop when COAL exhausts the head group (advances into the next group or wraps);
+    // land when the read presented last cycle arrives on ti_* this cycle. Present a
+    // new read whenever occupancy + in-flight leaves room (conservative: ignores a
+    // same-cycle pop; with depth 3 this still sustains 1 group/cycle steady-state).
+    wire gq_pop     = coal_fires && (walk_last
+                                     || (sg_x_next[SLOTW-1:2] != sg_x[SLOTW-1:2]));
+    wire pf_present = pf_active && ({1'b0, gq_cnt} + {2'd0, gq_inflight} < 3'd3);
+    wire [1:0] gq_land_idx = gq_pop ? (gq_cnt - 2'd1) : gq_cnt;
 
     // ---- SINGLE dedup_ram write port (M10K-inferable) ----
     // dedup_ram has exactly TWO logical writers - the gen-wrap clear-walk and the EMIT
@@ -432,21 +450,14 @@ module spanner_v2 import tsp_pkg::*; #(
         sf_push  = sp_we && needs_alloc;   // allocate -> push a setup
         sf_pdata = { emit_id, t_tag };
 
-        // COAL group read address. A registered-read tag buffer updates its output EVERY
-        // cycle from the presented address, so we drive rd_group to the group of the pixel
-        // COAL will coalesce NEXT cycle, CONTINUOUSLY (don't rely on the read output
-        // persisting across cycles). Next-coalesced pixel = sg_x_next if COAL fires this
-        // cycle (advancing), else sg_x (idle/fill/held).
-        rd_next_x = coal_fires ? sg_x_next : sg_x;
-        // rd_valid MUST stay asserted through a pipe_stall: when it drops, the taginvw
-        // read address collapses to group 0 (taginvw raddr defaults to 0 with rd4_valid=0),
-        // so the NEXT cycle ti_* holds group 0's {tag,invW} instead of sg_x's group. If COAL
-        // then fires (stall just cleared), it coalesces sg_x off group 0's STALE data
-        // (observed on menu2: group 0 = px0-3,py0's invW leaking into an interior group after
-        // a 1-cycle bubble). rd_next_x already = sg_x while stalled (coal_fires=0), so keeping
-        // rd_valid high just re-presents sg_x's group -> ti_* is always correct when COAL resumes.
-        rd_valid  = sg_active;
-        rd_group  = { rd_next_x[SLOTW-1:2], 2'b00 };
+        // COAL group read address: the sequential PREFETCH counter, decoupled from the
+        // walk (the old data-dependent rd_next_x address loop - RAM q -> run_rep ->
+        // next address -> RAM raddr in one cycle - was the critical path). The landing
+        // data is CAPTURED into the FIFO (gq_*), so nothing relies on the RAM output
+        // persisting across cycles and the old stale-address-on-stall hazard is gone
+        // by construction.
+        rd_valid  = pf_present;
+        rd_group  = { pf_grp, 2'b00 };
 
         // ----- SETUP -> triangle_setups write -----
         ts_we  = ts_pend;
@@ -465,7 +476,7 @@ module spanner_v2 import tsp_pkg::*; #(
         if (reset) begin
             busy <= 1'b0; tsp_go <= 1'b0;
             sg_active <= 1'b0; sg_x <= '0; t_valid <= 1'b0;
-            g_ready <= 1'b0;
+            pf_active <= 1'b0; pf_grp <= '0; gq_cnt <= 2'd0; gq_inflight <= 1'b0;
             cur_gen <= GEN_MAX;           // force a clear-walk on the FIRST start (HW-safe
                                           // regardless of M10K power-up state)
             dd_clearing <= 1'b0;
@@ -479,6 +490,35 @@ module spanner_v2 import tsp_pkg::*; #(
             fx_start  <= 1'b0;
             tsp_start <= 1'b0;
             tsp_go    <= 1'b0;            // 1-cyc pulse
+
+            // ---------------- group prefetch FIFO (see decl comment) ----------------
+            // Runs EVERY cycle, independent of pipe_stall: landing data is captured
+            // even while COAL is frozen. The pass-start resets later in this block
+            // override these assignments (NBA last-write-wins).
+            gq_inflight <= pf_present;
+            if (pf_present) begin
+                pf_grp <= pf_grp + 1'b1;
+                if (pf_grp == {(SLOTW-2){1'b1}}) pf_active <= 1'b0; // last group presented
+            end
+            if (gq_pop) begin
+                gq_valid[0] <= gq_valid[1]; gq_pt[0] <= gq_pt[1];
+                gq_valid[1] <= gq_valid[2]; gq_pt[1] <= gq_pt[2];
+                for (q = 0; q < 4; q = q + 1) begin
+                    gq_tag[0][q] <= gq_tag[1][q]; gq_invw[0][q] <= gq_invw[1][q];
+                    gq_tag[1][q] <= gq_tag[2][q]; gq_invw[1][q] <= gq_invw[2][q];
+                end
+            end
+            if (gq_inflight) begin
+                // landing is written AFTER the shift (same-index NBA: landing wins),
+                // which is exactly the popped-and-immediately-refilled entry case.
+                gq_valid[gq_land_idx] <= ti_valid;
+                gq_pt   [gq_land_idx] <= ti_pt;
+                for (q = 0; q < 4; q = q + 1) begin
+                    gq_tag [gq_land_idx][q] <= ti_tag[q];
+                    gq_invw[gq_land_idx][q] <= ti_invw[q];
+                end
+            end
+            gq_cnt <= gq_cnt - {1'b0, gq_pop} + {1'b0, gq_inflight};
 
             // ---------------- TSP freed a tile -> advance BOTH ring tails ----------------
             // planes and spans hand/free per-pass in lock-step, so one free pulse (the same
@@ -521,7 +561,9 @@ module spanner_v2 import tsp_pkg::*; #(
                     dd_clearing <= 1'b1; dd_clr_addr <= '0;   // SPANGEN idle until clear done
                 end else begin
                     cur_gen <= cur_gen + 1'b1;
-                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0; g_ready <= 1'b0;
+                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0;
+                    pf_active <= 1'b1; pf_grp <= '0;
+                    gq_cnt <= 2'd0; gq_inflight <= 1'b0;
                 end
             end
 
@@ -532,7 +574,9 @@ module spanner_v2 import tsp_pkg::*; #(
             if (dd_clearing) begin
                 if (dd_clr_addr == NSLOT-1) begin
                     dd_clearing <= 1'b0; cur_gen <= {{(GEN_W-1){1'b0}}, 1'b1};   // gen=1
-                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0; g_ready <= 1'b0;
+                    sg_x <= '0; sg_active <= 1'b1; t_valid <= 1'b0;
+                    pf_active <= 1'b1; pf_grp <= '0;
+                    gq_cnt <= 2'd0; gq_inflight <= 1'b0;
                 end else dd_clr_addr <= dd_clr_addr + 1'b1;
             end
 
@@ -561,19 +605,19 @@ module spanner_v2 import tsp_pkg::*; #(
 `ifndef SYNTHESIS
                     if ($test$plusargs("coaltrace"))
                         $display("[COAL] sg_x=%0d rdgrp=%0d rdv=%b ti_tag=%08x %08x %08x %08x val=%b",
-                                 sg_x, rd_group, rd_valid, ti_tag[0], ti_tag[1], ti_tag[2], ti_tag[3], ti_valid);
+                                 sg_x, rd_group, rd_valid, gq_tag[0][0], gq_tag[0][1], gq_tag[0][2], gq_tag[0][3], gq_valid[0]);
                     // +peelzero: in PEEL mode (shade_mode=0), catch a span emitted for a
-                    // lane whose ti_invw==0 — the exact bad case (peel shading a pixel with
+                    // lane whose invW==0 — the exact bad case (peel shading a pixel with
                     // valid=1 but zeroed invW). Shows the lane's valid/tag/invw.
                     if ($test$plusargs("peelzero") && !shade_mode && run_ok0
-                        && ti_invw[sg_lane] == 32'd0)
+                        && gq_invw[0][sg_lane] == 32'd0)
                         $display("[PEELZERO] sg_x=%0d lane=%0d val=%b tag=%08x invw=%08x rep=%0d",
-                                 sg_x, sg_lane, ti_valid, ti_tag[sg_lane], ti_invw[sg_lane], run_rep);
+                                 sg_x, sg_lane, gq_valid[0], gq_tag[0][sg_lane], gq_invw[0][sg_lane], run_rep);
                     // catch a COAL emit where the START lane is shaded (span will be written)
                     // AND its captured invw would be 0 in PEEL mode — the reader-fed bad px.
                     if ($test$plusargs("peelzero") && !shade_mode && run_ok0 && sg_x < 8)
-                        $display("[COALDBG] sg_x=%0d lane=%0d val=%b tag=%08x ti_invw[l]=%08x rep=%0d run_id=%0d",
-                                 sg_x, sg_lane, ti_valid, ti_tag[sg_lane], ti_invw[sg_lane], run_rep, run_id);
+                        $display("[COALDBG] sg_x=%0d lane=%0d val=%b tag=%08x invw[l]=%08x rep=%0d run_id=%0d",
+                                 sg_x, sg_lane, gq_valid[0], gq_tag[0][sg_lane], gq_invw[0][sg_lane], run_rep, run_id);
 `endif
                     t_valid  <= 1'b1;
                     t_x      <= sg_x;
@@ -581,28 +625,21 @@ module spanner_v2 import tsp_pkg::*; #(
                     t_tag    <= run_tag;
                     t_rep    <= run_rep;
                     t_ok     <= run_ok0;           // shaded run -> emit a span; else skip
-                    t_at     <= ti_pt[sg_lane];
+                    t_at     <= gq_pt[0][sg_lane];
                     for (q = 0; q < 4; q = q + 1)
-                        t_invw[q] <= (q < run_rep) ? ti_invw[sg_lane + q[1:0]] : 32'd0;
+                        t_invw[q] <= (q < run_rep) ? gq_invw[0][sg_lane + q[1:0]] : 32'd0;
                     // the dedup read for THIS descriptor is presented by the dedicated M10K
                     // block above (dd_re == coal_fires, dd_raddr == run_id); dd_rd_q resolves
                     // next cycle in EMIT. run_id/coal_fires are stable this cycle.
 
-                    // advance. The read for sg_x_next's group is presented THIS cycle
-                    // (rd_group tracks rd_next_x continuously) -> ti_* is correct next cycle.
+                    // advance; on a group crossing gq_pop (computed above) shifts the FIFO
+                    // so the head holds sg_x_next's group next cycle.
                     sg_x <= sg_x_next;
                     if (walk_last) sg_active <= 1'b0;
-                    // g_ready stays 1 (a valid read was presented this cycle).
                 end else begin
-                    // fill bubble (post start/stall): no descriptor; the read of sg_x's
-                    // group was presented this cycle -> ready next cycle.
+                    // fill bubble (FIFO empty after start, or resuming): no descriptor.
                     t_valid <= 1'b0;
                 end
-
-                // g_ready: a valid read was presented this cycle (sg_active && !pipe_stall
-                // is implied by being in this block); it lands next cycle. Cleared only at
-                // start (below) so the first COAL waits one fill cycle.
-                if (sg_active) g_ready <= 1'b1;
             end
 
             // =================== FIFO push ===================
