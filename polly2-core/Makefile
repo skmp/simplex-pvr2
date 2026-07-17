@@ -26,7 +26,7 @@ MAKEFLAGS += -j$(NJOBS)
 # dominates. Left single-threaded. To parallelize, run independent scenes with
 # `make -j` instead. (Set VTHREADS>1 to re-enable experimentally.)
 VTHREADS ?= 1
-VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/tsp/gen \
+VFLAGS    = -Wno-WIDTH -Wno-UNOPTFLAT -Wno-UNSIGNED -Wno-DECLFILENAME -Irtl/gen \
             -j $(NJOBS) $(if $(filter-out 1,$(VTHREADS)),--threads $(VTHREADS),) \
             --output-split 40000 --output-split-cfuncs 1000 \
             -CFLAGS "-O3 -march=native"
@@ -37,9 +37,6 @@ CWD  := $(shell pwd)
 .PHONY: clean test tex tex-addr tex-uv tex-filter tex-combiner \
         oparse region regfile regen sortcache itquad taginvw dense_span_buffer \
         frontendtsplp spannerv2 mulc9 mul16sppro add24sppro mulc9sppro add3sppro
-
-# TSP module files (package first). ISP shared FP units come from rtl/isp_min.
-TSP_RTL = rtl/tsp/tsp_pkg.sv $(filter-out rtl/tsp/tsp_pkg.sv,$(wildcard rtl/tsp/*.sv))
 
 # --- reorganized core: RTL now lives in rtl/<subsystem>/ trees. --------------
 # Package (must be listed, not just searched) + `-y` search dirs so Verilator
@@ -57,38 +54,37 @@ RTL_INC   = $(addprefix -y ,$(RTL_DIRS)) -Irtl/gen
 test: tex oparse region regfile sortcache itquad
 
 # ---- TSP texture-pipeline block tests (randomized vectors vs refsw) ----
-TSP = rtl/tsp
 tex: tex-addr tex-uv tex-filter tex-combiner
 	@echo "=== all texture block tests passed ==="
 
 tex-addr: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_addr \
-	  $(TSP)/tex_addr.sv $(CWD)/tb/tex_addr_tb.cpp \
+	  rtl/tsp/tex/tex_addr.sv $(CWD)/tb/tex_addr_tb.cpp \
 	  --Mdir $(BUILD)/obj_texaddr -o tb
 	./$(BUILD)/obj_texaddr/tb
 
 tex-uv: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_uvmap \
-	  $(TSP)/tex_uvmap.sv $(CWD)/tb/tex_uvmap_tb.cpp \
+	  rtl/tsp/tex/tex_uvmap.sv $(CWD)/tb/tex_uvmap_tb.cpp \
 	  --Mdir $(BUILD)/obj_texuv -o tb
 	./$(BUILD)/obj_texuv/tb
 
 tex-filter: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module tex_filter \
-	  $(TSP)/tex_filter.sv $(CWD)/tb/tex_filter_tb.cpp \
+	  rtl/tsp/tex/tex_filter.sv $(CWD)/tb/tex_filter_tb.cpp \
 	  --Mdir $(BUILD)/obj_texfilt -o tb
 	./$(BUILD)/obj_texfilt/tb
 
 tex-combiner: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module color_combiner \
-	  $(TSP)/color_combiner.sv $(CWD)/tb/tex_combiner_tb.cpp \
+	  rtl/tsp/color_combiner.sv $(CWD)/tb/tex_combiner_tb.cpp \
 	  --Mdir $(BUILD)/obj_texcomb -o tb
 	./$(BUILD)/obj_texcomb/tb
 
 # object_list_parser unit test: list walker (direct-DDR reader) + behav burst DDR.
 oparse: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module object_list_parser_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/object_list_parser_tb_top.sv $(TSP)/object_list_parser.sv \
+	  $(TSP_PKG) tb/object_list_parser_tb_top.sv rtl/lists/object_list_parser.sv \
 	  $(CWD)/tb/object_list_parser_tb.cpp --Mdir $(BUILD)/obj_oparse -o tb
 	./$(BUILD)/obj_oparse/tb
 
@@ -96,7 +92,7 @@ oparse: | $(BUILD)
 # priority, alias mismatch conservatism, reset sweep, random soak vs a C model.
 sortcache: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module sort_cache \
-	  rtl/tsp/sort_cache.sv \
+	  rtl/buffers/sort_cache.sv \
 	  $(CWD)/tb/sort_cache_tb.cpp --Mdir $(BUILD)/obj_sortcache -o tb
 	./$(BUILD)/obj_sortcache/tb
 
@@ -105,22 +101,22 @@ sortcache: | $(BUILD)
 # param_offs advance (hdr + nverts*stride per array record).
 itquad: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module isp_primitive_iterator_pf \
-	  $(TSP)/tsp_pkg.sv $(TSP)/isp_primitive_iterator_pf.sv \
+	  $(TSP_PKG) rtl/isp/isp_primitive_iterator_pf.sv \
 	  $(CWD)/tb/isp_primitive_iterator_quad_tb.cpp --Mdir $(BUILD)/obj_itquad -o tb
 	./$(BUILD)/obj_itquad/tb
 
 # regenerate the PVR register typedefs from minicast's pvr_regs.h
 PVR_REGS_H = ../minicast/libswirl/hw/pvr/pvr_regs.h
 regen:
-	python3 tools/gen_pvr_regs.py $(PVR_REGS_H) > rtl/tsp/gen/pvr_regs_gen.svh
-	@echo "regenerated rtl/tsp/gen/pvr_regs_gen.svh"
+	python3 tools/gen_pvr_regs.py $(PVR_REGS_H) > rtl/gen/pvr_regs_gen.svh
+	@echo "regenerated rtl/gen/pvr_regs_gen.svh"
 
 # taginvw_tile_buffer unit test: the split-out {valid,tag,invW} slice TSP reads. Exercises
 # the 4-wide aligned read (rd4/g4) with FOUR DISTINCT per-lane tags + a moving-address
 # streaming read + concurrent write/read, against the real M10K tile_ram. Self-checking.
 taginvw: | $(BUILD)
 	+$(VERILATOR) --binary $(VFLAGS) -Wno-BLKSEQ --top-module taginvw_selftest \
-	  rtl/tsp/tsp_pkg.sv rtl/isp_min/tile_ram.sv rtl/buffers/taginvw_tile_buffer.sv \
+	  $(TSP_PKG) rtl/isp/tile_ram.sv rtl/buffers/taginvw_tile_buffer.sv \
 	  tb/taginvw_selftest.sv --Mdir $(BUILD)/obj_taginvw -o taginvw
 	./$(BUILD)/obj_taginvw/taginvw
 
@@ -128,7 +124,7 @@ taginvw: | $(BUILD)
 # {start,rep,id,invw[0:3],at}). Writes spans at dense slots, reads back + streaming read.
 dense_span_buffer: | $(BUILD)
 	+$(VERILATOR) --binary $(VFLAGS) -Wno-BLKSEQ --top-module dense_span_buffer_selftest \
-	  rtl/tsp/dense_span_buffer.sv tb/dense_span_buffer_selftest.sv \
+	  rtl/buffers/dense_span_buffer.sv tb/dense_span_buffer_selftest.sv \
 	  --Mdir $(BUILD)/obj_densespan -o densespan
 	./$(BUILD)/obj_densespan/densespan
 
@@ -149,16 +145,15 @@ frontendtsplp: | $(BUILD)
 # pass "<dir> <first> <count>" (default: spanner_test_vectors 0 8).
 spannerv2: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
-	  --top-module spanner_v2_tb_top \
-	  $(TSP_RTL) tb/spanner_v2_tb_top.sv tb/sim_ddr_fb.sv \
-	  $(wildcard rtl/isp_min/*.sv) \
+	  --top-module spanner_v2_tb_top $(RTL_INC) \
+	  $(TSP_PKG) $(RTL_EXTRA) tb/spanner_v2_tb_top.sv tb/sim_ddr_fb.sv \
 	  $(CWD)/tb/spanner_v2_tb.cpp --Mdir $(BUILD)/obj_spannerv2 -o tb
 	./$(BUILD)/obj_spannerv2/tb $(ARGS)
 
 # fp_mul_c9 (colour*z) fuzz vs float*int
 mulc9: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_mul_c9_tb_top \
-	  rtl/tsp/fp_mul_c9.sv tb/fp_mul_c9_tb_top.sv \
+	  rtl/fp/fp_mul_c9.sv tb/fp_mul_c9_tb_top.sv \
 	  $(CWD)/tb/fp_mul_c9_tb.cpp --Mdir $(BUILD)/obj_mulc9 -o tb
 	./$(BUILD)/obj_mulc9/tb
 
@@ -166,40 +161,40 @@ mulc9: | $(BUILD)
 # Each TB clocks the pipelined DUT + a combinational ref and checks 0-tolerance match.
 mul16sppro: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_mul16_spp_ro_tb_top \
-	  rtl/isp_min/fp_mul16.sv rtl/isp_min/fp_mul16_spp_ro.sv tb/fp_mul16_spp_ro_tb_top.sv \
+	  rtl/fp/fp_mul16.sv rtl/fp/fp_mul16_spp_ro.sv tb/fp_mul16_spp_ro_tb_top.sv \
 	  $(CWD)/tb/fp_mul16_spp_ro_tb.cpp -CFLAGS -I$(CWD)/tb --Mdir $(BUILD)/obj_mul16sppro -o tb
 	./$(BUILD)/obj_mul16sppro/tb
 
 add24sppro: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_add24_spp_ro_tb_top \
-	  rtl/isp_min/fp_add24.sv rtl/isp_min/fp_add24_spp_ro.sv tb/fp_add24_spp_ro_tb_top.sv \
+	  rtl/fp/fp_add24.sv rtl/fp/fp_add24_spp_ro.sv tb/fp_add24_spp_ro_tb_top.sv \
 	  $(CWD)/tb/fp_add24_spp_ro_tb.cpp -CFLAGS -I$(CWD)/tb --Mdir $(BUILD)/obj_add24sppro -o tb
 	./$(BUILD)/obj_add24sppro/tb
 
 mulc9sppro: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_mul_c9_spp_ro_tb_top \
-	  rtl/tsp/fp_mul_c9.sv rtl/tsp/fp_mul_c9_spp_ro.sv tb/fp_mul_c9_spp_ro_tb_top.sv \
+	  rtl/fp/fp_mul_c9.sv rtl/fp/fp_mul_c9_spp_ro.sv tb/fp_mul_c9_spp_ro_tb_top.sv \
 	  $(CWD)/tb/fp_mul_c9_spp_ro_tb.cpp -CFLAGS -I$(CWD)/tb --Mdir $(BUILD)/obj_mulc9sppro -o tb
 	./$(BUILD)/obj_mulc9sppro/tb
 
 add3sppro: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --top-module fp_add3_24_spp_ro_tb_top \
-	  rtl/isp_min/fp_add3_24.sv rtl/isp_min/fp_add3_24_spp_ro.sv tb/fp_add3_24_spp_ro_tb_top.sv \
+	  rtl/fp/fp_add3_24.sv rtl/fp/fp_add3_24_spp_ro.sv tb/fp_add3_24_spp_ro_tb_top.sv \
 	  $(CWD)/tb/fp_add3_24_spp_ro_tb.cpp -CFLAGS -I$(CWD)/tb --Mdir $(BUILD)/obj_add3sppro -o tb
 	./$(BUILD)/obj_add3sppro/tb
 
 # reg_file unit test: PVR scalar regs (generated) + FOG/PAL M10K tables.
 regfile: | $(BUILD)
-	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw -Irtl/tsp/gen \
+	+$(VERILATOR) --cc --exe --build $(VFLAGS) -Wno-BLKSEQ --public-flat-rw \
 	  --top-module reg_file_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/reg_file_tb_top.sv $(TSP)/reg_file.sv \
+	  $(TSP_PKG) tb/reg_file_tb_top.sv rtl/buffers/reg_file.sv \
 	  $(CWD)/tb/reg_file_tb.cpp --Mdir $(BUILD)/obj_regfile -o tb
 	./$(BUILD)/obj_regfile/tb
 
 # region_array_parser unit test: region walk -> per-tile ordered states.
 region: | $(BUILD)
 	+$(VERILATOR) --cc --exe --build $(VFLAGS) --public-flat-rw --top-module region_array_parser_tb_top \
-	  $(TSP)/tsp_pkg.sv tb/region_array_parser_tb_top.sv $(TSP)/region_array_parser.sv \
+	  $(TSP_PKG) tb/region_array_parser_tb_top.sv rtl/lists/region_array_parser.sv \
 	  $(CWD)/tb/region_array_parser_tb.cpp --Mdir $(BUILD)/obj_region -o tb
 	./$(BUILD)/obj_region/tb
 
