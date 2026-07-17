@@ -342,7 +342,13 @@ assign      spx     = x_rel[10:1];           // /2: source pixel 0..639
 
 wire de_c  = (hcnt < H_ACT) && (vcnt < V_ACT);
 wire hs_c  = (hcnt >= HS_BEG) && (hcnt < HS_END);
-wire vs_c  = (vcnt >= VS_BEG) && (vcnt < VS_END);
+// VS edges must coincide with the HS leading edge (CEA-861; same equation
+// as ascal's o_vsv): rise at HS_BEG of line VS_BEG, fall at HS_BEG of line
+// VS_END. Toggling at hcnt==0 instead puts the VS edge 2008 px before HS,
+// which some HDMI sinks reject as an unsupported mode.
+wire vs_c  = (vcnt == VS_BEG && hcnt >= HS_BEG) ||
+             (vcnt >  VS_BEG && vcnt <  VS_END) ||
+             (vcnt == VS_END && hcnt <  HS_BEG);
 wire vbl_c = (vcnt >= V_ACT);
 wire img_c = img_h && img_v;
 
