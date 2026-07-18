@@ -30,8 +30,19 @@
 //                            R: [11:0] samples currently queued (0..2048).
 //   0xFF20201C  REVISION     RO. MMIO interface revision. 0 = pre-audio
 //                            bitstreams (the then-reserved slot read 0),
-//                            1 = audio (AUDIO_DATA + this register).
+//                            1 = audio (AUDIO_DATA + this register),
+//                            2 = border bands (FB_TOP/FB_BOT).
 //                            Writes ignored.
+//   0xFF202020  FB_TOP       RW. DDR BYTE address of a 640x30 RGB565
+//                            linear framebuffer (stride 1280 bytes),
+//                            displayed 2x-doubled as a 1280x60 band in the
+//                            top border (lines 0..59). 128-byte aligned
+//                            (low 7 bits forced 0); 0 = band off (black).
+//                            Sampled by the SPG once per frame at the
+//                            start of vertical blanking.
+//   0xFF202024  FB_BOT       RW. Same, for the bottom border
+//                            (lines 1020..1079).
+//   0xFF202028 - 0xFF20203C  reserved (read 0, writes ignored).
 //
 // Single clock domain (clk_sys). waitrequest is low except for AUDIO_DATA
 // writes with the FIFO full - every other access completes immediately;
@@ -71,7 +82,11 @@ module pvr_mmio
 	output reg         aud_wr    = 1'b0,     // 1-clk push pulse
 	output reg  [31:0] aud_wdata = 32'd0,
 	input  wire        aud_full,
-	input  wire [11:0] aud_level
+	input  wire [11:0] aud_level,
+
+	// SPG border band framebuffers (128-byte-aligned byte addr, 0 = off)
+	output reg  [31:0] fb_top    = 32'd0,
+	output reg  [31:0] fb_bot    = 32'd0
 );
 
 // no size casts (Quartus Standard 17.0)
@@ -80,13 +95,14 @@ localparam [8:0] RSTC = RST_CYCLES;
 /* verilator lint_on WIDTHTRUNC */
 
 // MMIO interface revision (REVISION reg): bump on every map change.
-// 1 = audio (AUDIO_DATA + REVISION added); 0 = anything older.
-localparam [31:0] REVISION = 32'd1;
+// 2 = border bands (FB_TOP/FB_BOT); 1 = audio (AUDIO_DATA + REVISION
+// added); 0 = anything older.
+localparam [31:0] REVISION = 32'd2;
 
 wire wr32     = avs_write && (avs_byteenable == 4'b1111);
 wire sel_regs = (avs_address[20:13] == 8'd0);     // 0x0000-0x1FFF
 wire sel_cfg  = (avs_address[20:13] == 8'd1);     // 0x2000-0x3FFF
-wire [2:0] cfg_word = avs_address[4:2];           // 0x2000..0x201C
+wire [3:0] cfg_word = avs_address[5:2];           // 0x2000..0x203C
 
 // AUDIO_DATA is the only stalling access: hold waitrequest while the FIFO
 // is full - and for the one cycle a just-accepted push (aud_wr) needs to
@@ -94,7 +110,7 @@ wire [2:0] cfg_word = avs_address[4:2];           // 0x2000..0x201C
 // against the stale full flag and get dropped. hps_lw_bridge keeps
 // avs_write asserted, so the push (and the HPS's blocked store) completes
 // on the first cycle with a free slot.
-wire wr_audio  = wr32 && sel_cfg && (cfg_word == 3'd6);
+wire wr_audio  = wr32 && sel_cfg && (cfg_word == 4'd6);
 wire aud_stall = aud_full || aud_wr;
 assign avs_waitrequest = wr_audio && aud_stall;
 
@@ -119,20 +135,20 @@ always @(posedge clk) begin
 			pvr_wr    <= 1'b1;
 		end
 		else if (sel_cfg) case (cfg_word)
-			3'd0: vram_top <= avs_writedata[31:24];        // VRAM_BASE
-			3'd2: begin                                    // GO
+			4'd0: vram_top <= avs_writedata[31:24];        // VRAM_BASE
+			4'd2: begin                                    // GO
 				pvr_go   <= 1'b1;
 				done_stk <= 1'b0;
 				busy     <= 1'b1;
 				cycles   <= 32'd0;
 			end
-			3'd3: begin                                    // RESET
+			4'd3: begin                                    // RESET
 				rst_cnt  <= RSTC;
 				busy     <= 1'b0;
 				done_stk <= 1'b0;
 			end
-			3'd5: clk_sel <= avs_writedata[1:0];           // CLK
-			3'd6: if (!aud_stall) begin                    // AUDIO_DATA
+			4'd5: clk_sel <= avs_writedata[1:0];           // CLK
+			4'd6: if (!aud_stall) begin                    // AUDIO_DATA
 				// wr32 stays asserted while waitrequest stalls the
 				// transaction; !aud_stall is the acceptance cycle
 				// (must mirror avs_waitrequest exactly), so exactly
@@ -140,6 +156,8 @@ always @(posedge clk) begin
 				aud_wr    <= 1'b1;
 				aud_wdata <= avs_writedata;
 			end
+			4'd8: fb_top <= {avs_writedata[31:7], 7'd0};   // FB_TOP (128B aligned)
+			4'd9: fb_bot <= {avs_writedata[31:7], 7'd0};   // FB_BOT
 			default: ;                                     // STATUS/CYCLES/rsvd: RO
 		endcase
 	end
@@ -162,12 +180,14 @@ always @(posedge clk) begin
 	avs_readdata      <= 32'd0;
 	if (avs_read && sel_cfg) begin
 		case (cfg_word)
-			3'd0: avs_readdata <= {vram_top, 24'd0};       // VRAM_BASE
-			3'd1: avs_readdata <= {30'd0, done_stk, busy}; // STATUS
-			3'd4: avs_readdata <= cycles;                  // FRAME_CYCLES
-			3'd5: avs_readdata <= {30'd0, clk_sel};        // CLK
-			3'd6: avs_readdata <= {20'd0, aud_level};      // AUDIO_DATA level
-			3'd7: avs_readdata <= REVISION;                // REVISION
+			4'd0: avs_readdata <= {vram_top, 24'd0};       // VRAM_BASE
+			4'd1: avs_readdata <= {30'd0, done_stk, busy}; // STATUS
+			4'd4: avs_readdata <= cycles;                  // FRAME_CYCLES
+			4'd5: avs_readdata <= {30'd0, clk_sel};        // CLK
+			4'd6: avs_readdata <= {20'd0, aud_level};      // AUDIO_DATA level
+			4'd7: avs_readdata <= REVISION;                // REVISION
+			4'd8: avs_readdata <= fb_top;                  // FB_TOP
+			4'd9: avs_readdata <= fb_bot;                  // FB_BOT
 			default: ;
 		endcase
 	end

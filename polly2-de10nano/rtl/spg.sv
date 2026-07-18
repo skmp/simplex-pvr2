@@ -16,6 +16,14 @@
 //    64-bit word. A line is then 2560 DDR bytes with half the bits useful
 //    (2x overfetch - still trivial bandwidth). fb_stride stays in FB-view
 //    bytes (1280) in both modes; the DDR advance doubles internally.
+//  - Two optional border bands: 640x30 RGB565 LINEAR framebuffers (stride
+//    fixed at 1280 bytes) displayed 2x-doubled as 1280x60, exactly filling
+//    the top (lines 0..59) and bottom (lines 1020..1079) borders,
+//    x-centred like the game window. fb_top_base / fb_bot_base are DDR
+//    BYTE addresses, 128-byte aligned, sampled once per frame at the start
+//    of vertical blanking (line 1080); 0 disables a band (black border).
+//    Band lines reuse the game fetch/line-buffer engine (linear mode,
+//    beat-aligned: 80 beats per line, never split, never misaligned).
 //  - DDR access is a 128-bit Avalon read master, intended for the vbuf
 //    port on sysmem_lite that ascal used to own (16-byte word addresses).
 //    The FB base only has to be 8-byte aligned: an odd 64-bit start word
@@ -69,6 +77,13 @@ module spg
 	input  wire        fb_split,     // Dreamcast split-VRAM layout (see header)
 	input  wire        fb_disp_half, // split: which 32-bit half of each 64-bit word
 
+	// Border bands (see header). BYTE addresses, 128-byte aligned, 0 = off;
+	// sampled once per frame at the start of vertical blanking.
+	/* verilator lint_off UNUSEDSIGNAL */
+	input  wire [31:0] fb_top_base,  // 640x30 linear RGB565 above the window
+	input  wire [31:0] fb_bot_base,  // 640x30 linear RGB565 below the window
+	/* verilator lint_on UNUSEDSIGNAL */
+
 	// 128-bit Avalon read master (sysmem vbuf port), avl_clk domain
 	input  wire         avl_clk,
 	output reg          avl_read,
@@ -117,6 +132,15 @@ localparam [7:0]  BC_FULL   = BURST_LEN; // full burstcount
 localparam [4:0]  BB_FULL   = BURST_LEN; // full per-burst beat count
 localparam [8:0]  B9_FULL   = BURST_LEN;
 localparam [27:0] ADDR_STEP = BURST_LEN; // address advance per full burst
+
+// border bands: 640x30 linear, stride 1280 bytes = 80 16-byte words/beats
+localparam [10:0] BAND_ADV   = 11'd80;
+localparam [8:0]  BAND_BEATS = 9'd80;
+
+// fetch/display region encoding ({region, src line} keys the request dedup)
+localparam [1:0] RGN_GAME = 2'd0;
+localparam [1:0] RGN_TOP  = 2'd1;
+localparam [1:0] RGN_BOT  = 2'd2;
 /* verilator lint_on WIDTHTRUNC */
 
 //////////////////////////////////////////////////////////////////////////
@@ -151,6 +175,14 @@ reg        dbl_lat    = 1'b0;
 reg        split_lat  = 1'b0;
 reg        half_lat   = 1'b0;
 
+// Band latches: sampled at the start of vertical blanking (line V_ACT), so
+// they are stable before the top band's first request (2 lines before the
+// raster wraps) and its display at line 0.
+reg [27:0] top_base_lat = 28'd0;
+reg [27:0] bot_base_lat = 28'd0;
+reg        top_en_lat   = 1'b0;
+reg        bot_en_lat   = 1'b0;
+
 // line-doubling shift: output lines per source line = 2 (480) or 4 (240p)
 wire [1:0] vshift = dbl_lat ? 2'd2 : 2'd1;
 
@@ -158,27 +190,43 @@ wire [1:0] vshift = dbl_lat ? 2'd2 : 2'd1;
 // Fetch requests (video domain -> Avalon domain)
 //////////////////////////////////////////////////////////////////////////
 
-// Two output lines ahead of the raster, decide which SOURCE line will be
-// needed and request it once. Buffer parity = source line LSB, so the line
-// being written is never the line being displayed.
+// Two output lines ahead of the raster, decide which SOURCE line (of which
+// region) will be needed and request it once. Buffer parity = source line
+// LSB, so the line being written is never the line being displayed - this
+// holds across region seams too (each region restarts at src 0 an even
+// number of output lines after the previous region's last line began).
 reg        req_toggle = 1'b0;
-reg        req_sof    = 1'b0;   // first line of frame: reload base address
+reg        req_sof    = 1'b0;   // first line of its region: reload base address
 reg        req_buf    = 1'b0;
-reg  [9:0] last_req   = 10'h3FF;
+reg  [1:0] req_region = RGN_GAME;
+reg [11:0] last_req   = 12'hFFF;   // {region, src}
 reg  [1:0] cnt_req    = 2'd0;
 
-wire [10:0] y_look   = vcnt + 11'd2;   // never wraps: Y1+2 << V_TOTAL
-wire        look_in  = (y_look >= Y0) && (y_look < Y1);
-wire [10:0] look_rel = y_look - Y0;
+// wraps only for the top band, whose first request lands 2 lines before
+// the raster does (V_TOTAL-2 -> line 0)
+wire [10:0] y_look_raw = vcnt + 11'd2;
+wire [10:0] y_look     = (y_look_raw >= V_TOTAL) ? y_look_raw - V_TOTAL
+                                                 : y_look_raw;
+
+wire        look_top  = (y_look < Y0) && top_en_lat;
+wire        look_game = (y_look >= Y0) && (y_look < Y1);
+wire        look_bot  = (y_look >= Y1) && (y_look < V_ACT) && bot_en_lat;
+wire        look_in   = look_top || look_game || look_bot;
+wire  [1:0] look_rgn  = look_top ? RGN_TOP : look_game ? RGN_GAME : RGN_BOT;
+wire [10:0] look_rel  = look_top  ? y_look
+                      : look_game ? y_look - Y0
+                                  : y_look - Y1;
+wire  [1:0] look_vsh  = look_game ? vshift : 2'd1;   // bands are always 2x
 /* verilator lint_off UNUSEDSIGNAL */
-wire [10:0] look_shf = look_rel >> vshift;
+wire [10:0] look_shf = look_rel >> look_vsh;
 /* verilator lint_on UNUSEDSIGNAL */
 wire  [9:0] look_src = look_shf[9:0];
+wire [11:0] look_key = {look_rgn, look_src};
 
 always @(posedge clk or posedge reset) begin
 	if (reset) begin
 		req_toggle <= 1'b0;
-		last_req   <= 10'h3FF;
+		last_req   <= 12'hFFF;
 		cnt_req    <= 2'd0;
 	end
 	else begin
@@ -190,13 +238,21 @@ always @(posedge clk or posedge reset) begin
 			dbl_lat    <= fb_line_dbl;
 			split_lat  <= fb_split;
 			half_lat   <= fb_disp_half;
-			last_req   <= 10'h3FF;
 		end
 
-		if (hcnt == 12'd0 && look_in && look_src != last_req) begin
+		if (vcnt == V_ACT && hcnt == 12'd0) begin
+			top_base_lat <= fb_top_base[31:4];   // [6:4] zero: 128B aligned
+			bot_base_lat <= fb_bot_base[31:4];
+			top_en_lat   <= (fb_top_base[31:7] != 25'd0);
+			bot_en_lat   <= (fb_bot_base[31:7] != 25'd0);
+			last_req     <= 12'hFFF;
+		end
+
+		if (hcnt == 12'd0 && look_in && look_key != last_req) begin
 			req_sof    <= (look_src == 10'd0);
 			req_buf    <= look_src[0];
-			last_req   <= look_src;
+			req_region <= look_rgn;
+			last_req   <= look_key;
 			cnt_req    <= cnt_req + 2'd1;
 			req_toggle <= ~req_toggle;   // payload above is stable when this lands
 		end
@@ -216,11 +272,20 @@ reg  [8:0] w           = 9'd0;   // beat index within the line
 reg  [8:0] beats_left  = 9'd0;   // beats still expected for the line
 reg  [4:0] burst_beats = 5'd0;   // beats still expected for the current burst
 reg        done_toggle = 1'b0;
+reg        cur_split   = 1'b0;   // this fetch's layout: only game can be split
+reg        cur_odd0    = 1'b0;   // ... or start mid-beat (bands are 128B aligned)
 
 wire req_edge = rt_sync[2] ^ rt_sync[1];
+wire req_game = (req_region == RGN_GAME);
 
 // 80 beats linear / 160 split, +1 when the FB starts mid-beat
 wire [8:0] total_beats = (split_lat ? 9'd160 : 9'd80) + {8'd0, odd0_lat};
+
+// requests never interleave regions: line_addr advances within one region
+// and req_sof reloads it from that region's base at the region's first line
+wire [27:0] region_base = (req_region == RGN_TOP) ? top_base_lat
+                        : (req_region == RGN_BOT) ? bot_base_lat
+                                                  : base_lat;
 
 always @(posedge avl_clk) begin : fetch_fsm
 	reg [27:0] na;
@@ -237,13 +302,16 @@ always @(posedge avl_clk) begin : fetch_fsm
 
 	if ((req_edge || pending) && !fetching) begin
 		pending        <= 1'b0;
-		na = req_sof ? base_lat : line_addr + {17'd0, adv_lat};
+		na = req_sof ? region_base
+		             : line_addr + {17'd0, req_game ? adv_lat : BAND_ADV};
 		line_addr      <= na;
 		avl_address    <= na;
 		avl_burstcount <= BC_FULL;         // total_beats >= 80: first burst is full
 		avl_read       <= 1'b1;
 		burst_beats    <= BB_FULL;
-		beats_left     <= total_beats;
+		beats_left     <= req_game ? total_beats : BAND_BEATS;
+		cur_split      <= req_game & split_lat;
+		cur_odd0       <= req_game & odd0_lat;
 		w              <= 9'd0;
 		fetching       <= 1'b1;
 	end
@@ -288,8 +356,8 @@ end
 // wrap high, so one upper-bound compare covers head and tail.
 //////////////////////////////////////////////////////////////////////////
 
-wire [10:0] base_n = split_lat ? {1'b0, w, 1'b0} - {10'd0, odd0_lat}
-                               : {w, 2'b00}      - {9'd0, odd0_lat, 1'b0};
+wire [10:0] base_n = cur_split ? {1'b0, w, 1'b0} - {10'd0, cur_odd0}
+                               : {w, 2'b00}      - {9'd0, cur_odd0, 1'b0};
 
 wire  [9:0] spx;    // display-side source pixel (declared ahead of use)
 wire        rbuf;
@@ -306,14 +374,14 @@ for (gb = 0; gb < 4; gb = gb + 1) begin : bank
 	localparam [1:0] GB = gb;
 	/* verilator lint_on WIDTHTRUNC */
 	wire  [1:0] o2   = GB - base_n[1:0];
-	wire        cand = split_lat ? (o2 < 2'd2) : 1'b1;
+	wire        cand = cur_split ? (o2 < 2'd2) : 1'b1;
 	wire [10:0] n    = base_n + {9'd0, o2};
 	wire        ok   = cand && (n < FB_WORDS);
 
 	wire [63:0] h64  = o2[0] ? avl_readdata[127:64] : avl_readdata[63:0];
 	wire [31:0] w32  = o2[1] ? (o2[0] ? avl_readdata[127:96] : avl_readdata[95:64])
 	                         : (o2[0] ? avl_readdata[63:32]  : avl_readdata[31:0]);
-	wire [31:0] wd   = split_lat ? (half_lat ? h64[31:0] : h64[63:32]) : w32;
+	wire [31:0] wd   = cur_split ? (half_lat ? h64[31:0] : h64[63:32]) : w32;
 
 	always @(posedge avl_clk) begin
 		if (fetching && avl_readdatavalid && ok) mem[{req_buf, n[8:2]}] <= wd;
@@ -329,9 +397,15 @@ endgenerate
 // after the counters; syncs/de/border are piped by 2 to stay aligned.
 //////////////////////////////////////////////////////////////////////////
 
-wire [10:0] y_rel   = vcnt - Y0;
+// active display region this line: game window or one of the border bands
+wire        top_v = (vcnt < Y0) && top_en_lat;
+wire        bot_v = (vcnt >= Y1) && (vcnt < V_ACT) && bot_en_lat;
+
+wire [10:0] y_rel   = vcnt - Y0;             // game-relative (underrun check)
+wire [10:0] d_rel   = top_v ? vcnt : bot_v ? vcnt - Y1 : y_rel;
+wire  [1:0] d_vsh   = (top_v || bot_v) ? 2'd1 : vshift;
 /* verilator lint_off UNUSEDSIGNAL */
-wire [10:0] y_shf   = y_rel >> vshift;
+wire [10:0] y_shf   = d_rel >> d_vsh;
 wire [11:0] x_rel   = hcnt - X0;
 /* verilator lint_on UNUSEDSIGNAL */
 wire  [9:0] src_cur = y_shf[9:0];
@@ -350,7 +424,7 @@ wire vs_c  = (vcnt == VS_BEG && hcnt >= HS_BEG) ||
              (vcnt >  VS_BEG && vcnt <  VS_END) ||
              (vcnt == VS_END && hcnt <  HS_BEG);
 wire vbl_c = (vcnt >= V_ACT);
-wire img_c = img_h && img_v;
+wire img_c = img_h && (img_v || top_v || bot_v);
 
 reg [2:0] lane1  = 3'd0;   // [2:1]=bank, [0]=16-bit half
 reg [4:0] pipe1  = 5'd0;   // {img, de, hs, vs, vbl}

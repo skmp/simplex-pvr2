@@ -19,7 +19,16 @@ VFLAGS = -Wno-WIDTH -Wno-UNUSEDSIGNAL -j $(NJOBS) --build-jobs $(NJOBS) \
 
 TSP_PKG = ../polly2-core/rtl/gen/tsp_pkg.sv
 
-all: spg-sync pvr-burst spg-loopback audio-i2s
+all: spg-sync pvr-burst spg-loopback audio-i2s spg-bands
+
+#   make spg-bands - border bands: per-pixel compare of full frames (top
+#                    band / game window / bottom band / black borders),
+#                    band enable/disable latching at vblank, no underrun
+spg-bands: obj_dir/spg_bands_tb
+	./obj_dir/spg_bands_tb
+
+obj_dir/spg_bands_tb: rtl/spg.sv tb/spg_bands_tb.cpp
+	$(VERILATOR) --cc --exe --build $(VFLAGS) rtl/spg.sv tb/spg_bands_tb.cpp -o spg_bands_tb
 
 spg-sync: obj_dir/spg_sync_tb
 	./obj_dir/spg_sync_tb
@@ -69,4 +78,4 @@ obj_dir/pvr_burst_tb: rtl/simplex_pvr_top.sv tb/peel_core_stub.sv tb/pvr_burst_t
 clean:
 	rm -rf obj_dir
 
-.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s clean
+.PHONY: all spg-sync pvr-burst spg-loopback audio-i2s spg-bands clean

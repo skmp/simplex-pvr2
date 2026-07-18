@@ -137,10 +137,12 @@ int main(int argc, char** argv) {
         if (f.l || f.r) { printf("idle frame not silent\n"); errors++; }
     if (avm_read(AUDIO_DATA) != 0) { printf("idle level != 0\n"); errors++; }
 
-    // ---- REVISION: reads 1 (audio support), read-only, never stalls ----
-    if (avm_read(REVISION) != 1) { printf("REVISION != 1\n"); errors++; }
+    // ---- REVISION: audio support is rev 1+ (don't pin the exact value,
+    // later map extensions bump it); read-only, never stalls ----
+    uint32_t rev = avm_read(REVISION);
+    if (rev <= 1) { printf("REVISION %u not > 1\n", rev); errors++; }
     if (avm_write(REVISION, 0xDEADBEEF)) { printf("REVISION write stalled\n"); errors++; }
-    if (avm_read(REVISION) != 1) { printf("REVISION not read-only\n"); errors++; }
+    if (avm_read(REVISION) != rev) { printf("REVISION not read-only\n"); errors++; }
 
     // ---- small batch: framing, order, one-shot ----
     static const Frame batch[8] = {

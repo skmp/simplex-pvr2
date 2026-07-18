@@ -52,7 +52,10 @@ pvr_mmio mmio
 	.aud_wr           (aud_wr),
 	.aud_wdata        (aud_wdata),
 	.aud_full         (aud_full),
-	.aud_level        (aud_level)
+	.aud_level        (aud_level),
+
+	.fb_top           (),
+	.fb_bot           ()
 );
 
 audio_i2s audio_i2s
