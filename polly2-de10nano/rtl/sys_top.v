@@ -327,6 +327,8 @@ wire        aud_fifo_wr, aud_fifo_full;
 wire [31:0] aud_fifo_wdata;
 wire [11:0] aud_fifo_level;
 
+wire [31:0] fb_top_base, fb_bot_base;
+
 pvr_mmio pvr_mmio
 (
 	.clk              (clk_sys),
@@ -352,7 +354,10 @@ pvr_mmio pvr_mmio
 	.aud_wr           (aud_fifo_wr),
 	.aud_wdata        (aud_fifo_wdata),
 	.aud_full         (aud_fifo_full),
-	.aud_level        (aud_fifo_level)
+	.aud_level        (aud_fifo_level),
+
+	.fb_top           (fb_top_base),
+	.fb_bot           (fb_bot_base)
 );
 
 //////////////////////////////////////////////////////////////////////////
@@ -514,6 +519,9 @@ spg spg
 	.fb_line_dbl (1'b0),
 	.fb_split    (1'b1),
 	.fb_disp_half(spvr_fb_r_sof1[22]),
+
+	.fb_top_base (fb_top_base),
+	.fb_bot_base (fb_bot_base),
 
 	.avl_clk          (clk_100m),
 	.avl_read         (vbuf_read),

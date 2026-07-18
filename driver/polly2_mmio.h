@@ -20,7 +20,15 @@
  *                          R: [11:0] samples currently queued (0..2048).
  *   0xFF20201C  REVISION   RO   MMIO interface revision. 0 = pre-audio
  *                          bitstream (slot was reserved, read 0), 1 = audio
- *                          (AUDIO_DATA + this register).
+ *                          (AUDIO_DATA + this register), 2 = border bands
+ *                          (FB_TOP/FB_BOT).
+ *   0xFF202020  FB_TOP     RW   DDR byte address of a 640x30 RGB565 linear
+ *                          framebuffer (stride 1280 bytes) shown 2x-doubled
+ *                          as a 1280x60 band in the top border of the 1080p
+ *                          raster. 128-byte aligned (low 7 bits forced 0);
+ *                          0 = band off. Sampled once per frame at vblank
+ *                          start.
+ *   0xFF202024  FB_BOT     RW   same, bottom border
  *
  * Prerequisites (load_fpga_bitstream already does both): L3 remap = 0x19
  * (lwhps2fpga visible) and brg_mod_reset = 0 (bridge out of reset).
@@ -44,10 +52,18 @@
 #define POLLY2_MMIO_CLK       0x2014
 #define POLLY2_MMIO_AUDIO_DATA 0x2018
 #define POLLY2_MMIO_REVISION  0x201C
+#define POLLY2_MMIO_FB_TOP    0x2020
+#define POLLY2_MMIO_FB_BOT    0x2024
 
 #define POLLY2_AUDIO_FIFO_DEPTH 2048u
 
 #define POLLY2_REV_AUDIO 1u   /* first revision with AUDIO_DATA + REVISION */
+#define POLLY2_REV_BANDS 2u   /* first revision with FB_TOP/FB_BOT */
+
+/* border band framebuffer geometry (source; displayed 2x as 1280x60) */
+#define POLLY2_BAND_W      640u
+#define POLLY2_BAND_H      30u
+#define POLLY2_BAND_STRIDE 1280u  /* bytes; 128-byte-aligned base required */
 
 #define POLLY2_STATUS_WORKING 0x1u
 #define POLLY2_STATUS_DONE    0x2u
@@ -113,6 +129,14 @@ static inline void polly2_set_clock(unsigned sel)
 	usleep(10);
 }
 
+/* current core clock in Hz, from the CLK register readback */
+static inline uint32_t polly2_clock_hz(void)
+{
+	static const uint32_t hz[4] = { 75000000u, 90000000u,
+	                                100000000u, 112500000u };
+	return hz[polly2_mmio_rd(POLLY2_MMIO_CLK) & 3u];
+}
+
 static inline void polly2_go(void)    { polly2_mmio_wr(POLLY2_MMIO_GO, 1); }
 static inline void polly2_reset(void) { polly2_mmio_wr(POLLY2_MMIO_RESET, 1); }
 
@@ -145,5 +169,23 @@ static inline uint32_t polly2_revision(void)
 static inline int polly2_has_audio(void)
 {
 	return polly2_revision() >= POLLY2_REV_AUDIO;
+}
+
+static inline int polly2_has_bands(void)
+{
+	return polly2_revision() >= POLLY2_REV_BANDS;
+}
+
+/* ddr_byte_addr: 128-byte-aligned DDR byte address of a 640x30 RGB565
+ * linear framebuffer (stride 1280), or 0 to turn the band off. The SPG
+ * samples these once per frame at vblank start. */
+static inline void polly2_set_fb_top(uint32_t ddr_byte_addr)
+{
+	polly2_mmio_wr(POLLY2_MMIO_FB_TOP, ddr_byte_addr);
+}
+
+static inline void polly2_set_fb_bot(uint32_t ddr_byte_addr)
+{
+	polly2_mmio_wr(POLLY2_MMIO_FB_BOT, ddr_byte_addr);
 }
 
