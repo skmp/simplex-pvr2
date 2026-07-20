@@ -12,8 +12,8 @@
 // = 48 kHz - the same division the silent placeholder used, so the
 // ADV7513 clocking is unchanged.
 //
-// One sample is popped per 48 kHz frame; an empty FIFO plays silence
-// (zeros, no last-sample repeat). There is no flush: after a core reset
+// One sample is popped per 48 kHz frame; an empty FIFO plays
+// last-sample repeat. There is no flush: after a core reset
 // queued samples simply drain within ~43ms worst case.
 //
 // CDC: standard async FIFO, gray-coded pointers through 2FF synchronizers
@@ -126,7 +126,7 @@ always @(posedge aclk) begin
 
 	// next frame's sample lands exactly on the LRCLK falling edge; slot 0
 	// carries no data (I2S one-bit delay), so the swap is never audible
-	if (adiv == 9'h1FF) sample <= got ? rdata_q : 32'd0;
+	if (adiv == 9'h1FF) sample <= rdata_q;
 
 	// data transitions on every SCLK falling edge (adiv[2:0] wraps 7 -> 0)
 	if (adiv[2:0] == 3'b111)
