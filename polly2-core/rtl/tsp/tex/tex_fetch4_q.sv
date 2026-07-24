@@ -79,12 +79,26 @@ module tex_fetch4_q import tsp_pkg::*; #(
     wire clear = reset || flush;
 
     // ---------------- shared 4-read-port caches (data + VQ) ----------------
+    // The data cache gets the FILL-LOOKAHEAD probe: while it is frozen filling, the
+    // ROWQ head (the very next lookup group) is presented on the probe port so its
+    // first missing line is DDR-requested back-to-back with the current fill. The
+    // VQ side has no queue ahead of it - probe tied off.
     cache_req_t   tc_req [0:3], vq_req [0:3];
     cache_resp_t  tc_resp[0:3], vq_resp[0:3];
+    wire        tcp_valid;
+    wire [3:0]  tcp_mask;
+    wire [28:0] tcp_waddr [0:3];
+    wire [28:0] vqp_waddr [0:3];
+    assign vqp_waddr[0] = 29'd0; assign vqp_waddr[1] = 29'd0;
+    assign vqp_waddr[2] = 29'd0; assign vqp_waddr[3] = 29'd0;
     tex_cache_4p_1c u_tc4 (.clk(clk),.reset(reset),.flush(flush),
-        .creq(tc_req),.cresp(tc_resp),.dreq(ddr_req[0]),.dresp(ddr_resp[0]));
+        .creq(tc_req),.cresp(tc_resp),
+        .probe_valid(tcp_valid),.probe_mask(tcp_mask),.probe_waddr(tcp_waddr),
+        .dreq(ddr_req[0]),.dresp(ddr_resp[0]));
     tex_cache_4p_1c u_vq4 (.clk(clk),.reset(reset),.flush(flush),
-        .creq(vq_req),.cresp(vq_resp),.dreq(ddr_req[1]),.dresp(ddr_resp[1]));
+        .creq(vq_req),.cresp(vq_resp),
+        .probe_valid(1'b0),.probe_mask(4'd0),.probe_waddr(vqp_waddr),
+        .dreq(ddr_req[1]),.dresp(ddr_resp[1]));
 
     wire tc_ready = tc_resp[0].ready;      // all ports gate together
     wire vq_ready = vq_resp[0].ready;
@@ -244,7 +258,12 @@ module tex_fetch4_q import tsp_pkg::*; #(
     wire [28:0] lk_wa_in [0:3];
     generate for (gi=0; gi<4; gi=gi+1) begin : lkw
         assign lk_wa_in[gi] = rowq_rdata[29*gi +: 29];
+        assign tcp_waddr[gi] = lk_wa_in[gi];
     end endgenerate
+    // fill-lookahead probe: present the head row whenever it exists and is not being
+    // accepted this cycle (the cache only samples it while frozen filling).
+    assign tcp_valid = rowq_ov && !rowq_pop;
+    assign tcp_mask  = lk_mask_in;
 
     // ============================ PIXQ: pixels + refs ============================
     localparam integer PIXQ_W = 3 + 8 + 12 + 21 + PLW;
