@@ -302,6 +302,17 @@ module tsp_shade_v2_pp import tsp_pkg::*; #(
 `ifndef SYNTHESIS
     reg dl_dfired = 1'b0, dl_xfired = 1'b0, dl_hw_fired = 1'b0;   // one-shot flags
     integer dl_npush = 0, dl_npop = 0;        // cumulative push/pop counters
+    // PL<->TEXEL PAIRING CROSS-CHECK (always on): the k-th popped payload must carry
+    // the SAME id tex_unit echoes with the k-th result (tu_oid rode THROUGH the fetch
+    // with the pixel; the pl FIFO id took the parallel path). A single dropped or
+    // duplicated tex_unit out_valid desyncs every later pixel - wrong texel paired
+    // with wrong base/ofs/tsp/id, wrong blend target. Catch the FIRST slip loudly.
+    integer dl_iderr = 0;
+    always @(posedge clk) if (!reset && pl_pop && pl_out[IDW-1:0] != tu_oid && dl_iderr < 10) begin
+        dl_iderr <= dl_iderr + 1;
+        $display("[tsp_shade_v2_pp] PL/TEXEL ID DESYNC #%0d: pl_id=%0d tu_oid=%0d pl_cnt=%0d h=%0d t=%0d",
+                 dl_iderr, pl_out[IDW-1:0], tu_oid, pl_cnt, pl_h, pl_t);
+    end
 `endif
     always @(posedge clk) begin
         if (reset) begin pl_h<=0; pl_t<=0; pl_cnt<=0; end

@@ -8,7 +8,11 @@
 //                           fbpp_shr/tex_addr/vq_addr + decode config)
 //   tex_addroffsgen_ib(1) : 4 corner relative texel offsets
 //   tex_add_mip (comb)    : + mip, *fbpp -> 4 byte offsets
-//   tex_fetch4_ob (~3,stall): 4 raw 64-bit words (owns the 2 caches)
+//   tex_fetch4_q (var,stall): 4 raw 64-bit words (owns the 2 caches). QUEUED +
+//                           COALESCING: dedups corner words into 4-slot rows and
+//                           decouples via 64-deep FIFOs so miss-fills overlap the
+//                           drain (tex_fetch4_ob is the retired lockstep version,
+//                           kept as the golden model for the texfetchq TB)
 //   tex_decode x4 (3)     : 4 raw words -> 4 ARGB texels (injected palette, x4 ports)
 //   tex_filter (6)        : bilinear/nearest blend -> 1 ARGB texel
 //
@@ -223,7 +227,7 @@ module tex_unit import tsp_pkg::*; #(
 
     wire        f_ov;
     wire [63:0] f_word [0:3];
-    tex_fetch4_ob #(.PLW(FPLW)) u_fetch (
+    tex_fetch4_q #(.PLW(FPLW)) u_fetch (
         .clk(clk),.reset(reset),.flush(flush),
         .in_valid(r_iss),.tex(r_tex),.vq(r_vq),.in_ready(fetch_ready),
         .tex_addr(r_texaddr),.vq_addr(r_vqaddr),.tex_offset(r_boff),.in_pl(fpl_in),
